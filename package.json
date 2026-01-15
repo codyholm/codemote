@@ -1,0 +1,30 @@
+{
+	"name": "guild-remote",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build": "pnpm -r build",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"lint": "biome check .",
+		"lint:fix": "biome check --write .",
+		"format": "biome format --write .",
+		"typecheck": "pnpm -r typecheck",
+		"prepare": "simple-git-hooks"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^1.9.0",
+		"typescript": "^5.6.0",
+		"vitest": "^2.1.0",
+		"simple-git-hooks": "^2.11.0"
+	},
+	"simple-git-hooks": {
+		"pre-commit": "pnpm lint && pnpm typecheck"
+	},
+	"engines": {
+		"node": ">=22.0.0",
+		"pnpm": ">=9.0.0"
+	},
+	"packageManager": "pnpm@9.15.0"
+}
