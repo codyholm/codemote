@@ -25,6 +25,10 @@ android/
 *.swp
 *.swo
 
+# Xcode
+xcuserdata/
+*.xcuserstate
+
 # OS
 .DS_Store
 Thumbs.db
