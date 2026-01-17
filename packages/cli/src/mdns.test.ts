@@ -6,6 +6,8 @@ import { Bonjour } from "bonjour-service";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MDNSAdvertiser, advertiseService } from "./mdns.js";
 
+const shouldRunMdnsIntegration = process.platform === "darwin" && !process.env["CI"];
+
 describe("MDNSAdvertiser", () => {
 	let advertiser: MDNSAdvertiser;
 
@@ -168,32 +170,36 @@ describe("advertiseService", () => {
 });
 
 describe("Integration: Service Discovery", () => {
-	it("should be discoverable by another Bonjour instance", async () => {
-		const advertiser = new MDNSAdvertiser();
-		advertiser.advertise({
-			port: 3000,
-			pin: "123456",
-		});
+	(shouldRunMdnsIntegration ? it : it.skip)(
+		"should be discoverable by another Bonjour instance",
+		async () => {
+			const advertiser = new MDNSAdvertiser();
+			advertiser.advertise({
+				port: 3000,
+				pin: "123456",
+			});
 
-		// Give the service time to publish
-		await new Promise<void>((resolve) => {
-			setTimeout(() => {
-				const browser = new Bonjour();
-				const finder = browser.find({ type: "guildremote" });
+			// Give the service time to publish
+			await new Promise<void>((resolve) => {
+				setTimeout(() => {
+					const browser = new Bonjour();
+					const finder = browser.find({ type: "guildremote" });
 
-				finder.on("up", (service) => {
-					expect(service.type).toBe("guildremote");
-					expect(service.port).toBe(3000);
-					expect(service.txt?.pin).toBe("123456");
-					expect(service.txt?.version).toBe("1");
+					finder.on("up", (service) => {
+						expect(service.type).toBe("guildremote");
+						expect(service.port).toBe(3000);
+						expect(service.txt?.pin).toBe("123456");
+						expect(service.txt?.version).toBe("1");
 
-					// Cleanup
-					finder.stop?.();
-					browser.destroy();
-					advertiser.destroy();
-					resolve();
-				});
-			}, 100);
-		});
-	}, 5000); // 5 second timeout for network operations
+						// Cleanup
+						finder.stop?.();
+						browser.destroy();
+						advertiser.destroy();
+						resolve();
+					});
+				}, 100);
+			});
+		},
+		5000,
+	); // 5 second timeout for network operations
 });
