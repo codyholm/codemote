@@ -5,6 +5,7 @@ node_modules/
 # Build outputs
 dist/
 build/
+.build/
 *.tsbuildinfo
 
 # Expo
@@ -20,6 +21,7 @@ android/
 # IDE
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 
@@ -37,3 +39,8 @@ npm-debug.log*
 # Database
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
+
+# Guild (generated)
+.guild/exports/

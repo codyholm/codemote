@@ -18,6 +18,16 @@
 		"lineWidth": 100
 	},
 	"files": {
-		"ignore": ["node_modules", "dist", ".expo", "ios", "android"]
+		"ignore": [
+			"node_modules",
+			"dist",
+			".build",
+			".expo",
+			"ios",
+			"android",
+			".guild/exports",
+			".claude",
+			"packages/mobile-react-native"
+		]
 	}
 }

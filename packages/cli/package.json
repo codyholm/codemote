@@ -1,0 +1,36 @@
+{
+	"name": "guild-remote",
+	"version": "0.1.0",
+	"description": "Control AI coding agents from your phone",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"bin": {
+		"guild-remote": "./dist/cli.js"
+	},
+	"scripts": {
+		"build": "tsc",
+		"start": "node dist/cli.js",
+		"dev": "tsc --watch",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run",
+		"test:watch": "vitest"
+	},
+	"dependencies": {
+		"@guild-remote/common": "workspace:*",
+		"@guild-remote/relay": "workspace:*",
+		"@guild-remote/uplink": "workspace:*",
+		"bonjour-service": "^1.2.1",
+		"chalk": "^5.3.0",
+		"qrcode-terminal": "^0.12.0",
+		"tweetnacl": "^1.0.3",
+		"ws": "^8.18.3"
+	},
+	"devDependencies": {
+		"@types/node": "^22.0.0",
+		"@types/qrcode-terminal": "^0.12.2",
+		"@types/ws": "^8.5.12",
+		"typescript": "^5.6.0",
+		"vitest": "^2.1.0"
+	}
+}
