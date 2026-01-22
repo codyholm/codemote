@@ -23,12 +23,14 @@
 		"bonjour-service": "^1.2.1",
 		"chalk": "^5.3.0",
 		"qrcode-terminal": "^0.12.0",
+		"selfsigned": "^2.4.1",
 		"tweetnacl": "^1.0.3",
 		"ws": "^8.18.3"
 	},
 	"devDependencies": {
 		"@types/node": "^22.0.0",
 		"@types/qrcode-terminal": "^0.12.2",
+		"@types/selfsigned": "^2.1.0",
 		"@types/ws": "^8.5.12",
 		"typescript": "^5.6.0",
 		"vitest": "^2.1.0"

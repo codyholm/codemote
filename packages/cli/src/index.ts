@@ -36,3 +36,5 @@ export {
 	buildPairingURL,
 	getLocalIP,
 } from "./qrcode.js";
+
+export { ensureLocalTLS, type EnsureLocalTLSOptions, type LocalTLSInfo } from "./tls.js";
