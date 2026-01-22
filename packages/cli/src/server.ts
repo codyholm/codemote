@@ -100,7 +100,7 @@ interface RelayStats {
  *   onClientConnected: () => console.log('Client connected!'),
  * });
  *
- * console.log(`Pairing PIN: ${server.pin}`);
+ * // Use `server.pin` for UI/QR display. Avoid printing it to stdout logs.
  * console.log(`Mobile connects to: ${server.url}`);
  *
  * // Later...
@@ -155,7 +155,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 	currentPIN = bridge.pairingCode;
 
-	console.log(`[Server] Pairing PIN: ${currentPIN}`);
+	console.log("[Server] Pairing PIN ready (redacted)");
 
 	return {
 		get pin() {

@@ -45,7 +45,7 @@ const server = await startServer({
   onClientConnected: () => console.log("Client connected!"),
 });
 
-console.log(`Pairing PIN: ${server.pin}`);
+// Use `server.pin` for UI/QR display. Avoid printing it to stdout logs.
 console.log(`WebSocket URL: ${server.url}`);
 
 // Later...
