@@ -2,6 +2,8 @@ import { randomBytes } from "node:crypto";
 import nacl from "tweetnacl";
 import { WebSocket } from "ws";
 
+import { ReplayGuard } from "./replayProtection.js";
+
 import type {
 	RuntimeType,
 	SessionStatus,
@@ -285,6 +287,7 @@ export async function startRelayUplinkBridge(
 
 	const sessions = new Map<string, SessionInfo>();
 	const approvalRequests = new Map<string, { sessionId: string }>();
+	const replayGuard = new ReplayGuard();
 	let mobilePublicKey: string | null = null;
 
 	const relayWs = relayWsOptions
@@ -332,6 +335,12 @@ export async function startRelayUplinkBridge(
 		}
 
 		if (msg.type === "message") {
+			const replayCheck = replayGuard.check(msg.payload);
+			if (!replayCheck.ok) {
+				log?.(`[Bridge] Rejected replayed/stale mobile message (${replayCheck.reason})`);
+				return;
+			}
+
 			const decoded = decryptFromMobile(msg.payload);
 			if (!decoded) {
 				log?.("[Bridge] Failed to decrypt message");
