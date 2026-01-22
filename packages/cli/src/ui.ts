@@ -7,6 +7,8 @@ export interface UIState {
 	/** Back-compat alias */
 	pairingCode?: string;
 	localURL: string;
+	/** Hex SHA-256 of leaf cert DER (64 chars) */
+	tlsPin?: string;
 	status: "starting" | "ready" | "connected" | "error";
 	errorMessage?: string;
 }
@@ -30,6 +32,8 @@ export async function renderUI(state: UIState): Promise<void> {
 
 	const { qrCode, localURL, status, errorMessage } = state;
 	const pin = state.pin ?? state.pairingCode ?? "";
+	const fingerprint = state.tlsPin ? state.tlsPin.slice(0, 8) : undefined;
+	const fingerprintText = fingerprint ? `   Server fingerprint: ${fingerprint}` : "";
 
 	// Box drawing
 	console.log(chalk.cyan("┌─────────────────────────────────────────────────────────────┐"));
@@ -52,7 +56,7 @@ export async function renderUI(state: UIState): Promise<void> {
 	console.log(
 		`${chalk.cyan("│")}${chalk.bold.yellow(`                    ${formatPairingCode(pin)}                          `)}${chalk.cyan("│")}`,
 	);
-	console.log(`${chalk.cyan("│")}${"".padEnd(61)}${chalk.cyan("│")}`);
+	console.log(`${chalk.cyan("│")}${chalk.dim(fingerprintText.padEnd(61))}${chalk.cyan("│")}`);
 	console.log(
 		`${chalk.cyan("│")}${chalk.dim(`   Local: ${localURL}`.padEnd(61))}${chalk.cyan("│")}`,
 	);

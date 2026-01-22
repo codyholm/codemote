@@ -126,6 +126,23 @@ describe("renderUI", () => {
 		expect(allCalls).toContain("192.168.1.100:3000");
 	});
 
+	it("should display short server fingerprint when tlsPin is present", async () => {
+		const tlsPin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+		const state: UIState = {
+			qrCode: "█▀▀▀▀▀█",
+			pin: "123456",
+			localURL: "http://192.168.1.100:3000",
+			tlsPin,
+			status: "ready",
+		};
+
+		await renderUI(state);
+
+		const allCalls = consoleLogSpy.mock.calls.map((call) => call[0]).join("\n");
+		expect(allCalls).toContain("Server fingerprint: 01234567");
+		expect(allCalls).not.toContain(tlsPin);
+	});
+
 	it("should split and display QR code lines", async () => {
 		const state: UIState = {
 			qrCode: "Line1\nLine2\nLine3",

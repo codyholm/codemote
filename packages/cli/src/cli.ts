@@ -63,6 +63,7 @@ async function main() {
 		pin: server.pin,
 		localURL: relayUrl,
 		status: "ready",
+		...(tlsPin ? { tlsPin } : {}),
 	});
 
 	// Handle shutdown
