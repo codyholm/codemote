@@ -36,9 +36,13 @@
  * 3. Expose RoomManager events for connection callbacks
  */
 
+import { readFile } from "node:fs/promises";
+import http from "node:http";
+import https from "node:https";
 import { type RelayServerConfig, createRelayServer } from "@guild-remote/relay";
 import { type RuntimeType, type UplinkConfig, UplinkServer } from "@guild-remote/uplink";
 import { startRelayUplinkBridge } from "./bridge.js";
+import { ensureLocalTLS } from "./tls.js";
 
 export interface ServerConfig {
 	/** Port for the relay server */
@@ -113,14 +117,22 @@ interface RelayStats {
 export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	const { port, onPINRegenerate, onClientConnected, dbPath, repoPath, runtimes } = config;
 
+	const tlsDisabled =
+		process.env["GUILD_REMOTE_DISABLE_TLS"] === "1" ||
+		process.env["GUILD_REMOTE_DISABLE_TLS"] === "true";
+	const wsScheme = tlsDisabled ? "ws" : "wss";
+
 	// Canonical pairing token is issued by the relay on register.
 	let currentPIN = "";
+	const tlsInfo = tlsDisabled ? undefined : await ensureLocalTLS();
+	const relayCertPem = tlsInfo ? await readFile(tlsInfo.certPath) : undefined;
 
 	// Start the relay server
 	const relayConfig: Partial<RelayServerConfig> = {
 		port,
 		host: "0.0.0.0",
 		...(dbPath ? { dbPath } : {}),
+		...(tlsInfo ? { tls: { keyPath: tlsInfo.keyPath, certPath: tlsInfo.certPath } } : {}),
 	};
 
 	const relay = await createRelayServer(relayConfig);
@@ -143,7 +155,8 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 	// Connect an uplink "device" to the relay and bridge messages to the uplink server
 	const bridge = await startRelayUplinkBridge({
-		relayUrl: `ws://127.0.0.1:${port}`,
+		relayUrl: `${wsScheme}://127.0.0.1:${port}`,
+		...(relayCertPem ? { relayWsOptions: { ca: relayCertPem } } : {}),
 		uplinkUrl: `ws://127.0.0.1:${port + 1}`,
 		repoPath: uplinkConfig.repoPath ?? process.cwd(),
 		onPairingCode: (pin) => {
@@ -168,7 +181,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 		uplinkPublicKey: bridge.uplinkPublicKey,
 
-		url: `ws://localhost:${port}`,
+		url: `${wsScheme}://localhost:${port}`,
 
 		async stop() {
 			console.log("[Server] Stopping servers...");
@@ -179,15 +192,47 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 		async getStats(): Promise<RelayStats> {
 			try {
-				const response = await fetch(`http://localhost:${port}/health`);
-				if (!response.ok) {
-					throw new Error(`Health check failed: ${response.status}`);
-				}
-				const data = (await response.json()) as {
+				const data = await new Promise<{
 					rooms: number;
 					connections: number;
 					version: string;
-				};
+				}>((resolve, reject) => {
+					const request = (tlsDisabled ? http : https).request(
+						{
+							method: "GET",
+							host: "localhost",
+							port,
+							path: "/health",
+							...(relayCertPem ? { ca: relayCertPem, servername: "localhost" } : {}),
+						},
+						(res) => {
+							if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+								reject(new Error(`Health check failed: ${res.statusCode ?? "unknown"}`));
+								return;
+							}
+
+							let body = "";
+							res.setEncoding("utf8");
+							res.on("data", (chunk) => {
+								body += chunk;
+							});
+							res.on("end", () => {
+								try {
+									const parsed = JSON.parse(body) as {
+										rooms: number;
+										connections: number;
+										version: string;
+									};
+									resolve(parsed);
+								} catch (err) {
+									reject(err instanceof Error ? err : new Error(String(err)));
+								}
+							});
+						},
+					);
+					request.on("error", (err) => reject(err));
+					request.end();
+				});
 				return {
 					rooms: data.rooms,
 					connections: data.connections,

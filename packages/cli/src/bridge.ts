@@ -111,6 +111,7 @@ type MobileOutboundMessage =
 
 export interface RelayUplinkBridgeConfig {
 	relayUrl: string;
+	relayWsOptions?: WebSocket.ClientOptions;
 	uplinkUrl: string;
 	repoPath: string;
 	onPairingCode?: (code: string) => void;
@@ -276,7 +277,8 @@ function expectedResponseType(commandType: UplinkCommand["type"]): UplinkRespons
 export async function startRelayUplinkBridge(
 	config: RelayUplinkBridgeConfig,
 ): Promise<RelayUplinkBridgeHandle> {
-	const { relayUrl, uplinkUrl, repoPath, onPairingCode, onMobilePaired, log } = config;
+	const { relayUrl, relayWsOptions, uplinkUrl, repoPath, onPairingCode, onMobilePaired, log } =
+		config;
 
 	const uplinkKeyPair = nacl.box.keyPair();
 	const uplinkPublicKey = Buffer.from(uplinkKeyPair.publicKey).toString("base64");
@@ -285,7 +287,9 @@ export async function startRelayUplinkBridge(
 	const approvalRequests = new Map<string, { sessionId: string }>();
 	let mobilePublicKey: string | null = null;
 
-	const relayWs = new WebSocket(relayUrl);
+	const relayWs = relayWsOptions
+		? new WebSocket(relayUrl, relayWsOptions)
+		: new WebSocket(relayUrl);
 	await waitForOpen(relayWs);
 
 	let pairingCode = await registerWithRelay(relayWs, uplinkPublicKey);

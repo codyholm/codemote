@@ -26,7 +26,7 @@ describe("Server Integration", () => {
 			expect(server.pin).toMatch(/^\d{6}$/);
 			expect(server.pairingCode).toMatch(/^\d{6}$/);
 			expect(server.uplinkPublicKey).toBeDefined();
-			expect(server.url).toBe(`ws://localhost:${testPort}`);
+			expect(server.url).toBe(`wss://localhost:${testPort}`);
 		});
 
 		it("should generate a valid PIN", async () => {

@@ -75,7 +75,7 @@ async function displayPIN(pin: string) {
 	try {
 		const qrData = {
 			pin,
-			url: "ws://localhost:8080/ws",
+			url: "wss://localhost:8080/ws",
 		};
 		console.log("QR Code for mobile app:");
 		const qrCode = await generateQRCode(JSON.stringify(qrData));
