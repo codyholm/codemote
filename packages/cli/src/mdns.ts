@@ -54,16 +54,15 @@ export class MDNSAdvertiser {
 			type: "guildremote", // becomes _guildremote._tcp
 			port,
 			txt: {
-				pin: token,
-				pairingCode: token,
 				version,
 				hostname: os.hostname(),
+				port: String(port),
 			},
 		});
 	}
 
 	/**
-	 * Updates the pairing code in TXT records
+	 * Updates the pairing code used for pairing
 	 * Stops and re-advertises the service with the new code
 	 * @param newPairingCode - New pairing code to advertise
 	 */

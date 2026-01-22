@@ -3,6 +3,8 @@
  */
 
 import { Bonjour } from "bonjour-service";
+import type { Service } from "bonjour-service";
+import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MDNSAdvertiser, advertiseService } from "./mdns.js";
 
@@ -10,12 +12,20 @@ const shouldRunMdnsIntegration = process.platform === "darwin" && !process.env["
 
 describe("MDNSAdvertiser", () => {
 	let advertiser: MDNSAdvertiser;
+	let publishSpy: MockInstance<
+		(...args: Parameters<Bonjour["publish"]>) => ReturnType<Bonjour["publish"]>
+	>;
 
 	beforeEach(() => {
 		advertiser = new MDNSAdvertiser();
+
+		const bonjour = (advertiser as unknown as { bonjour: Bonjour }).bonjour;
+		const fakeService = { stop: vi.fn() } as unknown as Service;
+		publishSpy = vi.spyOn(bonjour, "publish").mockReturnValue(fakeService);
 	});
 
 	afterEach(() => {
+		publishSpy?.mockRestore();
 		if (advertiser) {
 			advertiser.destroy();
 		}
@@ -29,6 +39,21 @@ describe("MDNSAdvertiser", () => {
 			};
 
 			advertiser.advertise(config);
+
+			const publishConfig = publishSpy.mock.calls[0]?.[0] as unknown as {
+				port: number;
+				txt?: Record<string, string>;
+			};
+			expect(publishConfig.port).toBe(3000);
+			expect(publishConfig.txt).toEqual(
+				expect.objectContaining({
+					version: "1",
+					hostname: expect.any(String),
+					port: "3000",
+				}),
+			);
+			expect(publishConfig.txt).not.toHaveProperty("pin");
+			expect(publishConfig.txt).not.toHaveProperty("pairingCode");
 
 			expect(advertiser.isAdvertising()).toBe(true);
 			const currentConfig = advertiser.getConfig();
@@ -48,6 +73,11 @@ describe("MDNSAdvertiser", () => {
 			};
 
 			advertiser.advertise(config);
+
+			const publishConfig = publishSpy.mock.calls[0]?.[0] as unknown as {
+				txt?: Record<string, string>;
+			};
+			expect(publishConfig.txt?.["version"]).toBe("2");
 
 			expect(advertiser.isAdvertising()).toBe(true);
 			const currentConfig = advertiser.getConfig();
@@ -155,7 +185,18 @@ describe("MDNSAdvertiser", () => {
 
 describe("advertiseService", () => {
 	it("should create and advertise a service", () => {
+		const fakeService = { stop: vi.fn() } as unknown as Service;
+		const publishSpy = vi.spyOn(Bonjour.prototype, "publish").mockReturnValue(fakeService);
+
 		const advertiser = advertiseService(3000, "123456");
+
+		const publishConfig = publishSpy.mock.calls[0]?.[0] as unknown as {
+			port: number;
+			txt?: Record<string, string>;
+		};
+		expect(publishConfig.port).toBe(3000);
+		expect(publishConfig.txt).not.toHaveProperty("pin");
+		expect(publishConfig.txt).not.toHaveProperty("pairingCode");
 
 		expect(advertiser.isAdvertising()).toBe(true);
 		expect(advertiser.getConfig()).toEqual({
@@ -166,6 +207,7 @@ describe("advertiseService", () => {
 		});
 
 		advertiser.destroy();
+		publishSpy.mockRestore();
 	});
 });
 
@@ -188,7 +230,9 @@ describe("Integration: Service Discovery", () => {
 					finder.on("up", (service) => {
 						expect(service.type).toBe("guildremote");
 						expect(service.port).toBe(3000);
-						expect(service.txt?.pin).toBe("123456");
+						expect(service.txt?.pin).toBeUndefined();
+						expect(service.txt?.pairingCode).toBeUndefined();
+						expect(service.txt?.port).toBe("3000");
 						expect(service.txt?.version).toBe("1");
 
 						// Cleanup
