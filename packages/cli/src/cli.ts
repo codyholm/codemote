@@ -26,6 +26,7 @@
 import { advertiseService } from "./mdns.js";
 import { buildPairingURL, generateQRCode, getLocalIP } from "./qrcode.js";
 import { startServer } from "./server.js";
+import { ensureLocalTLS } from "./tls.js";
 import { renderUI, updateStatus } from "./ui.js";
 
 async function main() {
@@ -43,7 +44,12 @@ async function main() {
 
 	// Get local IP and build QR code URL
 	const host = getLocalIP();
-	const pairingURL = buildPairingURL(host, port, server.pin);
+	const relayScheme = server.url.startsWith("wss://") ? "wss" : "ws";
+	const relayUrl = `${relayScheme}://${host}:${port}`;
+	const tlsPin = relayScheme === "wss" ? (await ensureLocalTLS()).tlsPin : undefined;
+	const pairingURL = tlsPin
+		? buildPairingURL(host, port, server.pin, { tlsPin, relayUrl })
+		: buildPairingURL(host, port, server.pin);
 	const qrCode = await generateQRCode(pairingURL);
 
 	// Start mDNS advertisement
@@ -55,7 +61,7 @@ async function main() {
 	await renderUI({
 		qrCode,
 		pin: server.pin,
-		localURL: `ws://${host}:${port}`,
+		localURL: relayUrl,
 		status: "ready",
 	});
 

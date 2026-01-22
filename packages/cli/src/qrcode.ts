@@ -6,11 +6,45 @@ import qrcode from "qrcode-terminal";
  * @param host - IP address or hostname
  * @param port - Port number
  * @param pin - Pairing PIN (canonical)
+ * @param options - Optional extra pairing metadata (TLS, relay URL)
  * @returns Deep link URL string
  */
-export function buildPairingURL(host: string, port: number, pin: string): string {
+
+export type BuildPairingURLOptions = {
+	/**
+	 * Certificate pin for the relay (sha256 leaf DER, hex64).
+	 *
+	 * This is delivered via QR for TOFU.
+	 */
+	tlsPin: string;
+	/**
+	 * Full relay URL, e.g. `wss://192.168.1.10:8080`.
+	 *
+	 * If omitted, defaults to `wss://{host}:{port}`.
+	 */
+	relayUrl?: string;
+};
+
+export function buildPairingURL(host: string, port: number, pin: string): string;
+export function buildPairingURL(
+	host: string,
+	port: number,
+	pin: string,
+	options: BuildPairingURLOptions,
+): string;
+export function buildPairingURL(
+	host: string,
+	port: number,
+	pin: string,
+	options?: BuildPairingURLOptions,
+): string {
 	// Back-compat: include both `pin` (canonical) and `code` (legacy)
-	return `guildremote://pair?host=${host}&port=${port}&pin=${pin}&code=${pin}`;
+	if (!options) {
+		return `guildremote://pair?host=${host}&port=${port}&pin=${pin}&code=${pin}`;
+	}
+
+	const relayUrl = options.relayUrl ?? `wss://${host}:${port}`;
+	return `guildremote://pair?host=${host}&port=${port}&relay=${relayUrl}&pin=${pin}&tlsPin=${options.tlsPin}&code=${pin}`;
 }
 
 /**
