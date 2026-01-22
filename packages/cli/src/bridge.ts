@@ -522,7 +522,7 @@ export async function startRelayUplinkBridge(
 	async function refreshPairingCode(): Promise<string> {
 		pairingCode = await registerWithRelay(relayWs, uplinkPublicKey);
 		onPairingCode?.(pairingCode);
-		log?.(`[Bridge] Refreshed PIN: ${pairingCode}`);
+		log?.("[Bridge] Refreshed PIN (redacted)");
 		return pairingCode;
 	}
 

@@ -49,7 +49,7 @@ async function main() {
 	// Start mDNS advertisement
 	const mdns = advertiseService(port, server.pin);
 
-	console.log(`[CLI] mDNS advertising on port ${port} with PIN ${server.pin}`);
+	console.log(`[CLI] mDNS advertising on port ${port}`);
 
 	// Render the UI
 	await renderUI({
