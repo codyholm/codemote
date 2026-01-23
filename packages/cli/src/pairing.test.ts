@@ -166,8 +166,13 @@ describe("RateLimiter", () => {
 
 			// Trigger lockout
 			await limiter.checkAndRecord(client, false);
-			await new Promise((resolve) => setTimeout(resolve, 200));
-			await limiter.checkAndRecord(client, false);
+			// Wait comfortably past backoff (100ms) for attempt #2.
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			const secondAttempt = await limiter.checkAndRecord(client, false);
+			if (!secondAttempt.allowed) {
+				await new Promise((resolve) => setTimeout(resolve, (secondAttempt.waitMs ?? 0) + 50));
+				await limiter.checkAndRecord(client, false);
+			}
 			await new Promise((resolve) => setTimeout(resolve, 300));
 			const lockoutResult = await limiter.checkAndRecord(client, false);
 			expect(lockoutResult.allowed).toBe(false);
