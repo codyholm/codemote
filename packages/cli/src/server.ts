@@ -74,6 +74,8 @@ export interface ServerHandle {
 	getStats: () => Promise<RelayStats>;
 	/** Manually refresh PIN (re-register with relay) */
 	regeneratePIN: () => Promise<void>;
+	/** Start a new runtime session from the terminal */
+	startSession: (runtime: RuntimeType, prompt: string) => Promise<{ sessionId: string }>;
 }
 
 interface RelayStats {
@@ -169,8 +171,10 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		port: port + 1,
 		host: "127.0.0.1",
 		repoPath: repoPath || process.cwd(),
-		runtimes: (runtimes || []) as RuntimeType[],
 	};
+	if (runtimes) {
+		uplinkConfig.runtimes = runtimes;
+	}
 
 	const uplink = new UplinkServer(uplinkConfig);
 	await uplink.start();
@@ -183,6 +187,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		...(relayCertPem ? { relayWsOptions: { ca: relayCertPem } } : {}),
 		uplinkUrl: `ws://127.0.0.1:${port + 1}`,
 		repoPath: uplinkConfig.repoPath ?? process.cwd(),
+		...(process.env["GUILD_REMOTE_DEBUG"] ? { log: (message) => console.log(message) } : {}),
 		onPairingCode: (pin) => {
 			currentPIN = pin;
 			onPINRegenerate?.(pin);
@@ -271,6 +276,10 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 		async regeneratePIN() {
 			currentPIN = await bridge.refreshPairingCode();
+		},
+
+		async startSession(runtime: RuntimeType, prompt: string) {
+			return bridge.startSession(runtime, prompt);
 		},
 	};
 }

@@ -29,8 +29,13 @@ import { startServer } from "./server.js";
 import { ensureLocalTLS } from "./tls.js";
 import { renderUI, updateStatus } from "./ui.js";
 
+import readline from "node:readline";
+
+import type { RuntimeType } from "@guild-remote/uplink";
+
 async function main() {
 	const port = Number.parseInt(process.env["PORT"] || "8080", 10);
+	let interactive = false;
 
 	console.log("Starting Guild Remote...");
 
@@ -38,7 +43,11 @@ async function main() {
 	const server = await startServer({
 		port,
 		onClientConnected: () => {
-			updateStatus("   ✓ Device connected");
+			if (interactive) {
+				console.log("Device connected");
+			} else {
+				updateStatus("   ✓ Device connected");
+			}
 		},
 	});
 
@@ -65,6 +74,81 @@ async function main() {
 		status: "ready",
 		...(tlsPin ? { tlsPin } : {}),
 	});
+
+	// Optional interactive terminal commands (for starting sessions)
+	if (process.stdin.isTTY) {
+		interactive = true;
+		console.log("\nCommands: claude|opencode|codex <prompt>  (or: help)");
+		const rl = readline.createInterface({
+			input: process.stdin,
+			output: process.stdout,
+			terminal: true,
+		});
+		rl.setPrompt("> ");
+		rl.prompt();
+
+		rl.on("line", async (line) => {
+			const trimmed = line.trim();
+			if (trimmed.length === 0) {
+				rl.prompt();
+				return;
+			}
+
+			if (trimmed === "help") {
+				console.log(
+					"\nCommands:\n  claude <prompt>\n  opencode <prompt>\n  codex <prompt>\n  quit\n",
+				);
+				rl.prompt();
+				return;
+			}
+
+			if (trimmed === "quit" || trimmed === "exit") {
+				rl.close();
+				process.kill(process.pid, "SIGINT");
+				return;
+			}
+
+			const [first, ...rest] = trimmed.split(/\s+/);
+			const runtime = first as RuntimeType;
+			const prompt = rest.join(" ").trim();
+
+			const allowed: RuntimeType[] = ["claude", "opencode", "codex"];
+			if (!allowed.includes(runtime)) {
+				console.log(`Unknown command: ${first}. Try: help`);
+				rl.prompt();
+				return;
+			}
+
+			let finalPrompt = prompt;
+			if (finalPrompt.length === 0) {
+				finalPrompt = (
+					await new Promise<string>((resolve) => {
+						rl.question("Prompt: ", (answer) => resolve(answer));
+					})
+				).trim();
+			}
+
+			if (finalPrompt.length === 0) {
+				console.log("Prompt is required");
+				rl.prompt();
+				return;
+			}
+
+			try {
+				const { sessionId } = await server.startSession(runtime, finalPrompt);
+				console.log(`Started session ${sessionId} (${runtime})`);
+			} catch (err) {
+				console.error(
+					`Failed to start session: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+			rl.prompt();
+		});
+
+		rl.on("close", () => {
+			// No-op; cleanup handled by SIGINT/SIGTERM.
+		});
+	}
 
 	// Handle shutdown
 	const cleanup = async () => {

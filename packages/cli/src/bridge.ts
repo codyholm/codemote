@@ -120,6 +120,7 @@ export interface RelayUplinkBridgeConfig {
 export interface RelayUplinkBridgeHandle {
 	pairingCode: string;
 	uplinkPublicKey: string;
+	startSession: (runtime: RuntimeType, prompt: string) => Promise<{ sessionId: string }>;
 	refreshPairingCode: () => Promise<string>;
 	stop: () => Promise<void>;
 }
@@ -446,6 +447,35 @@ export async function startRelayUplinkBridge(
 		}
 	}
 
+	async function startSession(
+		runtime: RuntimeType,
+		prompt: string,
+	): Promise<{ sessionId: string }> {
+		const cleanPrompt = prompt.trim();
+		if (cleanPrompt.length === 0) {
+			throw new Error("Prompt is required");
+		}
+
+		const started = await uplinkClient.startRun(runtime, repoPath, cleanPrompt);
+		if (started.type !== "run_started") {
+			throw new Error("Unexpected start_run response");
+		}
+
+		const sessionId = started.payload.sessionId;
+		sessions.set(sessionId, {
+			id: sessionId,
+			runtime,
+			status: "starting",
+			createdAt: Date.now(),
+		});
+
+		if (mobilePublicKey) {
+			sendSessionList();
+		}
+
+		return { sessionId };
+	}
+
 	async function handleApprovalResponse(message: ApprovalResponseMessage) {
 		const pending = approvalRequests.get(message.requestId);
 		if (!pending) {
@@ -524,6 +554,14 @@ export async function startRelayUplinkBridge(
 
 	function sendSessionList() {
 		const sessionsList = Array.from(sessions.values()).sort((a, b) => b.createdAt - a.createdAt);
+		log?.(
+			`[Bridge] sendSessionList: ${sessionsList.length} sessions, mobilePublicKey=${mobilePublicKey ? "set" : "null"}`,
+		);
+		if (sessionsList.length > 0) {
+			log?.(
+				`[Bridge] Sessions: ${sessionsList.map((s) => `${s.id.slice(0, 8)}(${s.runtime}:${s.status})`).join(", ")}`,
+			);
+		}
 		sendToMobile({ type: "session_list", sessions: sessionsList });
 	}
 
@@ -570,9 +608,11 @@ export async function startRelayUplinkBridge(
 
 	function sendToMobile(message: MobileOutboundMessage) {
 		if (!mobilePublicKey) {
+			log?.(`[Bridge] sendToMobile: skipped (no mobilePublicKey), type=${message.type}`);
 			return;
 		}
 
+		log?.(`[Bridge] sendToMobile: type=${message.type}`);
 		const plaintext = Buffer.from(JSON.stringify(message), "utf8");
 		const nonce = randomBytes(24);
 		const recipientPublicKey = Buffer.from(mobilePublicKey, "base64");
@@ -585,6 +625,7 @@ export async function startRelayUplinkBridge(
 			timestamp: Date.now(),
 		};
 
+		log?.("[Bridge] sendToMobile: sending encrypted message to relay");
 		relayWs.send(JSON.stringify({ type: "message", payload }));
 	}
 
@@ -598,6 +639,7 @@ export async function startRelayUplinkBridge(
 	return {
 		pairingCode,
 		uplinkPublicKey,
+		startSession,
 		refreshPairingCode,
 		stop: async () => {
 			await uplinkClient.close();

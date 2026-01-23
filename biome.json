@@ -27,7 +27,11 @@
 			"android",
 			".guild/exports",
 			".claude",
-			"packages/mobile-react-native"
+			"packages/mobile-react-native",
+			"packages/mobile-ios/**/*.xcassets",
+			"happy-main",
+			"happy-cli-main",
+			"happy-server-main"
 		]
 	}
 }
