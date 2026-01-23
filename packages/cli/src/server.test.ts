@@ -3,6 +3,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import WebSocket from "ws";
 import { type ServerHandle, startServer } from "./server.js";
 
 describe("Server Integration", () => {
@@ -80,6 +81,43 @@ describe("Server Integration", () => {
 			expect(originalPIN).toMatch(/^\d{6}$/);
 			expect(newPIN).toMatch(/^\d{6}$/);
 		});
+
+		it("does not crash when receiving malformed encrypted payloads", async () => {
+			const prevDisable = process.env["GUILD_REMOTE_DISABLE_TLS"];
+			const prevAllow = process.env["GUILD_REMOTE_ALLOW_INSECURE"];
+			process.env["GUILD_REMOTE_DISABLE_TLS"] = "1";
+			process.env["GUILD_REMOTE_ALLOW_INSECURE"] = "1";
+			try {
+				server = await startServer({ port: testPort + 35 });
+
+				const mobileWs = new WebSocket(`ws://127.0.0.1:${testPort + 35}/ws`);
+				await waitForOpen(mobileWs);
+
+				const pairPromise = waitForMessageOfType(mobileWs, "paired");
+				mobileWs.send(
+					JSON.stringify({
+						type: "pair",
+						publicKey: "mobile-test-key-456",
+						pin: server.pin,
+						deviceType: "mobile",
+					}),
+				);
+				await pairPromise;
+
+				// Relay will forward this raw message to the internal bridge.
+				mobileWs.send(JSON.stringify({ type: "message", payload: {} }));
+
+				// Server should remain healthy.
+				const stats = await server.getStats();
+				expect(stats.rooms).toBeGreaterThanOrEqual(1);
+				expect(stats.connections).toBeGreaterThanOrEqual(1);
+
+				mobileWs.close();
+			} finally {
+				process.env["GUILD_REMOTE_DISABLE_TLS"] = prevDisable;
+				process.env["GUILD_REMOTE_ALLOW_INSECURE"] = prevAllow;
+			}
+		});
 	});
 
 	describe("server lifecycle", () => {
@@ -138,3 +176,32 @@ describe("Server Integration", () => {
 		});
 	});
 });
+
+function waitForOpen(ws: WebSocket): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (ws.readyState === WebSocket.OPEN) {
+			resolve();
+			return;
+		}
+		ws.once("open", resolve);
+		ws.once("error", reject);
+		setTimeout(() => reject(new Error("WebSocket open timeout")), 5000);
+	});
+}
+
+function waitForMessageOfType(ws: WebSocket, type: string): Promise<Record<string, unknown>> {
+	return new Promise((resolve, reject) => {
+		const handler = (data: WebSocket.RawData) => {
+			const msg = JSON.parse(data.toString());
+			if (msg.type === type) {
+				ws.off("message", handler);
+				resolve(msg);
+			}
+		};
+		ws.on("message", handler);
+		setTimeout(() => {
+			ws.off("message", handler);
+			reject(new Error(`WebSocket message timeout waiting for type: ${type}`));
+		}, 5000);
+	});
+}

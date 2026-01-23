@@ -320,69 +320,78 @@ export async function startRelayUplinkBridge(
 		}
 	}
 
+	function dropMessage(reason: string) {
+		log?.(`[Bridge] Dropped relay message: ${reason}`);
+	}
+
 	async function handleRelayMessage(data: WebSocket.RawData) {
-		let raw: unknown;
 		try {
-			raw = JSON.parse(data.toString());
-		} catch {
-			protocolViolation("invalid_json");
-			return;
-		}
-
-		if (typeof raw !== "object" || raw === null) {
-			protocolViolation("message_not_object");
-			return;
-		}
-
-		const type = (raw as { type?: unknown }).type;
-		if (typeof type !== "string") {
-			protocolViolation("missing_type");
-			return;
-		}
-
-		const msg = raw as RelayInboundMessage;
-
-		if (msg.type === "registered") {
-			pairingCode = msg.pin ?? msg.pairingCode;
-			onPairingCode?.(pairingCode);
-			return;
-		}
-
-		if (msg.type === "paired") {
-			if (msg.mobilePublicKey) {
-				mobilePublicKey = msg.mobilePublicKey;
-				onMobilePaired?.();
-				log?.("[Bridge] Mobile paired");
-				sendSessionList();
-			}
-			return;
-		}
-
-		if (msg.type === "message") {
-			const payloadCheck = validateEncryptedPayload((raw as { payload?: unknown }).payload);
-			if (!payloadCheck.ok) {
-				protocolViolation(payloadCheck.reason);
+			let raw: unknown;
+			try {
+				raw = JSON.parse(data.toString());
+			} catch {
+				protocolViolation("invalid_json");
 				return;
 			}
 
-			const replayCheck = replayGuard.check(payloadCheck.value);
-			if (!replayCheck.ok) {
-				log?.(`[Bridge] Rejected replayed/stale mobile message (${replayCheck.reason})`);
+			if (typeof raw !== "object" || raw === null) {
+				protocolViolation("message_not_object");
 				return;
 			}
 
-			const decoded = decryptFromMobile(payloadCheck.value);
-			if (!decoded) {
-				log?.("[Bridge] Failed to decrypt message");
+			const type = (raw as { type?: unknown }).type;
+			if (typeof type !== "string") {
+				protocolViolation("missing_type");
 				return;
 			}
 
-			await handleMobileMessage(decoded);
-			return;
-		}
+			const msg = raw as RelayInboundMessage;
 
-		if (msg.type === "error") {
-			log?.("[Bridge] Relay error (redacted)");
+			if (msg.type === "registered") {
+				pairingCode = msg.pin ?? msg.pairingCode;
+				onPairingCode?.(pairingCode);
+				return;
+			}
+
+			if (msg.type === "paired") {
+				if (msg.mobilePublicKey) {
+					mobilePublicKey = msg.mobilePublicKey;
+					onMobilePaired?.();
+					log?.("[Bridge] Mobile paired");
+					sendSessionList();
+				}
+				return;
+			}
+
+			if (msg.type === "message") {
+				const payloadCheck = validateEncryptedPayload((raw as { payload?: unknown }).payload);
+				if (!payloadCheck.ok) {
+					dropMessage(payloadCheck.reason);
+					return;
+				}
+
+				const replayCheck = replayGuard.check(payloadCheck.value);
+				if (!replayCheck.ok) {
+					log?.(`[Bridge] Rejected replayed/stale mobile message (${replayCheck.reason})`);
+					return;
+				}
+
+				const decoded = decryptFromMobile(payloadCheck.value);
+				if (!decoded) {
+					log?.("[Bridge] Failed to decrypt message");
+					return;
+				}
+
+				await handleMobileMessage(decoded);
+				return;
+			}
+
+			if (msg.type === "error") {
+				log?.("[Bridge] Relay error (redacted)");
+			}
+		} catch (err) {
+			log?.(`[Bridge] Unhandled relay message error: ${String(err)}`);
+			protocolViolation("unhandled_error");
 		}
 	}
 
