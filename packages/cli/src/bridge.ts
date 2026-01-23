@@ -419,6 +419,9 @@ export async function startRelayUplinkBridge(
 			});
 			sendSessionList();
 		} catch (error) {
+			log?.(
+				`[Bridge] Failed to start session: ${error instanceof Error ? error.message : String(error)}`,
+			);
 			const errorId = `error-${Date.now()}`;
 			sessions.set(errorId, {
 				id: errorId,
@@ -430,7 +433,7 @@ export async function startRelayUplinkBridge(
 			sendToMobile({
 				type: "session_output",
 				sessionId: errorId,
-				text: `Failed to start session: ${error instanceof Error ? error.message : String(error)}`,
+				text: "Failed to start session. Check the terminal logs.",
 			});
 		}
 	}
