@@ -24,6 +24,9 @@ describe("ensureLocalTLS", () => {
 	it("creates a persisted cert/key and returns a deterministic tlsPin", async () => {
 		const first = await ensureLocalTLS({ tlsDir: tmpDir });
 		expect(first.tlsPin).toMatch(/^[0-9a-f]{64}$/);
+		expect(first.certValidToMs).toBeGreaterThan(Date.now());
+		expect(first.status).toBe("generated");
+		expect(first.regenerateReason).toBe("missing");
 
 		const certPem1 = await fs.readFile(first.certPath, "utf8");
 		const keyPem1 = await fs.readFile(first.keyPath, "utf8");
@@ -38,5 +41,20 @@ describe("ensureLocalTLS", () => {
 		expect(second.tlsPin).toBe(first.tlsPin);
 		expect(certPem2).toBe(certPem1);
 		expect(keyPem2).toBe(keyPem1);
+		expect(second.status).toBe("existing");
+	});
+
+	it("regenerates if existing files are invalid", async () => {
+		await fs.writeFile(path.join(tmpDir, "cert.pem"), "not a cert", "utf8");
+		await fs.writeFile(path.join(tmpDir, "key.pem"), "not a key", "utf8");
+
+		const info = await ensureLocalTLS({ tlsDir: tmpDir });
+		expect(info.tlsPin).toMatch(/^[0-9a-f]{64}$/);
+		expect(info.certValidToMs).toBeGreaterThan(Date.now());
+		expect(info.status).toBe("regenerated");
+		expect(info.regenerateReason).toBe("invalid");
+
+		const certPem = await fs.readFile(info.certPath, "utf8");
+		expect(certPem).toContain("BEGIN CERTIFICATE");
 	});
 });

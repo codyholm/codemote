@@ -126,6 +126,20 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	let currentPIN = "";
 	const tlsInfo = tlsDisabled ? undefined : await ensureLocalTLS();
 	const relayCertPem = tlsInfo ? await readFile(tlsInfo.certPath) : undefined;
+	if (tlsInfo) {
+		const daysRemaining = Math.floor((tlsInfo.certValidToMs - Date.now()) / (24 * 60 * 60 * 1000));
+		if (tlsInfo.status === "regenerated") {
+			console.warn(
+				`[Server] TLS certificate regenerated (${tlsInfo.regenerateReason ?? "unknown"}); re-pair iOS (Forget Server)`,
+			);
+		} else if (tlsInfo.status === "generated") {
+			console.log("[Server] TLS certificate created; scan QR to pair");
+		} else if (daysRemaining <= 30) {
+			console.warn(
+				`[Server] TLS certificate expires in ${daysRemaining} day(s); when it rotates you'll need to re-pair`,
+			);
+		}
+	}
 
 	// Start the relay server
 	const relayConfig: Partial<RelayServerConfig> = {
