@@ -2,11 +2,13 @@
  * PIN generation and rate limiting for pairing operations
  */
 
+import { randomInt } from "node:crypto";
+
 /**
  * Generates a 6-digit numeric PIN (000000-999999)
  */
 export function generatePIN(): string {
-	const pin = Math.floor(Math.random() * 1_000_000);
+	const pin = randomInt(0, 1_000_000);
 	return pin.toString().padStart(6, "0");
 }
 

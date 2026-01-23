@@ -8,12 +8,15 @@ describe("generatePIN", () => {
 		expect(pin).toMatch(/^\d{6}$/);
 	});
 
-	it("should pad with leading zeros", () => {
-		// Mock Math.random to return a small number
-		vi.spyOn(Math, "random").mockReturnValue(0.000001);
-		const pin = generatePIN();
-		expect(pin).toBe("000001");
-		vi.restoreAllMocks();
+	it("can produce leading zeros", () => {
+		let found = false;
+		for (let i = 0; i < 5000; i++) {
+			if (generatePIN().startsWith("0")) {
+				found = true;
+				break;
+			}
+		}
+		expect(found).toBe(true);
 	});
 
 	it("should generate different PINs", () => {
