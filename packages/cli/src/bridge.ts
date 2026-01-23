@@ -2,7 +2,10 @@ import { randomBytes } from "node:crypto";
 import nacl from "tweetnacl";
 import { WebSocket } from "ws";
 
+import { WS_MAX_PAYLOAD_BYTES } from "./messageLimits.js";
+import type { EncryptedPayload } from "./protocol.js";
 import { ReplayGuard } from "./replayProtection.js";
+import { validateEncryptedPayload } from "./validateEncryptedPayload.js";
 
 import type {
 	RuntimeType,
@@ -39,13 +42,6 @@ type RelayInboundMessage =
 	| RelayPairedMessage
 	| RelayMessageMessage
 	| RelayErrorMessage;
-
-interface EncryptedPayload {
-	senderPublicKey: string;
-	ciphertext: string;
-	nonce: string;
-	timestamp: number;
-}
 
 interface SessionInfo {
 	id: string;
@@ -291,13 +287,13 @@ export async function startRelayUplinkBridge(
 	let mobilePublicKey: string | null = null;
 
 	const relayWs = relayWsOptions
-		? new WebSocket(relayUrl, relayWsOptions)
-		: new WebSocket(relayUrl);
+		? new WebSocket(relayUrl, { maxPayload: WS_MAX_PAYLOAD_BYTES, ...relayWsOptions })
+		: new WebSocket(relayUrl, { maxPayload: WS_MAX_PAYLOAD_BYTES });
 	await waitForOpen(relayWs);
 
 	let pairingCode = await registerWithRelay(relayWs, uplinkPublicKey);
 	onPairingCode?.(pairingCode);
-	log?.(`[Bridge] Registered with relay, pairing code: ${pairingCode}`);
+	log?.("[Bridge] Registered with relay (pairing code redacted)");
 
 	const uplinkClient = await UplinkWsClient.connect(uplinkUrl, (event) => {
 		void handleUplinkEvent(event);
@@ -315,8 +311,36 @@ export async function startRelayUplinkBridge(
 		log?.(`[Bridge] Relay WebSocket error: ${String(err)}`);
 	});
 
+	function protocolViolation(reason: string) {
+		log?.(`[Bridge] Protocol violation: ${reason}; closing relay socket`);
+		try {
+			relayWs.close(1008, "Protocol violation");
+		} catch {
+			// ignore
+		}
+	}
+
 	async function handleRelayMessage(data: WebSocket.RawData) {
-		const msg = JSON.parse(data.toString()) as RelayInboundMessage;
+		let raw: unknown;
+		try {
+			raw = JSON.parse(data.toString());
+		} catch {
+			protocolViolation("invalid_json");
+			return;
+		}
+
+		if (typeof raw !== "object" || raw === null) {
+			protocolViolation("message_not_object");
+			return;
+		}
+
+		const type = (raw as { type?: unknown }).type;
+		if (typeof type !== "string") {
+			protocolViolation("missing_type");
+			return;
+		}
+
+		const msg = raw as RelayInboundMessage;
 
 		if (msg.type === "registered") {
 			pairingCode = msg.pin ?? msg.pairingCode;
@@ -335,13 +359,19 @@ export async function startRelayUplinkBridge(
 		}
 
 		if (msg.type === "message") {
-			const replayCheck = replayGuard.check(msg.payload);
+			const payloadCheck = validateEncryptedPayload((raw as { payload?: unknown }).payload);
+			if (!payloadCheck.ok) {
+				protocolViolation(payloadCheck.reason);
+				return;
+			}
+
+			const replayCheck = replayGuard.check(payloadCheck.value);
 			if (!replayCheck.ok) {
 				log?.(`[Bridge] Rejected replayed/stale mobile message (${replayCheck.reason})`);
 				return;
 			}
 
-			const decoded = decryptFromMobile(msg.payload);
+			const decoded = decryptFromMobile(payloadCheck.value);
 			if (!decoded) {
 				log?.("[Bridge] Failed to decrypt message");
 				return;
@@ -352,7 +382,7 @@ export async function startRelayUplinkBridge(
 		}
 
 		if (msg.type === "error") {
-			log?.(`[Bridge] Relay error: ${msg.message}`);
+			log?.("[Bridge] Relay error (redacted)");
 		}
 	}
 
@@ -487,19 +517,34 @@ export async function startRelayUplinkBridge(
 	}
 
 	function decryptFromMobile(payload: EncryptedPayload): MobileInboundMessage | null {
-		const senderPublicKey = Buffer.from(payload.senderPublicKey, "base64");
-		const nonce = Buffer.from(payload.nonce, "base64");
-		const ciphertext = Buffer.from(payload.ciphertext, "base64");
+		let senderPublicKey: Buffer;
+		let nonce: Buffer;
+		let ciphertext: Buffer;
+		try {
+			senderPublicKey = Buffer.from(payload.senderPublicKey, "base64");
+			nonce = Buffer.from(payload.nonce, "base64");
+			ciphertext = Buffer.from(payload.ciphertext, "base64");
+		} catch {
+			return null;
+		}
+
+		if (senderPublicKey.length !== 32) return null;
+		if (nonce.length !== 24) return null;
 
 		const plaintext = nacl.box.open(ciphertext, nonce, senderPublicKey, uplinkKeyPair.secretKey);
 		if (!plaintext) {
 			return null;
 		}
 
-		const decoded = JSON.parse(Buffer.from(plaintext).toString("utf8")) as {
-			type: string;
-			[key: string]: unknown;
-		};
+		let decoded: { type: string; [key: string]: unknown };
+		try {
+			decoded = JSON.parse(Buffer.from(plaintext).toString("utf8")) as {
+				type: string;
+				[key: string]: unknown;
+			};
+		} catch {
+			return null;
+		}
 
 		if (
 			decoded.type !== "new_session" &&
