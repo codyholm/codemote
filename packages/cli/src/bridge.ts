@@ -311,37 +311,36 @@ export async function startRelayUplinkBridge(
 		log?.(`[Bridge] Relay WebSocket error: ${String(err)}`);
 	});
 
-	function protocolViolation(reason: string) {
-		log?.(`[Bridge] Protocol violation: ${reason}; closing relay socket`);
-		try {
-			relayWs.close(1008, "Protocol violation");
-		} catch {
-			// ignore
-		}
-	}
-
 	function dropMessage(reason: string) {
 		log?.(`[Bridge] Dropped relay message: ${reason}`);
+	}
+
+	function rawDataToBuffer(data: WebSocket.RawData): Buffer {
+		if (typeof data === "string") return Buffer.from(data, "utf8");
+		if (data instanceof Buffer) return data;
+		if (data instanceof ArrayBuffer) return Buffer.from(data);
+		if (Array.isArray(data)) return Buffer.concat(data);
+		return Buffer.from(data as unknown as ArrayBuffer);
 	}
 
 	async function handleRelayMessage(data: WebSocket.RawData) {
 		try {
 			let raw: unknown;
 			try {
-				raw = JSON.parse(data.toString());
+				raw = JSON.parse(rawDataToBuffer(data).toString("utf8"));
 			} catch {
-				protocolViolation("invalid_json");
+				dropMessage("invalid_json");
 				return;
 			}
 
 			if (typeof raw !== "object" || raw === null) {
-				protocolViolation("message_not_object");
+				dropMessage("message_not_object");
 				return;
 			}
 
 			const type = (raw as { type?: unknown }).type;
 			if (typeof type !== "string") {
-				protocolViolation("missing_type");
+				dropMessage("missing_type");
 				return;
 			}
 
@@ -391,7 +390,7 @@ export async function startRelayUplinkBridge(
 			}
 		} catch (err) {
 			log?.(`[Bridge] Unhandled relay message error: ${String(err)}`);
-			protocolViolation("unhandled_error");
+			dropMessage("unhandled_error");
 		}
 	}
 

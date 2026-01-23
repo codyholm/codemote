@@ -57,9 +57,6 @@ importers:
       '@types/qrcode-terminal':
         specifier: ^0.12.2
         version: 0.12.2
-      '@types/selfsigned':
-        specifier: ^2.1.0
-        version: 2.1.0
       '@types/ws':
         specifier: ^8.5.12
         version: 8.18.1
@@ -522,10 +519,6 @@ packages:
 
   '@types/qrcode-terminal@0.12.2':
     resolution: {integrity: sha512-v+RcIEJ+Uhd6ygSQ0u5YYY7ZM+la7GgPbs0V/7l/kFs2uO4S8BcIUEMoP7za4DNIqNnUD5npf0A/7kBhrCKG5Q==}
-
-  '@types/selfsigned@2.1.0':
-    resolution: {integrity: sha512-9IpB+OBu3QaMojPbLMg0PxMA85lOt7o53ycx2ds82CSFMyxlj0iZtAPVJ1m1qnzKTlznYqa6zNVaEWC7hk/E/w==}
-    deprecated: This is a stub types definition. selfsigned provides its own type definitions, so you do not need this installed.
 
   '@types/ws@8.18.1':
     resolution: {integrity: sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==}
@@ -1445,10 +1438,6 @@ snapshots:
       undici-types: 6.21.0
 
   '@types/qrcode-terminal@0.12.2': {}
-
-  '@types/selfsigned@2.1.0':
-    dependencies:
-      selfsigned: 2.4.1
 
   '@types/ws@8.18.1':
     dependencies:

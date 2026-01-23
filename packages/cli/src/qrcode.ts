@@ -25,6 +25,12 @@ export type BuildPairingURLOptions = {
 	relayUrl?: string;
 };
 
+/**
+ * Legacy deep link format.
+ *
+ * Does not include `tlsPin`. Current iOS builds require `tlsPin` for first-time pairing
+ * (QR establishes trust), so this overload is only kept for back-compat/tests.
+ */
 export function buildPairingURL(host: string, port: number, pin: string): string;
 export function buildPairingURL(
 	host: string,

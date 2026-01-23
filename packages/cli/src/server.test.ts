@@ -114,8 +114,16 @@ describe("Server Integration", () => {
 
 				mobileWs.close();
 			} finally {
-				process.env["GUILD_REMOTE_DISABLE_TLS"] = prevDisable;
-				process.env["GUILD_REMOTE_ALLOW_INSECURE"] = prevAllow;
+				if (prevDisable === undefined) {
+					Reflect.deleteProperty(process.env, "GUILD_REMOTE_DISABLE_TLS");
+				} else {
+					process.env["GUILD_REMOTE_DISABLE_TLS"] = prevDisable;
+				}
+				if (prevAllow === undefined) {
+					Reflect.deleteProperty(process.env, "GUILD_REMOTE_ALLOW_INSECURE");
+				} else {
+					process.env["GUILD_REMOTE_ALLOW_INSECURE"] = prevAllow;
+				}
 			}
 		});
 	});
