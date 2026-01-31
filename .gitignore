@@ -56,11 +56,12 @@ happy-server-main/*
 *.mobileprovision
 *.xcarchive/
 ExportOptions.plist
+packages/mobile-ios/build/
 
 # Agent cockpit (local dev)
 .agent-cockpit/
 
 # Fastlane
-fastlane/report.xml
-fastlane/test_output/
-
+**/fastlane/report.xml
+**/fastlane/test_output/
+**/fastlane/screenshots/

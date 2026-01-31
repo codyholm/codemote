@@ -2,6 +2,27 @@
 
 CLI utilities for Guild Remote, including PIN generation and rate limiting for pairing operations.
 
+This package also ships the `guild-remote` executable (combined relay + uplink + bridge).
+
+## Running the Server
+
+```bash
+# From repo root
+pnpm -C packages/cli build
+pnpm -C packages/cli start
+
+# With debug logging
+GUILD_REMOTE_DEBUG=1 pnpm -C packages/cli start
+```
+
+When running interactively, you can start sessions from the terminal:
+
+```text
+> claude <prompt>
+> opencode <prompt>
+> codex <prompt>
+```
+
 ## Features
 
 ### PIN Generation
@@ -95,6 +116,9 @@ Manages PIN generation, expiry, and validation.
 
 ```bash
 pnpm test
+
+# Or run only CLI tests
+pnpm vitest run packages/cli/
 ```
 
 ## Building
