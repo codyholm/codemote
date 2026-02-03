@@ -23,13 +23,13 @@ importers:
 
   packages/cli:
     dependencies:
-      '@guild-remote/common':
+      '@codemote/common':
         specifier: workspace:*
         version: link:../common
-      '@guild-remote/relay':
+      '@codemote/relay':
         specifier: workspace:*
         version: link:../relay
-      '@guild-remote/uplink':
+      '@codemote/uplink':
         specifier: workspace:*
         version: link:../uplink
       bonjour-service:
@@ -75,15 +75,15 @@ importers:
 
   packages/relay:
     dependencies:
+      '@codemote/common':
+        specifier: workspace:*
+        version: link:../common
       '@fastify/cors':
         specifier: ^11.2.0
         version: 11.2.0
       '@fastify/websocket':
         specifier: ^11.2.0
         version: 11.2.0
-      '@guild-remote/common':
-        specifier: workspace:*
-        version: link:../common
       better-sqlite3:
         specifier: ^12.6.0
         version: 12.6.0
@@ -109,7 +109,7 @@ importers:
 
   packages/uplink:
     dependencies:
-      '@guild-remote/common':
+      '@codemote/common':
         specifier: workspace:*
         version: link:../common
       node-pty:
@@ -122,7 +122,7 @@ importers:
         specifier: ^8.19.0
         version: 8.19.0
     devDependencies:
-      '@guild-remote/relay':
+      '@codemote/relay':
         specifier: workspace:*
         version: link:../relay
       '@types/node':

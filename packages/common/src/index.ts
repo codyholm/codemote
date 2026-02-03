@@ -1,4 +1,4 @@
-// Shared types for Guild Remote
+// Shared types for Codemote
 
 export const VERSION = "0.1.0";
 

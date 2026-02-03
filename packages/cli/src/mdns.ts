@@ -1,5 +1,5 @@
 /**
- * mDNS/Bonjour service advertisement for Guild Remote
+ * mDNS/Bonjour service advertisement for Codemote
  * Advertises the service on the local network for iOS discovery
  */
 
@@ -8,7 +8,7 @@ import { Bonjour } from "bonjour-service";
 import type { Service } from "bonjour-service";
 
 /**
- * Configuration for advertising the Guild Remote service
+ * Configuration for advertising the Codemote service
  */
 export interface ServiceConfig {
 	/** Port number where the service is listening */
@@ -22,8 +22,8 @@ export interface ServiceConfig {
 }
 
 /**
- * Advertises Guild Remote service via mDNS/Bonjour
- * iOS apps discover this service using _guildremote._tcp.local
+ * Advertises Codemote service via mDNS/Bonjour
+ * iOS apps discover this service using _codemote._tcp.local
  */
 export class MDNSAdvertiser {
 	private bonjour: Bonjour;
@@ -35,7 +35,7 @@ export class MDNSAdvertiser {
 	}
 
 	/**
-	 * Advertises the Guild Remote service on the local network
+	 * Advertises the Codemote service on the local network
 	 * @param config - Service configuration including port and pairing code
 	 */
 	advertise(config: ServiceConfig): void {
@@ -50,8 +50,8 @@ export class MDNSAdvertiser {
 		this.currentConfig = { port, pin: token, pairingCode: token, version };
 
 		this.service = this.bonjour.publish({
-			name: `Guild Remote on ${os.hostname()}`,
-			type: "guildremote", // becomes _guildremote._tcp
+			name: `Codemote on ${os.hostname()}`,
+			type: "codemote", // becomes _codemote._tcp
 			port,
 			txt: {
 				version,

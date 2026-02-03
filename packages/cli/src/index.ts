@@ -1,5 +1,5 @@
 /**
- * @guild-remote/cli - CLI tools for Guild Remote
+ * codemote - CLI tools for Codemote
  */
 
 export {

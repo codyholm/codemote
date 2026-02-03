@@ -2,6 +2,18 @@
 
 ## Overview
 
+This file documents the original pairing utilities (`packages/cli/src/pairing.ts`).
+
+Current status:
+
+- The shipped local pairing flow uses the relay’s `PairingCodeService` (SQLite) in `packages/relay`.
+- `pairing.ts` (PIN manager + rate limiting) is not the primary code path today.
+
+See:
+
+- `packages/cli/SERVER.md` for the current local server composition.
+- `docs/connection-architecture.md` for the connection roadmap.
+
 Implemented a complete PIN generation and rate limiting system for device pairing operations in `packages/cli/src/pairing.ts`.
 
 ## Components
@@ -94,7 +106,7 @@ Comprehensive test suite with 34 tests covering:
 ## Usage Example
 
 ```typescript
-import { generatePIN, RateLimiter, PINManager } from "@guild-remote/cli";
+import { generatePIN, RateLimiter, PINManager } from "codemote";
 
 // Generate PIN
 const pin = generatePIN(); // "042815"

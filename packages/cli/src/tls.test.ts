@@ -14,7 +14,7 @@ describe("ensureLocalTLS", () => {
 	let tmpDir: string;
 
 	beforeEach(async () => {
-		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "guild-remote-tls-"));
+		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codemote-tls-"));
 	});
 
 	afterEach(async () => {

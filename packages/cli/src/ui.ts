@@ -38,7 +38,7 @@ export async function renderUI(state: UIState): Promise<void> {
 	// Box drawing
 	console.log(chalk.cyan("┌─────────────────────────────────────────────────────────────┐"));
 	console.log(
-		`${chalk.cyan("│")}${chalk.bold.white("                      Guild Remote                           ")}${chalk.cyan("│")}`,
+		`${chalk.cyan("│")}${chalk.bold.white("                        Codemote                             ")}${chalk.cyan("│")}`,
 	);
 	console.log(chalk.cyan("│                                                             │"));
 

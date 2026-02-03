@@ -1,12 +1,12 @@
 {
-	"name": "guild-remote",
+	"name": "codemote",
 	"version": "0.1.0",
 	"description": "Control AI coding agents from your phone",
 	"type": "module",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
 	"bin": {
-		"guild-remote": "./dist/cli.js"
+		"codemote": "./dist/cli.js"
 	},
 	"scripts": {
 		"build": "tsc",
@@ -17,9 +17,9 @@
 		"test:watch": "vitest"
 	},
 	"dependencies": {
-		"@guild-remote/common": "workspace:*",
-		"@guild-remote/relay": "workspace:*",
-		"@guild-remote/uplink": "workspace:*",
+		"@codemote/common": "workspace:*",
+		"@codemote/relay": "workspace:*",
+		"@codemote/uplink": "workspace:*",
 		"bonjour-service": "^1.2.1",
 		"chalk": "^5.3.0",
 		"qrcode-terminal": "^0.12.0",

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 /**
- * CLI Entry Point for Guild Remote
+ * CLI Entry Point for Codemote
  *
  * Main executable that starts the server, displays the UI, and handles
- * graceful shutdown. This is the entry point for `npx guild-remote`.
+ * graceful shutdown. This is the entry point for `npx codemote`.
  *
  * RESPONSIBILITIES:
  * 1. Start relay + uplink server on configured port
@@ -16,10 +16,10 @@
  * USAGE:
  * ```bash
  * # Default port 8080
- * npx guild-remote
+ * npx codemote
  *
  * # Custom port
- * PORT=3000 npx guild-remote
+ * PORT=3000 npx codemote
  * ```
  */
 
@@ -31,13 +31,13 @@ import { renderUI, updateStatus } from "./ui.js";
 
 import readline from "node:readline";
 
-import type { RuntimeType } from "@guild-remote/uplink";
+import type { RuntimeType } from "@codemote/uplink";
 
 async function main() {
 	const port = Number.parseInt(process.env["PORT"] || "8080", 10);
 	let interactive = false;
 
-	console.log("Starting Guild Remote...");
+	console.log("Starting Codemote...");
 
 	// Start the server (relay + uplink + bridge)
 	const server = await startServer({

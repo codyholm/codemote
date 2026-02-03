@@ -14,7 +14,7 @@ import { generateQRCode } from "./qrcode.js";
 import { startServer } from "./server.js";
 
 async function main() {
-	console.log("Starting Guild Remote server...\n");
+	console.log("Starting Codemote server...\n");
 
 	// Start the server
 	const server = await startServer({

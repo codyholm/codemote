@@ -1,5 +1,5 @@
 /**
- * Base error class for Guild Remote
+ * Base error class for Codemote
  */
 export class GuildRemoteError extends Error {
 	readonly code: string;

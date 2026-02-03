@@ -225,10 +225,10 @@ describe("Integration: Service Discovery", () => {
 			await new Promise<void>((resolve) => {
 				setTimeout(() => {
 					const browser = new Bonjour();
-					const finder = browser.find({ type: "guildremote" });
+					const finder = browser.find({ type: "codemote" });
 
 					finder.on("up", (service) => {
-						expect(service.type).toBe("guildremote");
+						expect(service.type).toBe("codemote");
 						expect(service.port).toBe(3000);
 						expect(service.txt?.pin).toBeUndefined();
 						expect(service.txt?.pairingCode).toBeUndefined();

@@ -1,8 +1,8 @@
-# @guild-remote/cli
+# codemote
 
-CLI utilities for Guild Remote, including PIN generation and rate limiting for pairing operations.
+CLI utilities for Codemote, including PIN generation and rate limiting for pairing operations.
 
-This package also ships the `guild-remote` executable (combined relay + uplink + bridge).
+This package also ships the `codemote` executable (combined relay + uplink + bridge).
 
 ## Running the Server
 
@@ -30,7 +30,7 @@ When running interactively, you can start sessions from the terminal:
 Generate secure 6-digit PINs for device pairing:
 
 ```typescript
-import { generatePIN } from "@guild-remote/cli";
+import { generatePIN } from "codemote";
 
 const pin = generatePIN(); // "042815"
 ```
@@ -40,7 +40,7 @@ const pin = generatePIN(); // "042815"
 Protect pairing endpoints with exponential backoff and lockout:
 
 ```typescript
-import { RateLimiter } from "@guild-remote/cli";
+import { RateLimiter } from "codemote";
 
 const limiter = new RateLimiter({
   maxAttempts: 5,
@@ -60,7 +60,7 @@ if (!result.allowed) {
 Manage PIN lifecycle with automatic expiry:
 
 ```typescript
-import { PINManager } from "@guild-remote/cli";
+import { PINManager } from "codemote";
 
 const manager = new PINManager(5 * 60 * 1000); // 5 minute TTL
 

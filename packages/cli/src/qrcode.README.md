@@ -1,78 +1,68 @@
-# QR Code Module
+# Terminal QR Code Pairing
 
-Terminal QR code generation for Guild Remote pairing.
+This module builds a deep link URL for pairing and renders it as a terminal-friendly QR code.
 
-## Features
+## What the QR contains
 
-- Build deep link pairing URLs with host, port, and PIN
-- Auto-detect local network IP address
-- Generate terminal-friendly QR codes for mobile scanning
+The QR code encodes a `codemote://pair` deep link.
+
+Current format (preferred):
+
+```
+codemote://pair?
+  host=<lan-host>
+  &port=<relay-port>
+  &relay=wss://<lan-host>:<relay-port>
+  &pin=<6-digit>
+  &tlsPin=<sha256-hex-64>
+  &code=<6-digit>
+```
+
+Notes:
+
+- `tlsPin` is the trust anchor for first-time pairing in local mode.
+- `pin` is canonical; `code` is a legacy alias accepted by older clients.
+- `relay` allows the iOS app to avoid manual URL entry.
 
 ## API
 
-### `buildPairingURL(host: string, port: number, pin: string): string`
+### `buildPairingURL(host, port, pin, options)`
 
-Builds a deep link URL for pairing.
+```ts
+type BuildPairingURLOptions = {
+  tlsPin: string;
+  relayUrl?: string; // defaults to wss://{host}:{port}
+};
 
-```typescript
-const url = buildPairingURL('192.168.1.100', 3000, '123456');
-// Returns: 'guildremote://pair?host=192.168.1.100&port=3000&pin=123456'
+buildPairingURL(host: string, port: number, pin: string, options: BuildPairingURLOptions): string
 ```
 
-### `getLocalIP(): string`
+### `generateQRCode(url)`
 
-Detects the local network IP address.
-
-**Detection Strategy:**
-1. Prefers common interfaces: `en0` (macOS), `eth0` (Linux), `en1`, `wlan0`
-2. Filters out:
-   - Loopback (`127.0.0.1`)
-   - Docker interfaces (`docker0`, `veth*`, `br-*`)
-   - Link-local addresses (`169.254.x.x`)
-   - Internal/virtual interfaces
-3. Falls back to `127.0.0.1` if no valid interface found
-
-```typescript
-const ip = getLocalIP();
-// Returns: '192.168.1.100' (example)
+```ts
+generateQRCode(url: string): Promise<string>
 ```
 
-### `generateQRCode(url: string): Promise<string>`
+## Example
 
-Generates a terminal-displayable QR code.
+```ts
+import { buildPairingURL, generateQRCode, getLocalIP } from "./qrcode.js";
 
-```typescript
-const qrCode = await generateQRCode('guildremote://pair?host=192.168.1.100&port=3000&pin=123456');
-console.log(qrCode);
-// Displays ASCII QR code
+const host = getLocalIP();
+const port = 8080;
+const pin = "851843";
+const tlsPin = "b61ea072..."; // 64 hex chars
+
+const url = buildPairingURL(host, port, pin, { tlsPin });
+const qr = await generateQRCode(url);
+
+console.log(qr);
 ```
 
-## Example Usage
+## Security Notes
 
-```typescript
-import { buildPairingURL, getLocalIP, generateQRCode } from './qrcode.js';
+- Do not print the raw pairing URL to logs (it contains the PIN).
+- Do not include the PIN in mDNS TXT records.
+- Prefer showing the QR in the UI and redacting the PIN in logs.
 
-async function showPairingQRCode(port: number, pin: string) {
-  const host = getLocalIP();
-  const url = buildPairingURL(host, port, pin);
-
-  console.log('Scan this QR code with the Guild Remote app:');
-  const qrCode = await generateQRCode(url);
-  console.log(qrCode);
-
-  console.log(`PIN: ${pin}`);
-}
-```
-
-## Testing
-
-Run tests with:
-
-```bash
-pnpm test qrcode
-```
-
-Tests cover:
-- URL building with various inputs
-- IP detection across different network configurations
-- QR code generation and uniqueness
+See `docs/security-architecture.md`.

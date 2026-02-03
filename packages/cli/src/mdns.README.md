@@ -1,24 +1,23 @@
 # mDNS Service Advertisement
 
-The `mdns` module provides Bonjour/mDNS service advertisement for Guild Remote, enabling iOS apps to discover the service on the local network.
+The `mdns` module provides Bonjour/mDNS service advertisement for Codemote, enabling iOS apps to discover the service on the local network.
 
 ## Overview
 
-This module uses the `bonjour-service` package to advertise the Guild Remote service as `_guildremote._tcp.local`, which iOS apps can discover using the Network framework or Bonjour.
+This module uses the `bonjour-service` package to advertise the Codemote service as `_codemote._tcp.local`, which iOS apps can discover using the Network framework.
 
 ## Quick Start
 
 ```typescript
-import { advertiseService } from '@guild-remote/cli';
+import { advertiseService } from "codemote";
 
-// Start advertising on port 3000 with a PIN
-const advertiser = advertiseService(3000, "123456");
+// Start advertising on port 8080
+// NOTE: the PIN is NOT advertised via mDNS TXT records.
+const advertiser = advertiseService(8080, "123456");
 
-// Service is now discoverable on the local network
-// Remember to clean up when done
-process.on('SIGINT', () => {
-  advertiser.destroy();
-  process.exit(0);
+process.on("SIGINT", () => {
+	advertiser.destroy();
+	process.exit(0);
 });
 ```
 
@@ -32,7 +31,7 @@ The main class for managing mDNS service advertisement.
 
 ##### `advertise(config: ServiceConfig): void`
 
-Starts advertising the Guild Remote service on the local network.
+Starts advertising the Codemote service on the local network.
 
 ```typescript
 const advertiser = new MDNSAdvertiser();
@@ -43,12 +42,15 @@ advertiser.advertise({
 });
 ```
 
-##### `updatePIN(newPIN: string): void`
+##### `updatePairingCode(newPairingCode: string): void`
 
-Updates the PIN in the TXT records without stopping the service. This is useful for PIN rotation.
+Updates the pairing token associated with the advertiser.
+
+Security note: the pairing token is not published in TXT records; updating it is for internal bookkeeping
+and any future extensions (not for discovery).
 
 ```typescript
-advertiser.updatePIN("654321");
+advertiser.updatePairingCode("654321");
 ```
 
 ##### `stop(): void`
@@ -100,30 +102,33 @@ const advertiser = advertiseService(3000, "123456");
 
 ```typescript
 interface ServiceConfig {
-  port: number;      // Port where the service is listening
-  pin: string;       // PIN for pairing authentication
-  version?: string;  // Protocol version (default: "1")
+	port: number; // Port where the service is listening
+	pin: string; // Pairing token (NOT broadcast via TXT)
+	pairingCode?: string; // Back-compat alias
+	version?: string; // Protocol version (default: "1")
 }
 ```
 
 ## Service Discovery
 
-The advertised service includes the following information:
+The advertised service includes endpoint metadata only:
 
-- **Service Type**: `_guildremote._tcp.local`
-- **Service Name**: `Guild Remote on <hostname>`
-- **Port**: The configured port number
+- **Service Type**: `_codemote._tcp.local`
+- **Service Name**: `Codemote on <hostname>`
+- **Port**: the configured port
 - **TXT Records**:
-  - `pin`: Current pairing PIN
-  - `version`: Protocol version
-  - `hostname`: System hostname
+  - `version`
+  - `hostname`
+  - `port`
+
+The pairing PIN is intentionally NOT included in TXT records.
 
 ### iOS Discovery Example
 
 ```swift
 import Network
 
-let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_guildremote._tcp", domain: nil), using: .tcp)
+let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_codemote._tcp", domain: nil), using: .tcp)
 
 browser.browseResultsChangedHandler = { results, changes in
     for result in results {
@@ -140,12 +145,13 @@ browser.browseResultsChangedHandler = { results, changes in
 browser.start(queue: .main)
 ```
 
-## Integration with PINManager
+## Integration with PIN rotation
 
-The mDNS advertiser works seamlessly with the `PINManager` for automatic PIN rotation:
+If you rotate the pairing token, you can keep local discovery stable while updating the UI/QR.
+This example shows how to wire a PIN manager to re-advertise:
 
 ```typescript
-import { MDNSAdvertiser, PINManager } from '@guild-remote/cli';
+import { MDNSAdvertiser, PINManager } from "codemote";
 
 const advertiser = new MDNSAdvertiser();
 const pinManager = new PINManager(5 * 60 * 1000); // 5 minute TTL
@@ -153,7 +159,7 @@ const pinManager = new PINManager(5 * 60 * 1000); // 5 minute TTL
 // Update mDNS when PIN regenerates
 pinManager.setOnRegenerate((newPIN) => {
   console.log(`PIN rotated to: ${newPIN}`);
-  advertiser.updatePIN(newPIN);
+  advertiser.updatePairingCode(newPIN);
 });
 
 // Start advertising
@@ -172,14 +178,14 @@ process.on('SIGINT', () => {
 
 ## Error Handling
 
-The `updatePIN` method will throw an error if called when not advertising:
+The `updatePairingCode` method will throw an error if called when not advertising:
 
 ```typescript
 try {
-  advertiser.updatePIN("123456");
+  advertiser.updatePairingCode("123456");
 } catch (error) {
-  console.error("Cannot update PIN:", error.message);
-  // "Cannot update PIN: service is not currently advertising"
+  console.error("Cannot update pairing code:", error.message);
+  // "Cannot update pairing code: service is not currently advertising"
 }
 ```
 
@@ -207,8 +213,8 @@ tsx src/mdns.example.ts
 ## Best Practices
 
 1. **Always clean up**: Call `destroy()` when shutting down to release network resources
-2. **Use PIN rotation**: Integrate with `PINManager` for automatic PIN updates
-3. **Handle errors**: Wrap `updatePIN` in try-catch blocks
+2. **Do not advertise secrets**: keep the PIN out of mDNS TXT records
+3. **Handle errors**: Wrap `updatePairingCode` in try-catch blocks
 4. **Single instance**: Only create one advertiser per port to avoid conflicts
 5. **Unique ports**: Use different ports for multiple services on the same machine
 
@@ -223,7 +229,7 @@ tsx src/mdns.example.ts
 
 ### PIN updates not reflecting
 
-- Ensure you're calling `updatePIN()` on the correct instance
+- Ensure you're calling `updatePairingCode()` on the correct instance
 - Verify the service is advertising before updating
 - iOS apps may cache TXT records briefly
 

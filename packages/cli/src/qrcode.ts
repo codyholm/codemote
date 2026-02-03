@@ -46,11 +46,11 @@ export function buildPairingURL(
 ): string {
 	// Back-compat: include both `pin` (canonical) and `code` (legacy)
 	if (!options) {
-		return `guildremote://pair?host=${host}&port=${port}&pin=${pin}&code=${pin}`;
+		return `codemote://pair?host=${host}&port=${port}&pin=${pin}&code=${pin}`;
 	}
 
 	const relayUrl = options.relayUrl ?? `wss://${host}:${port}`;
-	return `guildremote://pair?host=${host}&port=${port}&relay=${relayUrl}&pin=${pin}&tlsPin=${options.tlsPin}&code=${pin}`;
+	return `codemote://pair?host=${host}&port=${port}&relay=${relayUrl}&pin=${pin}&tlsPin=${options.tlsPin}&code=${pin}`;
 }
 
 /**

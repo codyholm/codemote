@@ -14,14 +14,14 @@ function quickExample() {
 	const pin = generatePIN();
 	const port = 3000;
 
-	console.log(`Advertising Guild Remote service on port ${port}`);
+	console.log(`Advertising Codemote service on port ${port}`);
 	console.log(`PIN: ${pin}\n`);
 
 	const advertiser = advertiseService(port, pin);
 
 	// Service is now discoverable on the local network
 	console.log("Service is advertising...");
-	console.log("iOS app can discover this via _guildremote._tcp.local\n");
+	console.log("iOS app can discover this via _codemote._tcp.local\n");
 
 	// Clean up after 5 seconds
 	setTimeout(() => {
@@ -110,7 +110,7 @@ async function pinRotationExample() {
 
 // Run examples
 if (import.meta.url === `file://${process.argv[1]}`) {
-	console.log("Guild Remote mDNS Examples");
+	console.log("Codemote mDNS Examples");
 	console.log("==========================\n");
 
 	// Run quick example

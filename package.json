@@ -1,10 +1,10 @@
 {
-	"name": "guild-remote",
+	"name": "codemote",
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
 	"bin": {
-		"guild-remote": "./packages/cli/dist/cli.js"
+		"codemote": "./packages/cli/dist/cli.js"
 	},
 	"scripts": {
 		"build": "pnpm -r build",

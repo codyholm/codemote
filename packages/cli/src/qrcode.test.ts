@@ -8,27 +8,27 @@ describe("buildPairingURL", () => {
 	it("should build correct deep link URL", () => {
 		const url = buildPairingURL("192.168.1.100", 3000, "123456", { tlsPin });
 		expect(url).toBe(
-			"guildremote://pair?host=192.168.1.100&port=3000&relay=wss://192.168.1.100:3000&pin=123456&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=123456",
+			"codemote://pair?host=192.168.1.100&port=3000&relay=wss://192.168.1.100:3000&pin=123456&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=123456",
 		);
 	});
 
 	it("should handle different ports", () => {
 		const url = buildPairingURL("10.0.0.5", 8080, "abcdef", { tlsPin });
 		expect(url).toBe(
-			"guildremote://pair?host=10.0.0.5&port=8080&relay=wss://10.0.0.5:8080&pin=abcdef&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=abcdef",
+			"codemote://pair?host=10.0.0.5&port=8080&relay=wss://10.0.0.5:8080&pin=abcdef&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=abcdef",
 		);
 	});
 
 	it("should handle hostname instead of IP", () => {
 		const url = buildPairingURL("localhost", 3000, "999999", { tlsPin });
 		expect(url).toBe(
-			"guildremote://pair?host=localhost&port=3000&relay=wss://localhost:3000&pin=999999&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=999999",
+			"codemote://pair?host=localhost&port=3000&relay=wss://localhost:3000&pin=999999&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=999999",
 		);
 	});
 
 	it("should remain compatible with older parsers", () => {
 		const url = buildPairingURL("192.168.1.100", 3000, "123456");
-		expect(url).toBe("guildremote://pair?host=192.168.1.100&port=3000&pin=123456&code=123456");
+		expect(url).toBe("codemote://pair?host=192.168.1.100&port=3000&pin=123456&code=123456");
 	});
 });
 
@@ -235,7 +235,7 @@ describe("getLocalIP", () => {
 
 describe("generateQRCode", () => {
 	it("should generate QR code for valid URL", async () => {
-		const url = "guildremote://pair?host=192.168.1.100&port=3000&code=123456";
+		const url = "codemote://pair?host=192.168.1.100&port=3000&code=123456";
 		const qrCode = await generateQRCode(url);
 
 		expect(qrCode).toBeDefined();
@@ -244,8 +244,8 @@ describe("generateQRCode", () => {
 	});
 
 	it("should handle different URLs", async () => {
-		const url1 = "guildremote://pair?host=10.0.0.1&port=8080&code=abc123";
-		const url2 = "guildremote://pair?host=192.168.1.1&port=3000&code=xyz789";
+		const url1 = "codemote://pair?host=10.0.0.1&port=8080&code=abc123";
+		const url2 = "codemote://pair?host=192.168.1.1&port=3000&code=xyz789";
 
 		const qr1 = await generateQRCode(url1);
 		const qr2 = await generateQRCode(url2);

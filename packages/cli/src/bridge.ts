@@ -13,7 +13,7 @@ import type {
 	StreamEvent,
 	UplinkCommand,
 	UplinkResponse,
-} from "@guild-remote/uplink";
+} from "@codemote/uplink";
 
 interface RelayRegisteredMessage {
 	type: "registered";

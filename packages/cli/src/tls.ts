@@ -16,7 +16,7 @@ export type LocalTLSInfo = {
 
 export type EnsureLocalTLSOptions = {
 	/**
-	 * Defaults to `~/.guild-remote/tls`.
+	 * Defaults to `~/.codemote/tls`.
 	 *
 	 * Primarily intended for tests.
 	 */
@@ -24,7 +24,7 @@ export type EnsureLocalTLSOptions = {
 };
 
 function defaultTLSDir(): string {
-	return path.join(os.homedir(), ".guild-remote", "tls");
+	return path.join(os.homedir(), ".codemote", "tls");
 }
 
 function tlsPinFromCertPEM(certPem: string): string {
@@ -53,7 +53,7 @@ async function readFileIfExists(filePath: string): Promise<string | undefined> {
 }
 
 function generateSelfSigned(): { certPem: string; keyPem: string } {
-	const attrs = [{ name: "commonName", value: "guild-remote" }];
+	const attrs = [{ name: "commonName", value: "codemote" }];
 
 	const pems = selfsigned.generate(attrs, {
 		algorithm: "sha256",
@@ -72,7 +72,7 @@ function generateSelfSigned(): { certPem: string; keyPem: string } {
 				name: "subjectAltName",
 				altNames: [
 					{ type: 2, value: "localhost" },
-					{ type: 2, value: "guild-remote.local" },
+					{ type: 2, value: "codemote.local" },
 					{ type: 7, ip: "127.0.0.1" },
 				],
 			},
@@ -86,8 +86,8 @@ function generateSelfSigned(): { certPem: string; keyPem: string } {
  * Ensures a persisted self-signed certificate exists for LAN TLS.
  *
  * Default location:
- * - `~/.guild-remote/tls/cert.pem`
- * - `~/.guild-remote/tls/key.pem`
+ * - `~/.codemote/tls/cert.pem`
+ * - `~/.codemote/tls/key.pem`
  *
  * `tlsPin` is SHA-256 of the leaf certificate DER (hex).
  */

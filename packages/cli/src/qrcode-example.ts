@@ -18,7 +18,7 @@ async function main() {
 	console.log(`Pairing URL: ${url}`);
 
 	// Generate and display QR code
-	console.log("\nScan this QR code with the Guild Remote mobile app:\n");
+	console.log("\nScan this QR code with the Codemote mobile app:\n");
 	const qrCode = await generateQRCode(url);
 	console.log(qrCode);
 
