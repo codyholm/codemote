@@ -18,9 +18,9 @@ export type BuildPairingURLOptions = {
 	 */
 	tlsPin: string;
 	/**
-	 * Full relay URL, e.g. `wss://192.168.1.10:8080`.
+	 * Full relay URL, e.g. `wss://192.168.1.10:8080/ws`.
 	 *
-	 * If omitted, defaults to `wss://{host}:{port}`.
+	 * If omitted, defaults to `wss://{host}:{port}/ws`.
 	 */
 	relayUrl?: string;
 };
@@ -28,8 +28,7 @@ export type BuildPairingURLOptions = {
 /**
  * Legacy deep link format.
  *
- * Does not include `tlsPin`. Current iOS builds require `tlsPin` for first-time pairing
- * (QR establishes trust), so this overload is only kept for back-compat/tests.
+ * Does not include `tlsPin`. This overload is kept for back-compat/tests.
  */
 export function buildPairingURL(host: string, port: number, pin: string): string;
 export function buildPairingURL(
@@ -49,8 +48,11 @@ export function buildPairingURL(
 		return `codemote://pair?host=${host}&port=${port}&pin=${pin}&code=${pin}`;
 	}
 
-	const relayUrl = options.relayUrl ?? `wss://${host}:${port}`;
-	return `codemote://pair?host=${host}&port=${port}&relay=${relayUrl}&pin=${pin}&tlsPin=${options.tlsPin}&code=${pin}`;
+	const relayUrl = options.relayUrl ?? `wss://${host}:${port}/ws`;
+	const relayEncoded = encodeURIComponent(relayUrl);
+	const tlsPinEncoded = encodeURIComponent(options.tlsPin);
+	const pinEncoded = encodeURIComponent(pin);
+	return `codemote://pair?host=${host}&port=${port}&relay=${relayEncoded}&pin=${pinEncoded}&tlsPin=${tlsPinEncoded}&code=${pinEncoded}`;
 }
 
 /**

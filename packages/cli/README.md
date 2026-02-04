@@ -62,7 +62,7 @@ Manage PIN lifecycle with automatic expiry:
 ```typescript
 import { PINManager } from "codemote";
 
-const manager = new PINManager(5 * 60 * 1000); // 5 minute TTL
+const manager = new PINManager(15 * 60 * 1000); // 15 minute TTL
 
 console.log(manager.pin); // Current PIN
 manager.validate("123456"); // Check if PIN matches
@@ -99,7 +99,7 @@ Rate limiter with exponential backoff.
 Manages PIN generation, expiry, and validation.
 
 **Constructor:**
-- `ttlMs` - PIN time-to-live in milliseconds (default: 300000 = 5 minutes)
+- `ttlMs` - PIN time-to-live in milliseconds (default: 900000 = 15 minutes)
 
 **Properties:**
 - `pin` - Get current PIN (regenerates if expired)

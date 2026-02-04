@@ -228,18 +228,32 @@ describe("Integration: Service Discovery", () => {
 					const finder = browser.find({ type: "codemote" });
 
 					finder.on("up", (service) => {
-						expect(service.type).toBe("codemote");
-						expect(service.port).toBe(3000);
-						expect(service.txt?.pin).toBeUndefined();
-						expect(service.txt?.pairingCode).toBeUndefined();
-						expect(service.txt?.port).toBe("3000");
-						expect(service.txt?.version).toBe("1");
+						// Other Codemote instances may be running on the network during local dev
+						// (e.g. a background `pnpm -C packages/cli start`). Filter for the one we started.
+						if (service.port !== 3000) {
+							return;
+						}
 
-						// Cleanup
-						finder.stop?.();
-						browser.destroy();
-						advertiser.destroy();
-						resolve();
+						try {
+							expect(service.type).toBe("codemote");
+							expect(service.port).toBe(3000);
+							expect(service.txt?.pin).toBeUndefined();
+							expect(service.txt?.pairingCode).toBeUndefined();
+							expect(service.txt?.port).toBe("3000");
+							expect(service.txt?.version).toBe("1");
+
+							// Cleanup
+							finder.stop?.();
+							browser.destroy();
+							advertiser.destroy();
+							resolve();
+						} catch (err) {
+							// Ensure cleanup on assertion failure too.
+							finder.stop?.();
+							browser.destroy();
+							advertiser.destroy();
+							throw err;
+						}
 					});
 				}, 100);
 			});

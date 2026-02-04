@@ -8,21 +8,21 @@ describe("buildPairingURL", () => {
 	it("should build correct deep link URL", () => {
 		const url = buildPairingURL("192.168.1.100", 3000, "123456", { tlsPin });
 		expect(url).toBe(
-			"codemote://pair?host=192.168.1.100&port=3000&relay=wss://192.168.1.100:3000&pin=123456&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=123456",
+			"codemote://pair?host=192.168.1.100&port=3000&relay=wss%3A%2F%2F192.168.1.100%3A3000%2Fws&pin=123456&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=123456",
 		);
 	});
 
 	it("should handle different ports", () => {
 		const url = buildPairingURL("10.0.0.5", 8080, "abcdef", { tlsPin });
 		expect(url).toBe(
-			"codemote://pair?host=10.0.0.5&port=8080&relay=wss://10.0.0.5:8080&pin=abcdef&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=abcdef",
+			"codemote://pair?host=10.0.0.5&port=8080&relay=wss%3A%2F%2F10.0.0.5%3A8080%2Fws&pin=abcdef&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=abcdef",
 		);
 	});
 
 	it("should handle hostname instead of IP", () => {
 		const url = buildPairingURL("localhost", 3000, "999999", { tlsPin });
 		expect(url).toBe(
-			"codemote://pair?host=localhost&port=3000&relay=wss://localhost:3000&pin=999999&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=999999",
+			"codemote://pair?host=localhost&port=3000&relay=wss%3A%2F%2Flocalhost%3A3000%2Fws&pin=999999&tlsPin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&code=999999",
 		);
 	});
 

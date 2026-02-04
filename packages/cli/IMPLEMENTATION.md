@@ -45,7 +45,7 @@ Implements sophisticated rate limiting with:
 
 Manages PIN lifecycle with:
 
-- **Automatic Expiry**: PINs expire after configurable TTL (default 5 minutes)
+- **Automatic Expiry**: PINs expire after configurable TTL (default 15 minutes)
 - **Auto-Regeneration**: New PIN generated automatically on expiry
 - **Validation**: Check if provided PIN matches current unexpired PIN
 - **Callbacks**: Notify on regeneration for UI updates
@@ -125,7 +125,7 @@ if (!result.allowed) {
 }
 
 // PIN management
-const manager = new PINManager(5 * 60 * 1000); // 5 min TTL
+const manager = new PINManager(15 * 60 * 1000); // 15 min TTL
 console.log(manager.pin); // Current PIN
 manager.validate("123456"); // Check if matches
 manager.setOnRegenerate((newPin) => {

@@ -154,7 +154,7 @@ This example shows how to wire a PIN manager to re-advertise:
 import { MDNSAdvertiser, PINManager } from "codemote";
 
 const advertiser = new MDNSAdvertiser();
-const pinManager = new PINManager(5 * 60 * 1000); // 5 minute TTL
+const pinManager = new PINManager(15 * 60 * 1000); // 15 minute TTL
 
 // Update mDNS when PIN regenerates
 pinManager.setOnRegenerate((newPIN) => {

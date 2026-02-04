@@ -12,7 +12,7 @@ Current format (preferred):
 codemote://pair?
   host=<lan-host>
   &port=<relay-port>
-  &relay=wss://<lan-host>:<relay-port>
+  &relay=wss%3A%2F%2F<lan-host>%3A<relay-port>%2Fws
   &pin=<6-digit>
   &tlsPin=<sha256-hex-64>
   &code=<6-digit>
@@ -23,6 +23,7 @@ Notes:
 - `tlsPin` is the trust anchor for first-time pairing in local mode.
 - `pin` is canonical; `code` is a legacy alias accepted by older clients.
 - `relay` allows the iOS app to avoid manual URL entry.
+- `relay` is URL-encoded in the deep link query (so it can safely contain `://` and `/ws`).
 
 ## API
 
@@ -31,7 +32,7 @@ Notes:
 ```ts
 type BuildPairingURLOptions = {
   tlsPin: string;
-  relayUrl?: string; // defaults to wss://{host}:{port}
+  relayUrl?: string; // defaults to wss://{host}:{port}/ws
 };
 
 buildPairingURL(host: string, port: number, pin: string, options: BuildPairingURLOptions): string

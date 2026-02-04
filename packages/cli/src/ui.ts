@@ -1,5 +1,7 @@
 import chalk from "chalk";
 
+import { verifyCodeFromTlsPin } from "./tls.js";
+
 export interface UIState {
 	qrCode: string;
 	/** Canonical onboarding token */
@@ -33,6 +35,8 @@ export async function renderUI(state: UIState): Promise<void> {
 	const { qrCode, localURL, status, errorMessage } = state;
 	const pin = state.pin ?? state.pairingCode ?? "";
 	const fingerprint = state.tlsPin ? state.tlsPin.slice(0, 8) : undefined;
+	const verifyCode = state.tlsPin ? verifyCodeFromTlsPin(state.tlsPin) : undefined;
+	const verifyText = verifyCode ? `   Verify code: ${verifyCode}` : "";
 	const fingerprintText = fingerprint ? `   Server fingerprint: ${fingerprint}` : "";
 
 	// Box drawing
@@ -56,6 +60,9 @@ export async function renderUI(state: UIState): Promise<void> {
 	console.log(
 		`${chalk.cyan("│")}${chalk.bold.yellow(`                    ${formatPairingCode(pin)}                          `)}${chalk.cyan("│")}`,
 	);
+	if (verifyText) {
+		console.log(`${chalk.cyan("│")}${chalk.dim(verifyText.padEnd(61))}${chalk.cyan("│")}`);
+	}
 	console.log(`${chalk.cyan("│")}${chalk.dim(fingerprintText.padEnd(61))}${chalk.cyan("│")}`);
 	console.log(
 		`${chalk.cyan("│")}${chalk.dim(`   Local: ${localURL}`.padEnd(61))}${chalk.cyan("│")}`,

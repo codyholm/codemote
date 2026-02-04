@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ensureLocalTLS } from "./tls.js";
+import { ensureLocalTLS, verifyCodeFromTlsPin } from "./tls.js";
 
 function tlsPinFromCertPEM(certPem: string): string {
 	const leaf = new crypto.X509Certificate(certPem);
@@ -56,5 +56,18 @@ describe("ensureLocalTLS", () => {
 
 		const certPem = await fs.readFile(info.certPath, "utf8");
 		expect(certPem).toContain("BEGIN CERTIFICATE");
+	});
+
+	describe("verifyCodeFromTlsPin", () => {
+		it("derives a stable 4-digit code", () => {
+			const tlsPin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+			expect(verifyCodeFromTlsPin(tlsPin)).toBe("8743");
+		});
+
+		it("rejects invalid pins", () => {
+			expect(() => verifyCodeFromTlsPin("not a pin")).toThrow();
+			expect(() => verifyCodeFromTlsPin("")).toThrow();
+			expect(() => verifyCodeFromTlsPin("0123")).toThrow();
+		});
 	});
 });

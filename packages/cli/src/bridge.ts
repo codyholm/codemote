@@ -99,13 +99,32 @@ interface NewSessionMessage {
 	prompt: string;
 }
 
-type MobileInboundMessage = ApprovalResponseMessage | SendPromptMessage | NewSessionMessage;
+type DiffScope = "staged" | "unstaged" | "all";
+
+interface GetDiffMessage {
+	type: "get_diff";
+	sessionId: string;
+	scope: DiffScope;
+}
+
+interface DiffMessage {
+	type: "diff";
+	sessionId: string;
+	diff: string;
+}
+
+type MobileInboundMessage =
+	| ApprovalResponseMessage
+	| SendPromptMessage
+	| NewSessionMessage
+	| GetDiffMessage;
 
 type MobileOutboundMessage =
 	| SessionListMessage
 	| SessionOutputMessage
 	| SessionStatusMessage
-	| ApprovalRequestMessage;
+	| ApprovalRequestMessage
+	| DiffMessage;
 
 export interface RelayUplinkBridgeConfig {
 	relayUrl: string;
@@ -173,6 +192,13 @@ class UplinkWsClient {
 		return this.sendAndWait({
 			type: "send_input",
 			payload: { sessionId, input },
+		});
+	}
+
+	async getDiff(sessionId: string, scope: DiffScope) {
+		return this.sendAndWait({
+			type: "get_diff",
+			payload: { sessionId, scope },
 		});
 	}
 
@@ -405,6 +431,10 @@ export async function startRelayUplinkBridge(
 				await uplinkClient.sendInput(message.sessionId, message.prompt);
 				return;
 			}
+			case "get_diff": {
+				await handleGetDiff(message);
+				return;
+			}
 			case "approval_response": {
 				await handleApprovalResponse(message);
 				return;
@@ -552,6 +582,30 @@ export async function startRelayUplinkBridge(
 		}
 	}
 
+	async function handleGetDiff(message: GetDiffMessage) {
+		try {
+			const response = await uplinkClient.getDiff(message.sessionId, message.scope);
+			if (response.type !== "diff") {
+				throw new Error("Unexpected get_diff response");
+			}
+
+			sendToMobile({
+				type: "diff",
+				sessionId: response.payload.sessionId,
+				diff: response.payload.diff,
+			});
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to get diff: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			sendToMobile({
+				type: "diff",
+				sessionId: message.sessionId,
+				diff: `Failed to get diff. ${error instanceof Error ? error.message : String(error)}`,
+			});
+		}
+	}
+
 	function sendSessionList() {
 		const sessionsList = Array.from(sessions.values()).sort((a, b) => b.createdAt - a.createdAt);
 		log?.(
@@ -597,6 +651,7 @@ export async function startRelayUplinkBridge(
 
 		if (
 			decoded.type !== "new_session" &&
+			decoded.type !== "get_diff" &&
 			decoded.type !== "send_prompt" &&
 			decoded.type !== "approval_response"
 		) {

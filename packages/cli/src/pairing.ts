@@ -129,7 +129,9 @@ export class RateLimiter {
 		}
 
 		// Apply exponential backoff
-		const backoffIndex = Math.min(newCount - 1, this.config.backoffMs.length - 1);
+		// Backoff applies based on the number of *prior* failed attempts.
+		// e.g. after 1 failed attempt, require backoffMs[0] before allowing attempt #2.
+		const backoffIndex = Math.min(record.count - 1, this.config.backoffMs.length - 1);
 		const backoffDelay = this.config.backoffMs[backoffIndex];
 		const timeSinceLastAttempt = now - record.lastAttempt;
 

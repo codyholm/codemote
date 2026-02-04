@@ -54,7 +54,7 @@ async function main() {
 	// Get local IP and build QR code URL
 	const host = getLocalIP();
 	const relayScheme = server.url.startsWith("wss://") ? "wss" : "ws";
-	const relayUrl = `${relayScheme}://${host}:${port}`;
+	const relayUrl = `${relayScheme}://${host}:${port}/ws`;
 	const tlsPin = relayScheme === "wss" ? (await ensureLocalTLS()).tlsPin : undefined;
 	const pairingURL = tlsPin
 		? buildPairingURL(host, port, server.pin, { tlsPin, relayUrl })
@@ -78,7 +78,7 @@ async function main() {
 	// Optional interactive terminal commands (for starting sessions)
 	if (process.stdin.isTTY) {
 		interactive = true;
-		console.log("\nCommands: claude|opencode|codex <prompt>  (or: help)");
+		console.log("\nCommands: claude|opencode|codex|gemini <prompt>  (or: help)");
 		const rl = readline.createInterface({
 			input: process.stdin,
 			output: process.stdout,
@@ -96,7 +96,7 @@ async function main() {
 
 			if (trimmed === "help") {
 				console.log(
-					"\nCommands:\n  claude <prompt>\n  opencode <prompt>\n  codex <prompt>\n  quit\n",
+					"\nCommands:\n  claude <prompt>\n  opencode <prompt>\n  codex <prompt>\n  gemini <prompt>\n  quit\n",
 				);
 				rl.prompt();
 				return;
@@ -112,7 +112,7 @@ async function main() {
 			const runtime = first as RuntimeType;
 			const prompt = rest.join(" ").trim();
 
-			const allowed: RuntimeType[] = ["claude", "opencode", "codex"];
+			const allowed: RuntimeType[] = ["claude", "opencode", "codex", "gemini"];
 			if (!allowed.includes(runtime)) {
 				console.log(`Unknown command: ${first}. Try: help`);
 				rl.prompt();

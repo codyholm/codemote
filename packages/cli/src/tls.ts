@@ -32,6 +32,21 @@ function tlsPinFromCertPEM(certPem: string): string {
 	return crypto.createHash("sha256").update(leaf.raw).digest("hex");
 }
 
+/**
+ * Derive a short, human-checkable verification code from a TLS pin.
+ *
+ * The code is not a secret; it is intended for out-of-band comparison on first connect.
+ */
+export function verifyCodeFromTlsPin(tlsPin: string): string {
+	if (!/^[0-9a-f]{64}$/i.test(tlsPin)) {
+		throw new Error("Invalid tlsPin (expected 64 hex chars)");
+	}
+
+	const bytes = Buffer.from(tlsPin, "hex");
+	const value = bytes.readUInt32BE(0);
+	return String(value % 10_000).padStart(4, "0");
+}
+
 function certValidToMs(certPem: string): number {
 	const leaf = new crypto.X509Certificate(certPem);
 	const ms = Date.parse(leaf.validTo);

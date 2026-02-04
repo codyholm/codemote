@@ -22,7 +22,7 @@ async function main() {
 		repoPath: process.cwd(),
 		runtimes: ["opencode"],
 
-		// Callback when PIN regenerates (every 5 minutes)
+		// Callback when PIN regenerates (every 15 minutes)
 		onPINRegenerate: async (pin) => {
 			console.log("\n🔄 PIN regenerated");
 			await displayPIN(pin);
@@ -68,7 +68,7 @@ async function displayPIN(pin: string) {
 	console.log("📱 PAIRING PIN");
 	console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 	console.log(`\n   PIN: ${pin.split("").join(" ")}`);
-	console.log("\n   Valid for: 5 minutes");
+	console.log("\n   Valid for: 15 minutes");
 	console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
 	// Optionally display QR code
