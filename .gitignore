@@ -48,15 +48,20 @@ npm-debug.log*
 
 # Guild (generated)
 .guild/exports/
+.guild/.archive/
 happy-cli-main/*
 happy-main/*
 happy-server-main/*
+
+# Codex
+.codex/
 
 # iOS signing/build artifacts
 *.mobileprovision
 *.xcarchive/
 ExportOptions.plist
 packages/mobile-ios/build/
+packages/mobile-ios/.build/
 
 # Agent cockpit (local dev)
 .agent-cockpit/
