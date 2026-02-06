@@ -146,6 +146,8 @@ type MobileOutboundMessage =
 	| DiffMessage
 	| DeviceInfoMessage;
 
+const AUTO_RESUME_RUNTIMES: ReadonlySet<RuntimeType> = new Set(["claude", "opencode"]);
+
 export interface RelayUplinkBridgeConfig {
 	relayUrl: string;
 	relayWsOptions?: WebSocket.ClientOptions;
@@ -462,7 +464,7 @@ export async function startRelayUplinkBridge(
 			let sessionStartError: unknown = error;
 			if (resumeSessionId) {
 				log?.(
-					`[Bridge] Resume failed for claude session ${resumeSessionId}: ${
+					`[Bridge] Resume failed for ${message.runtime} session ${resumeSessionId}: ${
 						error instanceof Error ? error.message : String(error)
 					}; retrying with a fresh session`,
 				);
@@ -496,17 +498,17 @@ export async function startRelayUplinkBridge(
 	}
 
 	function resolveResumeSessionId(message: NewSessionMessage): string | undefined {
-		if (message.runtime !== "claude") {
+		if (!AUTO_RESUME_RUNTIMES.has(message.runtime)) {
 			return undefined;
 		}
 		if (message.resumeSessionId && message.resumeSessionId.trim().length > 0) {
 			return message.resumeSessionId.trim();
 		}
 
-		const latestClaude = Array.from(sessions.values())
-			.filter((session) => session.runtime === "claude" && !!session.runtimeSessionId)
+		const latestRuntimeSession = Array.from(sessions.values())
+			.filter((session) => session.runtime === message.runtime && !!session.runtimeSessionId)
 			.sort((a, b) => b.createdAt - a.createdAt)[0];
-		return latestClaude?.runtimeSessionId;
+		return latestRuntimeSession?.runtimeSessionId;
 	}
 
 	async function startAndTrackSession(
