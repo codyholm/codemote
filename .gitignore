@@ -6,6 +6,8 @@ node_modules/
 dist/
 build/
 .build/
+.next/
+out/
 *.tsbuildinfo
 
 # Expo
@@ -35,6 +37,9 @@ Thumbs.db
 
 # Test
 coverage/
+playwright-report/
+test-results/
+.artifacts/
 
 # Logs
 *.log

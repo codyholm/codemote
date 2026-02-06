@@ -36,7 +36,11 @@
 			"packages/mobile-ios/.build",
 			"happy-main",
 			"happy-cli-main",
-			"happy-server-main"
+			"happy-server-main",
+			".next",
+			"out",
+			"test-results",
+			"playwright-report"
 		]
 	}
 }
