@@ -26,6 +26,7 @@ describe("Server Integration", () => {
 			expect(server).toBeDefined();
 			expect(server.pin).toMatch(/^\d{6}$/);
 			expect(server.pairingCode).toMatch(/^\d{6}$/);
+			expect(server.uplinkDeviceId).toBeDefined();
 			expect(server.uplinkPublicKey).toBeDefined();
 			expect(server.url).toBe(`wss://localhost:${testPort}`);
 		});
@@ -97,7 +98,7 @@ describe("Server Integration", () => {
 				mobileWs.send(
 					JSON.stringify({
 						type: "pair",
-						publicKey: "mobile-test-key-456",
+						deviceId: "mobile-test-device-456",
 						pin: server.pin,
 						deviceType: "mobile",
 					}),

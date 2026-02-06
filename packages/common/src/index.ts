@@ -25,7 +25,6 @@ export type StreamEventType =
 	| "session.output"
 	| "session.status"
 	| "attention.required"
-	| "artifact.created"
 	| "git.diff_updated";
 
 export interface StreamEvent {
@@ -40,16 +39,10 @@ export interface RunOptions {
 	profile: RuntimeType;
 	workspace: string;
 	initialPrompt: string;
+	resumeSessionId?: string;
 }
 
 export interface RunResult {
 	runId: string;
 	sessionId: string;
-}
-
-export interface Artifacts {
-	summary: string;
-	changes: string[];
-	evidence: string[];
-	decisions: string[];
 }

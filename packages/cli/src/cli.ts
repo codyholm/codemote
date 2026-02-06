@@ -29,6 +29,8 @@ import { startServer } from "./server.js";
 import { ensureLocalTLS } from "./tls.js";
 import { renderUI, updateStatus } from "./ui.js";
 
+import { mkdir } from "node:fs/promises";
+import { resolve } from "node:path";
 import readline from "node:readline";
 
 import type { RuntimeType } from "@codemote/uplink";
@@ -36,12 +38,20 @@ import type { RuntimeType } from "@codemote/uplink";
 async function main() {
 	const port = Number.parseInt(process.env["PORT"] || "8080", 10);
 	let interactive = false;
+	const configuredRepoPath = process.env["CODEMOTE_REPO_PATH"]?.trim();
+	const inferredRepoPath = process.env["INIT_CWD"]?.trim() || process.cwd();
+	const repoPath = resolve(configuredRepoPath || inferredRepoPath);
+
+	if (configuredRepoPath) {
+		await mkdir(repoPath, { recursive: true });
+	}
 
 	console.log("Starting Codemote...");
 
 	// Start the server (relay + uplink + bridge)
 	const server = await startServer({
 		port,
+		repoPath,
 		onClientConnected: () => {
 			if (interactive) {
 				console.log("Device connected");
@@ -65,6 +75,7 @@ async function main() {
 	const mdns = advertiseService(port, server.pin);
 
 	console.log(`[CLI] mDNS advertising on port ${port}`);
+	console.log(`[CLI] Session workspace root: ${repoPath}`);
 
 	// Render the UI
 	await renderUI({

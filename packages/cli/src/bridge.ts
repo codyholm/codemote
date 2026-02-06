@@ -1,11 +1,11 @@
-import { randomBytes } from "node:crypto";
-import nacl from "tweetnacl";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { WebSocket } from "ws";
 
 import { WS_MAX_PAYLOAD_BYTES } from "./messageLimits.js";
-import type { EncryptedPayload } from "./protocol.js";
-import { ReplayGuard } from "./replayProtection.js";
-import { validateEncryptedPayload } from "./validateEncryptedPayload.js";
+import { detectTailscaleEndpoint } from "./tailscale.js";
 
 import type {
 	RuntimeType,
@@ -17,19 +17,19 @@ import type {
 
 interface RelayRegisteredMessage {
 	type: "registered";
-	pairingCode: string;
+	pairingCode?: string;
 	pin?: string;
 }
 
 interface RelayPairedMessage {
 	type: "paired";
-	uplinkPublicKey?: string;
-	mobilePublicKey?: string;
+	uplinkDeviceId?: string;
+	mobileDeviceId?: string;
 }
 
 interface RelayMessageMessage {
 	type: "message";
-	payload: EncryptedPayload;
+	payload?: unknown;
 }
 
 interface RelayErrorMessage {
@@ -48,6 +48,7 @@ interface SessionInfo {
 	runtime: RuntimeType;
 	status: SessionStatus;
 	createdAt: number;
+	runtimeSessionId?: string;
 }
 
 interface SessionListMessage {
@@ -80,6 +81,23 @@ interface ApprovalRequestMessage {
 	request: ApprovalRequestInfo;
 }
 
+interface DiffMessage {
+	type: "diff";
+	sessionId: string;
+	diff: string;
+}
+
+interface DeviceEndpointMessage {
+	kind: "tailscale";
+	url: string;
+}
+
+interface DeviceInfoMessage {
+	type: "device_info";
+	uplinkDeviceId: string;
+	endpoints: DeviceEndpointMessage[];
+}
+
 interface ApprovalResponseMessage {
 	type: "approval_response";
 	sessionId: string;
@@ -93,10 +111,16 @@ interface SendPromptMessage {
 	prompt: string;
 }
 
+interface StopMessage {
+	type: "stop";
+	sessionId: string;
+}
+
 interface NewSessionMessage {
 	type: "new_session";
 	runtime: RuntimeType;
 	prompt: string;
+	resumeSessionId?: string;
 }
 
 type DiffScope = "staged" | "unstaged" | "all";
@@ -107,15 +131,10 @@ interface GetDiffMessage {
 	scope: DiffScope;
 }
 
-interface DiffMessage {
-	type: "diff";
-	sessionId: string;
-	diff: string;
-}
-
 type MobileInboundMessage =
 	| ApprovalResponseMessage
 	| SendPromptMessage
+	| StopMessage
 	| NewSessionMessage
 	| GetDiffMessage;
 
@@ -124,7 +143,8 @@ type MobileOutboundMessage =
 	| SessionOutputMessage
 	| SessionStatusMessage
 	| ApprovalRequestMessage
-	| DiffMessage;
+	| DiffMessage
+	| DeviceInfoMessage;
 
 export interface RelayUplinkBridgeConfig {
 	relayUrl: string;
@@ -138,15 +158,18 @@ export interface RelayUplinkBridgeConfig {
 
 export interface RelayUplinkBridgeHandle {
 	pairingCode: string;
+	uplinkDeviceId: string;
+	/** @deprecated alias of uplinkDeviceId for back-compat */
 	uplinkPublicKey: string;
 	startSession: (runtime: RuntimeType, prompt: string) => Promise<{ sessionId: string }>;
 	refreshPairingCode: () => Promise<string>;
 	stop: () => Promise<void>;
 }
 
+const DEVICE_ID_PATH = join(homedir(), ".codemote", "device-id");
+
 class UplinkWsClient {
-	private ws: WebSocket;
-	private pending: Array<{
+	private readonly pending: Array<{
 		expectedType: UplinkResponse["type"];
 		resolve: (msg: UplinkResponse) => void;
 		reject: (err: Error) => void;
@@ -154,11 +177,9 @@ class UplinkWsClient {
 	}> = [];
 
 	constructor(
-		ws: WebSocket,
+		private readonly ws: WebSocket,
 		private readonly onEvent: (event: StreamEvent) => void,
 	) {
-		this.ws = ws;
-
 		ws.on("message", (data: WebSocket.RawData) => {
 			this.handleMessage(data);
 		});
@@ -181,10 +202,21 @@ class UplinkWsClient {
 		return new UplinkWsClient(ws, onEvent);
 	}
 
-	async startRun(profile: RuntimeType, workspace: string, initialPrompt: string) {
+	async startRun(
+		profile: RuntimeType,
+		workspace: string,
+		initialPrompt: string,
+		resumeSessionId?: string,
+	) {
+		const payload = {
+			profile,
+			workspace,
+			initialPrompt,
+			...(resumeSessionId ? { resumeSessionId } : {}),
+		};
 		return this.sendAndWait({
 			type: "start_run",
-			payload: { profile, workspace, initialPrompt },
+			payload,
 		});
 	}
 
@@ -195,13 +227,6 @@ class UplinkWsClient {
 		});
 	}
 
-	async getDiff(sessionId: string, scope: DiffScope) {
-		return this.sendAndWait({
-			type: "get_diff",
-			payload: { sessionId, scope },
-		});
-	}
-
 	async stopSession(sessionId: string) {
 		return this.sendAndWait({
 			type: "stop",
@@ -209,8 +234,17 @@ class UplinkWsClient {
 		});
 	}
 
+	async getDiff(sessionId: string, scope: DiffScope) {
+		return this.sendAndWait({
+			type: "get_diff",
+			payload: { sessionId, scope },
+		});
+	}
+
 	async listSessions() {
-		return this.sendAndWait({ type: "list_sessions" });
+		return this.sendAndWait({
+			type: "list_sessions",
+		});
 	}
 
 	async close(): Promise<void> {
@@ -224,7 +258,7 @@ class UplinkWsClient {
 		});
 	}
 
-	private handleMessage(data: WebSocket.RawData) {
+	private handleMessage(data: WebSocket.RawData): void {
 		const msg = JSON.parse(data.toString()) as UplinkResponse;
 
 		if (msg.type === "event") {
@@ -268,7 +302,7 @@ class UplinkWsClient {
 		});
 	}
 
-	private rejectAll(err: Error) {
+	private rejectAll(err: Error): void {
 		while (this.pending.length > 0) {
 			const waiter = this.pending.shift();
 			if (!waiter) {
@@ -305,26 +339,28 @@ export async function startRelayUplinkBridge(
 	const { relayUrl, relayWsOptions, uplinkUrl, repoPath, onPairingCode, onMobilePaired, log } =
 		config;
 
-	const uplinkKeyPair = nacl.box.keyPair();
-	const uplinkPublicKey = Buffer.from(uplinkKeyPair.publicKey).toString("base64");
+	const uplinkDeviceId = await getOrCreateUplinkDeviceId();
+	const relayPort = relayPortFromURL(relayUrl);
+	const relaySecure = relayUrl.startsWith("wss://");
 
 	const sessions = new Map<string, SessionInfo>();
 	const approvalRequests = new Map<string, { sessionId: string }>();
-	const replayGuard = new ReplayGuard();
-	let mobilePublicKey: string | null = null;
+	let mobileDeviceId: string | null = null;
+	let pairingCode = "";
 
 	const relayWs = relayWsOptions
 		? new WebSocket(relayUrl, { maxPayload: WS_MAX_PAYLOAD_BYTES, ...relayWsOptions })
 		: new WebSocket(relayUrl, { maxPayload: WS_MAX_PAYLOAD_BYTES });
 	await waitForOpen(relayWs);
 
-	let pairingCode = await registerWithRelay(relayWs, uplinkPublicKey);
+	pairingCode = await registerWithRelay(relayWs, uplinkDeviceId);
 	onPairingCode?.(pairingCode);
 	log?.("[Bridge] Registered with relay (pairing code redacted)");
 
 	const uplinkClient = await UplinkWsClient.connect(uplinkUrl, (event) => {
 		void handleUplinkEvent(event);
 	});
+	await syncSessionsFromUplink();
 
 	relayWs.on("message", (data: WebSocket.RawData) => {
 		void handleRelayMessage(data);
@@ -338,10 +374,6 @@ export async function startRelayUplinkBridge(
 		log?.(`[Bridge] Relay WebSocket error: ${String(err)}`);
 	});
 
-	function dropMessage(reason: string) {
-		log?.(`[Bridge] Dropped relay message: ${reason}`);
-	}
-
 	function rawDataToBuffer(data: WebSocket.RawData): Buffer {
 		if (typeof data === "string") return Buffer.from(data, "utf8");
 		if (data instanceof Buffer) return data;
@@ -350,116 +382,102 @@ export async function startRelayUplinkBridge(
 		return Buffer.from(data as unknown as ArrayBuffer);
 	}
 
-	async function handleRelayMessage(data: WebSocket.RawData) {
+	function dropMessage(reason: string): void {
+		log?.(`[Bridge] Dropped relay message: ${reason}`);
+	}
+
+	async function handleRelayMessage(data: WebSocket.RawData): Promise<void> {
+		let raw: unknown;
 		try {
-			let raw: unknown;
-			try {
-				raw = JSON.parse(rawDataToBuffer(data).toString("utf8"));
-			} catch {
-				dropMessage("invalid_json");
-				return;
-			}
+			raw = JSON.parse(rawDataToBuffer(data).toString("utf8"));
+		} catch {
+			dropMessage("invalid_json");
+			return;
+		}
 
-			if (typeof raw !== "object" || raw === null) {
-				dropMessage("message_not_object");
-				return;
-			}
+		const relayMessage = decodeRelayInbound(raw);
+		if (!relayMessage) {
+			dropMessage("invalid_relay_message");
+			return;
+		}
 
-			const type = (raw as { type?: unknown }).type;
-			if (typeof type !== "string") {
-				dropMessage("missing_type");
-				return;
-			}
-
-			const msg = raw as RelayInboundMessage;
-
-			if (msg.type === "registered") {
-				pairingCode = msg.pin ?? msg.pairingCode;
+		switch (relayMessage.type) {
+			case "registered":
+				pairingCode = relayMessage.pin ?? relayMessage.pairingCode ?? pairingCode;
 				onPairingCode?.(pairingCode);
 				return;
-			}
 
-			if (msg.type === "paired") {
-				if (msg.mobilePublicKey) {
-					mobilePublicKey = msg.mobilePublicKey;
+			case "paired":
+				if (relayMessage.mobileDeviceId) {
+					mobileDeviceId = relayMessage.mobileDeviceId;
 					onMobilePaired?.();
 					log?.("[Bridge] Mobile paired");
+					await syncSessionsFromUplink();
 					sendSessionList();
+					void sendDeviceInfoToMobile();
 				}
 				return;
-			}
 
-			if (msg.type === "message") {
-				const payloadCheck = validateEncryptedPayload((raw as { payload?: unknown }).payload);
-				if (!payloadCheck.ok) {
-					dropMessage(payloadCheck.reason);
-					return;
-				}
-
-				const replayCheck = replayGuard.check(payloadCheck.value);
-				if (!replayCheck.ok) {
-					log?.(`[Bridge] Rejected replayed/stale mobile message (${replayCheck.reason})`);
-					return;
-				}
-
-				const decoded = decryptFromMobile(payloadCheck.value);
+			case "message": {
+				const decoded = decodeMobileInbound(relayMessage.payload);
 				if (!decoded) {
-					log?.("[Bridge] Failed to decrypt message");
+					dropMessage("invalid_mobile_message");
 					return;
 				}
-
 				await handleMobileMessage(decoded);
 				return;
 			}
 
-			if (msg.type === "error") {
+			case "error":
 				log?.("[Bridge] Relay error (redacted)");
-			}
-		} catch (err) {
-			log?.(`[Bridge] Unhandled relay message error: ${String(err)}`);
-			dropMessage("unhandled_error");
+				return;
 		}
 	}
 
-	async function handleMobileMessage(message: MobileInboundMessage) {
+	async function handleMobileMessage(message: MobileInboundMessage): Promise<void> {
 		switch (message.type) {
-			case "new_session": {
+			case "new_session":
 				await handleNewSession(message);
 				return;
-			}
-			case "send_prompt": {
+			case "send_prompt":
 				await uplinkClient.sendInput(message.sessionId, message.prompt);
 				return;
-			}
-			case "get_diff": {
+			case "stop":
+				await uplinkClient.stopSession(message.sessionId);
+				return;
+			case "get_diff":
 				await handleGetDiff(message);
 				return;
-			}
-			case "approval_response": {
+			case "approval_response":
 				await handleApprovalResponse(message);
 				return;
-			}
 		}
 	}
 
-	async function handleNewSession(message: NewSessionMessage) {
+	async function handleNewSession(message: NewSessionMessage): Promise<void> {
+		const resumeSessionId = resolveResumeSessionId(message);
 		try {
-			const started = await uplinkClient.startRun(message.runtime, repoPath, message.prompt);
-			if (started.type !== "run_started") {
-				throw new Error("Unexpected start_run response");
+			await startAndTrackSession(message.runtime, message.prompt, resumeSessionId);
+		} catch (error) {
+			let sessionStartError: unknown = error;
+			if (resumeSessionId) {
+				log?.(
+					`[Bridge] Resume failed for claude session ${resumeSessionId}: ${
+						error instanceof Error ? error.message : String(error)
+					}; retrying with a fresh session`,
+				);
+				try {
+					await startAndTrackSession(message.runtime, message.prompt);
+					return;
+				} catch (fallbackError) {
+					sessionStartError = fallbackError;
+				}
 			}
 
-			const sessionId = started.payload.sessionId;
-			sessions.set(sessionId, {
-				id: sessionId,
-				runtime: message.runtime,
-				status: "starting",
-				createdAt: Date.now(),
-			});
-			sendSessionList();
-		} catch (error) {
 			log?.(
-				`[Bridge] Failed to start session: ${error instanceof Error ? error.message : String(error)}`,
+				`[Bridge] Failed to start session: ${
+					sessionStartError instanceof Error ? sessionStartError.message : String(sessionStartError)
+				}`,
 			);
 			const errorId = `error-${Date.now()}`;
 			sessions.set(errorId, {
@@ -477,16 +495,26 @@ export async function startRelayUplinkBridge(
 		}
 	}
 
-	async function startSession(
-		runtime: RuntimeType,
-		prompt: string,
-	): Promise<{ sessionId: string }> {
-		const cleanPrompt = prompt.trim();
-		if (cleanPrompt.length === 0) {
-			throw new Error("Prompt is required");
+	function resolveResumeSessionId(message: NewSessionMessage): string | undefined {
+		if (message.runtime !== "claude") {
+			return undefined;
+		}
+		if (message.resumeSessionId && message.resumeSessionId.trim().length > 0) {
+			return message.resumeSessionId.trim();
 		}
 
-		const started = await uplinkClient.startRun(runtime, repoPath, cleanPrompt);
+		const latestClaude = Array.from(sessions.values())
+			.filter((session) => session.runtime === "claude" && !!session.runtimeSessionId)
+			.sort((a, b) => b.createdAt - a.createdAt)[0];
+		return latestClaude?.runtimeSessionId;
+	}
+
+	async function startAndTrackSession(
+		runtime: RuntimeType,
+		prompt: string,
+		resumeSessionId?: string,
+	): Promise<{ sessionId: string }> {
+		const started = await uplinkClient.startRun(runtime, repoPath, prompt, resumeSessionId);
 		if (started.type !== "run_started") {
 			throw new Error("Unexpected start_run response");
 		}
@@ -497,16 +525,25 @@ export async function startRelayUplinkBridge(
 			runtime,
 			status: "starting",
 			createdAt: Date.now(),
+			...(resumeSessionId ? { runtimeSessionId: resumeSessionId } : {}),
 		});
-
-		if (mobilePublicKey) {
-			sendSessionList();
-		}
-
+		sendSessionList();
 		return { sessionId };
 	}
 
-	async function handleApprovalResponse(message: ApprovalResponseMessage) {
+	async function startSession(
+		runtime: RuntimeType,
+		prompt: string,
+	): Promise<{ sessionId: string }> {
+		const cleanPrompt = prompt.trim();
+		if (cleanPrompt.length === 0) {
+			throw new Error("Prompt is required");
+		}
+
+		return startAndTrackSession(runtime, cleanPrompt);
+	}
+
+	async function handleApprovalResponse(message: ApprovalResponseMessage): Promise<void> {
 		const pending = approvalRequests.get(message.requestId);
 		if (!pending) {
 			return;
@@ -516,8 +553,8 @@ export async function startRelayUplinkBridge(
 		await uplinkClient.sendInput(pending.sessionId, message.approved ? "y" : "n");
 	}
 
-	async function handleUplinkEvent(event: StreamEvent) {
-		if (!mobilePublicKey) {
+	async function handleUplinkEvent(event: StreamEvent): Promise<void> {
+		if (!mobileDeviceId) {
 			return;
 		}
 
@@ -551,6 +588,7 @@ export async function startRelayUplinkBridge(
 					sessionId: event.sessionId,
 					status,
 				});
+				await syncSessionRuntimeMetadata(event.sessionId);
 				sendSessionList();
 				return;
 			}
@@ -582,7 +620,7 @@ export async function startRelayUplinkBridge(
 		}
 	}
 
-	async function handleGetDiff(message: GetDiffMessage) {
+	async function handleGetDiff(message: GetDiffMessage): Promise<void> {
 		try {
 			const response = await uplinkClient.getDiff(message.sessionId, message.scope);
 			if (response.type !== "diff") {
@@ -606,86 +644,103 @@ export async function startRelayUplinkBridge(
 		}
 	}
 
-	function sendSessionList() {
+	function sendSessionList(): void {
 		const sessionsList = Array.from(sessions.values()).sort((a, b) => b.createdAt - a.createdAt);
 		log?.(
-			`[Bridge] sendSessionList: ${sessionsList.length} sessions, mobilePublicKey=${mobilePublicKey ? "set" : "null"}`,
+			`[Bridge] sendSessionList: ${sessionsList.length} sessions, mobileDeviceId=${mobileDeviceId ? "set" : "null"}`,
 		);
-		if (sessionsList.length > 0) {
-			log?.(
-				`[Bridge] Sessions: ${sessionsList.map((s) => `${s.id.slice(0, 8)}(${s.runtime}:${s.status})`).join(", ")}`,
-			);
-		}
 		sendToMobile({ type: "session_list", sessions: sessionsList });
 	}
 
-	function decryptFromMobile(payload: EncryptedPayload): MobileInboundMessage | null {
-		let senderPublicKey: Buffer;
-		let nonce: Buffer;
-		let ciphertext: Buffer;
-		try {
-			senderPublicKey = Buffer.from(payload.senderPublicKey, "base64");
-			nonce = Buffer.from(payload.nonce, "base64");
-			ciphertext = Buffer.from(payload.ciphertext, "base64");
-		} catch {
-			return null;
-		}
-
-		if (senderPublicKey.length !== 32) return null;
-		if (nonce.length !== 24) return null;
-
-		const plaintext = nacl.box.open(ciphertext, nonce, senderPublicKey, uplinkKeyPair.secretKey);
-		if (!plaintext) {
-			return null;
-		}
-
-		let decoded: { type: string; [key: string]: unknown };
-		try {
-			decoded = JSON.parse(Buffer.from(plaintext).toString("utf8")) as {
-				type: string;
-				[key: string]: unknown;
-			};
-		} catch {
-			return null;
-		}
-
-		if (
-			decoded.type !== "new_session" &&
-			decoded.type !== "get_diff" &&
-			decoded.type !== "send_prompt" &&
-			decoded.type !== "approval_response"
-		) {
-			return null;
-		}
-
-		return decoded as unknown as MobileInboundMessage;
-	}
-
-	function sendToMobile(message: MobileOutboundMessage) {
-		if (!mobilePublicKey) {
-			log?.(`[Bridge] sendToMobile: skipped (no mobilePublicKey), type=${message.type}`);
+	function sendToMobile(message: MobileOutboundMessage): void {
+		if (!mobileDeviceId) {
+			log?.(`[Bridge] sendToMobile: skipped (no mobileDeviceId), type=${message.type}`);
 			return;
 		}
 
 		log?.(`[Bridge] sendToMobile: type=${message.type}`);
-		const plaintext = Buffer.from(JSON.stringify(message), "utf8");
-		const nonce = randomBytes(24);
-		const recipientPublicKey = Buffer.from(mobilePublicKey, "base64");
-		const ciphertext = nacl.box(plaintext, nonce, recipientPublicKey, uplinkKeyPair.secretKey);
+		relayWs.send(JSON.stringify({ type: "message", payload: message }));
+	}
 
-		const payload: EncryptedPayload = {
-			senderPublicKey: uplinkPublicKey,
-			ciphertext: Buffer.from(ciphertext).toString("base64"),
-			nonce: Buffer.from(nonce).toString("base64"),
-			timestamp: Date.now(),
+	function toSessionInfo(session: {
+		id: string;
+		runtime: RuntimeType;
+		status: SessionStatus;
+		startedAt?: number;
+		createdAt?: number;
+		runtimeSessionId?: string;
+	}): SessionInfo {
+		return {
+			id: session.id,
+			runtime: session.runtime,
+			status: session.status,
+			createdAt: session.createdAt ?? session.startedAt ?? Date.now(),
+			...(session.runtimeSessionId ? { runtimeSessionId: session.runtimeSessionId } : {}),
 		};
+	}
 
-		log?.("[Bridge] sendToMobile: sending encrypted message to relay");
-		relayWs.send(JSON.stringify({ type: "message", payload }));
+	async function syncSessionsFromUplink(): Promise<void> {
+		try {
+			const response = await uplinkClient.listSessions();
+			if (response.type !== "sessions") {
+				return;
+			}
+			sessions.clear();
+			for (const session of response.payload) {
+				sessions.set(session.id, toSessionInfo(session));
+			}
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to sync sessions from uplink: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+
+	async function syncSessionRuntimeMetadata(sessionId: string): Promise<void> {
+		const existing = sessions.get(sessionId);
+		if (!existing || existing.runtimeSessionId) {
+			return;
+		}
+
+		try {
+			const response = await uplinkClient.listSessions();
+			if (response.type !== "sessions") {
+				return;
+			}
+			const fromUplink = response.payload.find((session) => session.id === sessionId);
+			if (!fromUplink?.runtimeSessionId) {
+				return;
+			}
+			existing.runtimeSessionId = fromUplink.runtimeSessionId;
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to sync runtime metadata: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+
+	async function sendDeviceInfoToMobile(): Promise<void> {
+		const tailscaleEndpoint = await detectTailscaleEndpoint({
+			port: relayPort,
+			secure: relaySecure,
+		});
+		if (!tailscaleEndpoint) {
+			return;
+		}
+
+		sendToMobile({
+			type: "device_info",
+			uplinkDeviceId,
+			endpoints: [{ kind: "tailscale", url: tailscaleEndpoint.url }],
+		});
 	}
 
 	async function refreshPairingCode(): Promise<string> {
-		pairingCode = await registerWithRelay(relayWs, uplinkPublicKey);
+		pairingCode = await registerWithRelay(relayWs, uplinkDeviceId);
 		onPairingCode?.(pairingCode);
 		log?.("[Bridge] Refreshed PIN (redacted)");
 		return pairingCode;
@@ -693,7 +748,8 @@ export async function startRelayUplinkBridge(
 
 	return {
 		pairingCode,
-		uplinkPublicKey,
+		uplinkDeviceId,
+		uplinkPublicKey: uplinkDeviceId,
 		startSession,
 		refreshPairingCode,
 		stop: async () => {
@@ -705,11 +761,35 @@ export async function startRelayUplinkBridge(
 	};
 }
 
-async function registerWithRelay(relayWs: WebSocket, uplinkPublicKey: string): Promise<string> {
+async function getOrCreateUplinkDeviceId(): Promise<string> {
+	try {
+		const existing = (await readFile(DEVICE_ID_PATH, "utf8")).trim();
+		if (existing.length > 0) {
+			return existing;
+		}
+	} catch {
+		// ignore
+	}
+
+	const created = randomUUID();
+	await mkdir(dirname(DEVICE_ID_PATH), { recursive: true });
+	await writeFile(DEVICE_ID_PATH, `${created}\n`, "utf8");
+	return created;
+}
+
+function relayPortFromURL(relayUrl: string): number {
+	const parsed = new URL(relayUrl);
+	if (parsed.port) {
+		return Number.parseInt(parsed.port, 10);
+	}
+	return parsed.protocol === "wss:" ? 443 : 80;
+}
+
+async function registerWithRelay(relayWs: WebSocket, uplinkDeviceId: string): Promise<string> {
 	relayWs.send(
 		JSON.stringify({
 			type: "register",
-			publicKey: uplinkPublicKey,
+			deviceId: uplinkDeviceId,
 			deviceType: "uplink",
 		}),
 	);
@@ -719,7 +799,7 @@ async function registerWithRelay(relayWs: WebSocket, uplinkPublicKey: string): P
 		throw new Error("Unexpected relay response during registration");
 	}
 
-	return registered.pin ?? registered.pairingCode;
+	return registered.pin ?? registered.pairingCode ?? "";
 }
 
 async function waitForRelayMessage(
@@ -734,8 +814,9 @@ async function waitForRelayMessage(
 
 		const handler = (data: WebSocket.RawData) => {
 			try {
-				const msg = JSON.parse(data.toString()) as RelayInboundMessage;
-				if (msg.type === expectedType) {
+				const parsed = JSON.parse(data.toString()) as unknown;
+				const msg = decodeRelayInbound(parsed);
+				if (msg && msg.type === expectedType) {
 					clearTimeout(timeout);
 					relayWs.off("message", handler);
 					resolve(msg);
@@ -747,6 +828,119 @@ async function waitForRelayMessage(
 
 		relayWs.on("message", handler);
 	});
+}
+
+function decodeRelayInbound(raw: unknown): RelayInboundMessage | null {
+	if (typeof raw !== "object" || raw === null) {
+		return null;
+	}
+	const type = (raw as { type?: unknown }).type;
+	if (type === "registered") {
+		const pin = (raw as { pin?: unknown }).pin;
+		const pairingCode = (raw as { pairingCode?: unknown }).pairingCode;
+		if (typeof pin !== "string" && typeof pairingCode !== "string") {
+			return null;
+		}
+		return {
+			type: "registered",
+			...(typeof pin === "string" ? { pin } : {}),
+			...(typeof pairingCode === "string" ? { pairingCode } : {}),
+		};
+	}
+	if (type === "paired") {
+		const uplinkDeviceId = (raw as { uplinkDeviceId?: unknown }).uplinkDeviceId;
+		const mobileDeviceId = (raw as { mobileDeviceId?: unknown }).mobileDeviceId;
+		return {
+			type: "paired",
+			...(typeof uplinkDeviceId === "string" ? { uplinkDeviceId } : {}),
+			...(typeof mobileDeviceId === "string" ? { mobileDeviceId } : {}),
+		};
+	}
+	if (type === "message") {
+		return {
+			type: "message",
+			payload: (raw as { payload?: unknown }).payload,
+		};
+	}
+	if (type === "error") {
+		const message = (raw as { message?: unknown }).message;
+		if (typeof message !== "string") {
+			return null;
+		}
+		return { type: "error", message };
+	}
+	return null;
+}
+
+function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
+	if (typeof payload !== "object" || payload === null) {
+		return null;
+	}
+
+	const type = (payload as { type?: unknown }).type;
+	if (type === "new_session") {
+		const runtime = (payload as { runtime?: unknown }).runtime;
+		const prompt = (payload as { prompt?: unknown }).prompt;
+		const resumeSessionId = (payload as { resumeSessionId?: unknown }).resumeSessionId;
+		if (
+			(runtime === "opencode" ||
+				runtime === "claude" ||
+				runtime === "codex" ||
+				runtime === "gemini") &&
+			typeof prompt === "string"
+		) {
+			if (typeof resumeSessionId === "string" && resumeSessionId.trim().length > 0) {
+				return { type: "new_session", runtime, prompt, resumeSessionId: resumeSessionId.trim() };
+			}
+			return { type: "new_session", runtime, prompt };
+		}
+		return null;
+	}
+
+	if (type === "send_prompt") {
+		const sessionId = (payload as { sessionId?: unknown }).sessionId;
+		const prompt = (payload as { prompt?: unknown }).prompt;
+		if (typeof sessionId === "string" && typeof prompt === "string") {
+			return { type: "send_prompt", sessionId, prompt };
+		}
+		return null;
+	}
+
+	if (type === "stop") {
+		const sessionId = (payload as { sessionId?: unknown }).sessionId;
+		if (typeof sessionId === "string") {
+			return { type: "stop", sessionId };
+		}
+		return null;
+	}
+
+	if (type === "get_diff") {
+		const sessionId = (payload as { sessionId?: unknown }).sessionId;
+		const scope = (payload as { scope?: unknown }).scope;
+		if (
+			typeof sessionId === "string" &&
+			(scope === "staged" || scope === "unstaged" || scope === "all")
+		) {
+			return { type: "get_diff", sessionId, scope };
+		}
+		return null;
+	}
+
+	if (type === "approval_response") {
+		const sessionId = (payload as { sessionId?: unknown }).sessionId;
+		const requestId = (payload as { requestId?: unknown }).requestId;
+		const approved = (payload as { approved?: unknown }).approved;
+		if (
+			typeof sessionId === "string" &&
+			typeof requestId === "string" &&
+			typeof approved === "boolean"
+		) {
+			return { type: "approval_response", sessionId, requestId, approved };
+		}
+		return null;
+	}
+
+	return null;
 }
 
 async function waitForOpen(ws: WebSocket): Promise<void> {
