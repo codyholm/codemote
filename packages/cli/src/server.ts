@@ -64,7 +64,9 @@ export interface ServerHandle {
 	pin: string;
 	/** Back-compat alias for older consumers */
 	pairingCode: string;
-	/** Public key used by the uplink bridge */
+	/** Stable device ID used by the uplink bridge */
+	uplinkDeviceId: string;
+	/** @deprecated alias of uplinkDeviceId for back-compat */
 	uplinkPublicKey: string;
 	/** WebSocket URL for clients */
 	url: string;
@@ -208,6 +210,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 			return currentPIN;
 		},
 
+		uplinkDeviceId: bridge.uplinkDeviceId,
 		uplinkPublicKey: bridge.uplinkPublicKey,
 
 		url: `${wsScheme}://localhost:${port}`,
