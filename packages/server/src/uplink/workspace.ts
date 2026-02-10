@@ -78,12 +78,19 @@ export class WorkspaceManager {
 		const workspaceGit = this.gitForDir(workspace.workingDir);
 		const status = await workspaceGit.status();
 
+		const unstaged =
+			status.modified.length +
+			status.deleted.length +
+			status.created.length +
+			status.renamed.length +
+			status.conflicted.length;
+
 		return {
 			branch: status.current ?? "HEAD",
 			ahead: status.ahead,
 			behind: status.behind,
 			staged: status.staged.length,
-			unstaged: status.modified.length + status.deleted.length,
+			unstaged,
 			untracked: status.not_added.length,
 		};
 	}
@@ -142,7 +149,7 @@ export class WorkspaceManager {
 		const workspace = this.workspaces.get(id);
 		if (!workspace) throw new WorkspaceNotFoundError(id);
 
-		if (!/^[a-zA-Z][a-zA-Z0-9._\-/]*$/.test(branch)) {
+		if (!/^[a-zA-Z0-9][a-zA-Z0-9._\-/]*$/.test(branch)) {
 			throw new Error("Invalid branch name. Use letters, numbers, dots, hyphens, or slashes.");
 		}
 
