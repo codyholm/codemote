@@ -9,6 +9,7 @@ build/
 .next/
 out/
 *.tsbuildinfo
+*.tgz
 
 # Expo
 .expo/
@@ -75,3 +76,4 @@ packages/mobile-ios/.build/
 **/fastlane/report.xml
 **/fastlane/test_output/
 **/fastlane/screenshots/
+**/fastlane/api_key.json
