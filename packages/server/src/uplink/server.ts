@@ -271,6 +271,63 @@ export class UplinkServer {
 				return { type: "diff", payload: { sessionId: command.payload.sessionId, diff } };
 			}
 
+			case "git_status": {
+				const session = this.sessionManager.get(command.payload.sessionId);
+				if (!session) throw new Error("Session not found");
+				const status = await this.workspaceManager.getStatus(session.workspace.id);
+				return {
+					type: "git_status_result",
+					payload: { sessionId: command.payload.sessionId, status },
+				};
+			}
+
+			case "git_pull": {
+				const session = this.sessionManager.get(command.payload.sessionId);
+				if (!session) throw new Error("Session not found");
+				const summary = await this.workspaceManager.pull(session.workspace.id);
+				return {
+					type: "git_pull_result",
+					payload: { sessionId: command.payload.sessionId, summary },
+				};
+			}
+
+			case "git_push": {
+				const session = this.sessionManager.get(command.payload.sessionId);
+				if (!session) throw new Error("Session not found");
+				const summary = await this.workspaceManager.push(session.workspace.id);
+				return {
+					type: "git_push_result",
+					payload: { sessionId: command.payload.sessionId, summary },
+				};
+			}
+
+			case "git_worktree_add": {
+				const session = this.sessionManager.get(command.payload.sessionId);
+				if (!session) throw new Error("Session not found");
+				const result = await this.workspaceManager.addWorktree(
+					session.workspace.id,
+					command.payload.branch,
+				);
+				return {
+					type: "git_worktree_result",
+					payload: { sessionId: command.payload.sessionId, ...result },
+				};
+			}
+
+			case "git_submit_pr": {
+				const session = this.sessionManager.get(command.payload.sessionId);
+				if (!session) throw new Error("Session not found");
+				const url = await this.workspaceManager.submitPR(
+					session.workspace.id,
+					command.payload.title,
+					command.payload.body,
+				);
+				return {
+					type: "git_pr_result",
+					payload: { sessionId: command.payload.sessionId, url },
+				};
+			}
+
 			case "list_directory": {
 				const requestedPath = command.payload.path?.trim() || homedir();
 				const resolvedPath = resolve(requestedPath);

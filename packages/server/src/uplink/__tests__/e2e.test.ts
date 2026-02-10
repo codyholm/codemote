@@ -1,6 +1,6 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { simpleGit } from "simple-git";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
@@ -49,6 +49,15 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 	afterAll(async () => {
 		await uplinkServer?.stop();
 		await relayServer?.stop();
+		// Clean up worktrees created during tests
+		const testDirBase = basename(testDir);
+		const parentDir = dirname(testDir);
+		const entries = await readdir(parentDir);
+		for (const entry of entries) {
+			if (entry.startsWith(testDirBase) && entry !== testDirBase) {
+				await rm(join(parentDir, entry), { recursive: true, force: true });
+			}
+		}
 		await rm(testDir, { recursive: true, force: true });
 	});
 
@@ -263,6 +272,163 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 		const stagedDiffPayload = stagedDiffResponse["payload"] as Record<string, unknown>;
 		expect(stagedDiffPayload["sessionId"]).toBe(sessionId);
 		expect(typeof stagedDiffPayload["diff"]).toBe("string");
+
+		clientWs.close();
+	}, 15000);
+
+	it("uplink handles git_status command", async () => {
+		const clientWs = new WebSocket(`ws://127.0.0.1:${uplinkPort}`);
+		await waitForOpen(clientWs);
+
+		// Start a session first
+		const runPromise = waitForMessageOfType(clientWs, "run_started");
+		clientWs.send(
+			JSON.stringify({
+				type: "start_run",
+				payload: {
+					profile: "opencode",
+					workspace: testDir,
+					initialPrompt: "Test for git status",
+				},
+			}),
+		);
+
+		const runResponse = await runPromise;
+		const runPayload = runResponse["payload"] as Record<string, unknown>;
+		const sessionId = runPayload["sessionId"] as string;
+
+		// Request git status
+		const statusPromise = waitForMessageOfType(clientWs, "git_status_result");
+		clientWs.send(
+			JSON.stringify({
+				type: "git_status",
+				payload: { sessionId },
+			}),
+		);
+
+		const statusResponse = await statusPromise;
+		expect(statusResponse["type"]).toBe("git_status_result");
+		const statusPayload = statusResponse["payload"] as Record<string, unknown>;
+		expect(statusPayload["sessionId"]).toBe(sessionId);
+		const status = statusPayload["status"] as Record<string, unknown>;
+		expect(status["branch"]).toBe("main");
+		expect(typeof status["ahead"]).toBe("number");
+		expect(typeof status["behind"]).toBe("number");
+		expect(typeof status["staged"]).toBe("number");
+		expect(typeof status["unstaged"]).toBe("number");
+		expect(typeof status["untracked"]).toBe("number");
+
+		clientWs.close();
+	}, 15000);
+
+	it("uplink handles git_pull command", async () => {
+		const clientWs = new WebSocket(`ws://127.0.0.1:${uplinkPort}`);
+		await waitForOpen(clientWs);
+
+		// Start a session
+		const runPromise = waitForMessageOfType(clientWs, "run_started");
+		clientWs.send(
+			JSON.stringify({
+				type: "start_run",
+				payload: {
+					profile: "opencode",
+					workspace: testDir,
+					initialPrompt: "Test for git pull",
+				},
+			}),
+		);
+
+		const runResponse = await runPromise;
+		const runPayload = runResponse["payload"] as Record<string, unknown>;
+		const sessionId = runPayload["sessionId"] as string;
+
+		// Pull (no remote configured, should error)
+		const pullPromise = waitForMessageOfType(clientWs, "error");
+		clientWs.send(
+			JSON.stringify({
+				type: "git_pull",
+				payload: { sessionId },
+			}),
+		);
+
+		const pullResponse = await pullPromise;
+		expect(pullResponse["type"]).toBe("error");
+
+		clientWs.close();
+	}, 15000);
+
+	it("uplink handles git_push command", async () => {
+		const clientWs = new WebSocket(`ws://127.0.0.1:${uplinkPort}`);
+		await waitForOpen(clientWs);
+
+		// Start a session
+		const runPromise = waitForMessageOfType(clientWs, "run_started");
+		clientWs.send(
+			JSON.stringify({
+				type: "start_run",
+				payload: {
+					profile: "opencode",
+					workspace: testDir,
+					initialPrompt: "Test for git push",
+				},
+			}),
+		);
+
+		const runResponse = await runPromise;
+		const runPayload = runResponse["payload"] as Record<string, unknown>;
+		const sessionId = runPayload["sessionId"] as string;
+
+		// Push (no remote configured, should error)
+		const pushPromise = waitForMessageOfType(clientWs, "error");
+		clientWs.send(
+			JSON.stringify({
+				type: "git_push",
+				payload: { sessionId },
+			}),
+		);
+
+		const pushResponse = await pushPromise;
+		expect(pushResponse["type"]).toBe("error");
+
+		clientWs.close();
+	}, 15000);
+
+	it("uplink handles git_worktree_add command", async () => {
+		const clientWs = new WebSocket(`ws://127.0.0.1:${uplinkPort}`);
+		await waitForOpen(clientWs);
+
+		// Start a session
+		const runPromise = waitForMessageOfType(clientWs, "run_started");
+		clientWs.send(
+			JSON.stringify({
+				type: "start_run",
+				payload: {
+					profile: "opencode",
+					workspace: testDir,
+					initialPrompt: "Test for worktree",
+				},
+			}),
+		);
+
+		const runResponse = await runPromise;
+		const runPayload = runResponse["payload"] as Record<string, unknown>;
+		const sessionId = runPayload["sessionId"] as string;
+
+		// Create worktree
+		const worktreePromise = waitForMessageOfType(clientWs, "git_worktree_result");
+		clientWs.send(
+			JSON.stringify({
+				type: "git_worktree_add",
+				payload: { sessionId, branch: "test-worktree" },
+			}),
+		);
+
+		const worktreeResponse = await worktreePromise;
+		expect(worktreeResponse["type"]).toBe("git_worktree_result");
+		const worktreePayload = worktreeResponse["payload"] as Record<string, unknown>;
+		expect(worktreePayload["sessionId"]).toBe(sessionId);
+		expect(worktreePayload["branch"]).toBe("test-worktree");
+		expect(typeof worktreePayload["path"]).toBe("string");
 
 		clientWs.close();
 	}, 15000);

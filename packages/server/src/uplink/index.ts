@@ -10,6 +10,7 @@ export type {
 	WorkspaceConfig,
 	Workspace,
 	DirectoryEntry,
+	GitStatusSummary,
 	Session,
 	UplinkCommand,
 	UplinkResponse,
