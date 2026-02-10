@@ -1,128 +1,49 @@
-# codemote
+# Codemote
 
-CLI utilities for Codemote, including PIN generation and rate limiting for pairing operations.
+Control AI coding agents from your phone. Start Claude Code, OpenCode, Codex, or Gemini sessions from an iOS app and watch them work in real time.
 
-This package also ships the `codemote` executable (combined relay + uplink + bridge).
-
-## Running the Server
+## Quick Start
 
 ```bash
-# From repo root
-pnpm -C packages/cli build
-pnpm -C packages/cli start
-
-# With debug logging
-GUILD_REMOTE_DEBUG=1 pnpm -C packages/cli start
+npx codemote
 ```
 
-When running interactively, you can start sessions from the terminal:
+This starts a local server, displays a QR code and PIN, and waits for the Codemote iOS app to connect.
 
-```text
-> claude <prompt>
-> opencode <prompt>
-> codex <prompt>
-```
+## How It Works
 
-## Features
+1. Run `npx codemote` in your project directory
+2. Scan the QR code with your iPhone camera, or open the Codemote app and enter the PIN
+3. Once paired, start AI coding sessions from your phone
+4. Watch output stream in real time, send follow-up prompts, and manage sessions remotely
 
-### PIN Generation
+Codemote runs entirely on your machine. No data leaves your network. The phone connects directly to your computer over your local network.
 
-Generate secure 6-digit PINs for device pairing:
+## Requirements
 
-```typescript
-import { generatePIN } from "codemote";
+- Node.js 20 or later
+- One or more AI coding agents installed: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenCode](https://github.com/anomalyco/opencode), [Codex](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli)
+- Codemote iOS app (available on TestFlight)
 
-const pin = generatePIN(); // "042815"
-```
+## Configuration
 
-### Rate Limiting
+Codemote works out of the box with zero configuration. These environment variables are available for advanced use:
 
-Protect pairing endpoints with exponential backoff and lockout:
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `8080` | Server port |
+| `CODEMOTE_REPO_PATH` | Current directory | Working directory for sessions |
+| `CLAUDE_PATH` | `claude` | Path to Claude Code executable |
+| `CODEX_PATH` | `codex` | Path to Codex executable |
+| `GEMINI_PATH` | `gemini` | Path to Gemini CLI executable |
 
-```typescript
-import { RateLimiter } from "codemote";
+## Security
 
-const limiter = new RateLimiter({
-  maxAttempts: 5,
-  windowMs: 60_000,
-  backoffMs: [1000, 2000, 4000, 8000, 16_000],
-  lockoutMs: 60_000,
-});
+- All connections use TLS by default (self-signed certificate, generated locally)
+- Pairing requires a 6-digit PIN displayed only on your terminal
+- No data is sent to external servers. Everything runs locally.
+- The relay, uplink, and bridge all run in a single process on your machine
 
-const result = await limiter.checkAndRecord(clientIP, success);
-if (!result.allowed) {
-  console.log(result.message); // "Too many attempts. Wait 2s before retrying"
-}
-```
+## License
 
-### PIN Management
-
-Manage PIN lifecycle with automatic expiry:
-
-```typescript
-import { PINManager } from "codemote";
-
-const manager = new PINManager(15 * 60 * 1000); // 15 minute TTL
-
-console.log(manager.pin); // Current PIN
-manager.validate("123456"); // Check if PIN matches
-
-manager.setOnRegenerate((newPin) => {
-  console.log("New PIN:", newPin);
-  // Update UI, notify clients, etc.
-});
-```
-
-## API
-
-### `generatePIN(): string`
-
-Generates a random 6-digit PIN (000000-999999).
-
-### `RateLimiter`
-
-Rate limiter with exponential backoff.
-
-**Constructor:**
-- `config.maxAttempts` - Max failed attempts before lockout (default: 5)
-- `config.windowMs` - Time window for rate limiting (default: 60000)
-- `config.backoffMs` - Backoff delays for each attempt (default: [1000, 2000, 4000, 8000, 16000])
-- `config.lockoutMs` - Lockout duration after max attempts (default: 60000)
-
-**Methods:**
-- `checkAndRecord(clientIP, success)` - Check if request is allowed and record attempt
-- `reset(clientIP)` - Clear rate limit for client
-- `clear()` - Clear all rate limit records
-
-### `PINManager`
-
-Manages PIN generation, expiry, and validation.
-
-**Constructor:**
-- `ttlMs` - PIN time-to-live in milliseconds (default: 900000 = 15 minutes)
-
-**Properties:**
-- `pin` - Get current PIN (regenerates if expired)
-
-**Methods:**
-- `validate(pin)` - Check if PIN matches and is not expired
-- `getRemainingTime()` - Get milliseconds until expiry
-- `isExpired()` - Check if PIN is expired
-- `forceRegenerate()` - Manually regenerate PIN
-- `setOnRegenerate(callback)` - Set callback for regeneration events
-- `dispose()` - Clean up timers
-
-## Testing
-
-```bash
-pnpm test
-
-# Or run only CLI tests
-pnpm vitest run packages/cli/
-```
-
-## Building
-
-```bash
-pnpm build
-```
+MIT

@@ -1,4 +1,3 @@
-import type Database from "better-sqlite3";
 import { customAlphabet } from "nanoid";
 
 // Canonical onboarding token: 6-digit numeric PIN
@@ -6,16 +5,21 @@ const generateCode = customAlphabet("0123456789", 6);
 
 const CODE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
+interface PairingCode {
+	code: string;
+	uplinkDeviceId: string;
+	createdAt: number;
+	expiresAt: number;
+	usedAt?: number;
+	mobileDeviceId?: string;
+}
+
 /**
  * Service for managing pairing codes (numeric PINs).
  * Codes are 6-digit numeric strings, single-use, with 15-minute TTL.
  */
 export class PairingCodeService {
-	private db: Database.Database;
-
-	constructor(db: Database.Database) {
-		this.db = db;
-	}
+	private codes = new Map<string, PairingCode>();
 
 	/**
 	 * Generate a new pairing code for an Uplink.
@@ -26,30 +30,19 @@ export class PairingCodeService {
 		const code = generateCode();
 		const now = Date.now();
 
-		const invalidateAndInsert = this.db.transaction(
-			(nextCode: string, nextUplinkDeviceId: string, createdAt: number, expiresAt: number) => {
-				// PIN refresh should invalidate previous unused PINs for this uplink.
-				this.db
-					.prepare(
-						`
-	      DELETE FROM pairing_codes
-	      WHERE uplink_device_id = ? AND used_at IS NULL
-	    `,
-					)
-					.run(nextUplinkDeviceId);
+		// PIN refresh should invalidate previous unused PINs for this uplink.
+		for (const [key, entry] of this.codes) {
+			if (entry.uplinkDeviceId === uplinkDeviceId && entry.usedAt === undefined) {
+				this.codes.delete(key);
+			}
+		}
 
-				this.db
-					.prepare(
-						`
-	      INSERT INTO pairing_codes (code, uplink_device_id, created_at, expires_at)
-	      VALUES (?, ?, ?, ?)
-	    `,
-					)
-					.run(nextCode, nextUplinkDeviceId, createdAt, expiresAt);
-			},
-		);
-
-		invalidateAndInsert(code, uplinkDeviceId, now, now + CODE_TTL_MS);
+		this.codes.set(code, {
+			code,
+			uplinkDeviceId,
+			createdAt: now,
+			expiresAt: now + CODE_TTL_MS,
+		});
 
 		return code;
 	}
@@ -64,30 +57,16 @@ export class PairingCodeService {
 		const now = Date.now();
 		const normalizedCode = code.toUpperCase();
 
-		// Find valid, unused code
-		const row = this.db
-			.prepare(
-				`
-      SELECT uplink_device_id FROM pairing_codes
-      WHERE code = ? AND expires_at > ? AND used_at IS NULL
-    `,
-			)
-			.get(normalizedCode, now) as { uplink_device_id: string } | undefined;
-
-		if (!row) return null;
+		const entry = this.codes.get(normalizedCode);
+		if (!entry) return null;
+		if (entry.expiresAt <= now) return null;
+		if (entry.usedAt !== undefined) return null;
 
 		// Mark as used
-		this.db
-			.prepare(
-				`
-      UPDATE pairing_codes
-      SET used_at = ?, mobile_device_id = ?
-      WHERE code = ?
-    `,
-			)
-			.run(now, mobileDeviceId, normalizedCode);
+		entry.usedAt = now;
+		entry.mobileDeviceId = mobileDeviceId;
 
-		return row.uplink_device_id;
+		return entry.uplinkDeviceId;
 	}
 
 	/**
@@ -95,14 +74,16 @@ export class PairingCodeService {
 	 * @returns Number of codes removed
 	 */
 	cleanup(): number {
-		const result = this.db
-			.prepare(
-				`
-      DELETE FROM pairing_codes WHERE expires_at < ?
-    `,
-			)
-			.run(Date.now());
+		const now = Date.now();
+		let removed = 0;
 
-		return result.changes;
+		for (const [key, entry] of this.codes) {
+			if (entry.expiresAt < now) {
+				this.codes.delete(key);
+				removed++;
+			}
+		}
+
+		return removed;
 	}
 }

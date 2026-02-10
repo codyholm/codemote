@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import websocket from "@fastify/websocket";
 import Fastify from "fastify";
-import { createDatabase } from "./db/schema.js";
 import { RELAY_VERSION } from "./index.js";
 import { registerWebSocketRoutes } from "./routes/ws.js";
 import { PairingCodeService } from "./services/codes.js";
@@ -22,8 +21,6 @@ export interface RelayServerConfig {
 	port: number;
 	/** Host to bind to (default: 0.0.0.0) */
 	host: string;
-	/** Path to SQLite database file (default: relay.db in cwd) */
-	dbPath?: string;
 	/** Optional TLS config (enables HTTPS/WSS) */
 	tls?: RelayServerTLSConfig;
 }
@@ -76,8 +73,7 @@ export async function createRelayServer(config: Partial<RelayServerConfig> = {})
 	});
 
 	// Initialize services
-	const db = createDatabase(cfg.dbPath);
-	const codes = new PairingCodeService(db);
+	const codes = new PairingCodeService();
 	const rooms = new RoomManager();
 
 	// Health check endpoint
@@ -105,7 +101,6 @@ export async function createRelayServer(config: Partial<RelayServerConfig> = {})
 	// Lifecycle hooks
 	app.addHook("onClose", () => {
 		clearInterval(cleanupInterval);
-		db.close();
 	});
 
 	return {

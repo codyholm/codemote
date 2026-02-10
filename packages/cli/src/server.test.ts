@@ -166,15 +166,6 @@ describe("Server Integration", () => {
 			expect(server).toBeDefined();
 		});
 
-		it("should accept custom database path", async () => {
-			server = await startServer({
-				port: testPort + 90,
-				dbPath: ":memory:",
-			});
-
-			expect(server).toBeDefined();
-		});
-
 		it("should accept runtime configuration", async () => {
 			server = await startServer({
 				port: testPort + 100,

@@ -11,9 +11,6 @@ export { createRelayServer, type RelayServerConfig } from "./server.js";
 export { PairingCodeService } from "./services/codes.js";
 export { RoomManager } from "./services/rooms.js";
 
-// Database exports
-export { createDatabase } from "./db/schema.js";
-
 /**
  * Generic relay message envelope.
  * Payloads are forwarded as JSON between connected devices.
