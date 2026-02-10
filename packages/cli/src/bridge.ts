@@ -13,7 +13,7 @@ import type {
 	StreamEvent,
 	UplinkCommand,
 	UplinkResponse,
-} from "@codemote/uplink";
+} from "@codemote/server";
 
 interface RelayRegisteredMessage {
 	type: "registered";

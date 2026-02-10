@@ -33,7 +33,7 @@ import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import readline from "node:readline";
 
-import type { RuntimeType } from "@codemote/uplink";
+import type { RuntimeType } from "@codemote/server";
 
 async function main() {
 	const port = Number.parseInt(process.env["PORT"] || "8080", 10);
