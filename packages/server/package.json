@@ -1,0 +1,30 @@
+{
+	"name": "@codemote/server",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"scripts": {
+		"build": "tsc",
+		"typecheck": "tsc --noEmit",
+		"dev": "tsc --watch"
+	},
+	"dependencies": {
+		"@codemote/common": "workspace:*",
+		"@fastify/cors": "^11.2.0",
+		"@fastify/websocket": "^11.2.0",
+		"better-sqlite3": "^12.6.0",
+		"fastify": "^5.6.2",
+		"nanoid": "^5.1.6",
+		"node-pty": "^1.1.0",
+		"simple-git": "^3.30.0",
+		"ws": "^8.19.0"
+	},
+	"devDependencies": {
+		"@types/better-sqlite3": "^7.6.13",
+		"@types/node": "^22.19.6",
+		"@types/ws": "^8.18.1",
+		"typescript": "^5.6.0"
+	}
+}

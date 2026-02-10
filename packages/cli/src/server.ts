@@ -39,8 +39,13 @@
 import { readFile } from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
-import { type RelayServerConfig, createRelayServer } from "@codemote/relay";
-import { type RuntimeType, type UplinkConfig, UplinkServer } from "@codemote/uplink";
+import {
+	type RelayServerConfig,
+	type RuntimeType,
+	type UplinkConfig,
+	UplinkServer,
+	createRelayServer,
+} from "@codemote/server";
 import { startRelayUplinkBridge } from "./bridge.js";
 import { ensureLocalTLS } from "./tls.js";
 
