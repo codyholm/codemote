@@ -66,6 +66,18 @@ export interface Session {
 }
 
 /**
+ * Git status summary for a workspace
+ */
+export interface GitStatusSummary {
+	branch: string;
+	ahead: number;
+	behind: number;
+	staged: number;
+	unstaged: number;
+	untracked: number;
+}
+
+/**
  * Command sent to Uplink via WebSocket
  */
 export type UplinkCommand =
@@ -75,6 +87,14 @@ export type UplinkCommand =
 	| {
 			type: "get_diff";
 			payload: { sessionId: string; scope: "staged" | "unstaged" | "all" };
+	  }
+	| { type: "git_status"; payload: { sessionId: string } }
+	| { type: "git_pull"; payload: { sessionId: string } }
+	| { type: "git_push"; payload: { sessionId: string } }
+	| { type: "git_worktree_add"; payload: { sessionId: string; branch: string } }
+	| {
+			type: "git_submit_pr";
+			payload: { sessionId: string; title?: string; body?: string };
 	  }
 	| { type: "list_sessions" }
 	| { type: "list_directory"; payload: { path?: string } }
@@ -88,6 +108,17 @@ export type UplinkResponse =
 	| { type: "input_sent"; payload: { sessionId: string } }
 	| { type: "stopped"; payload: { sessionId: string } }
 	| { type: "diff"; payload: { sessionId: string; diff: string } }
+	| {
+			type: "git_status_result";
+			payload: { sessionId: string; status: GitStatusSummary };
+	  }
+	| { type: "git_pull_result"; payload: { sessionId: string; summary: string } }
+	| { type: "git_push_result"; payload: { sessionId: string; summary: string } }
+	| {
+			type: "git_worktree_result";
+			payload: { sessionId: string; path: string; branch: string };
+	  }
+	| { type: "git_pr_result"; payload: { sessionId: string; url: string } }
 	| { type: "sessions"; payload: Session[] }
 	| { type: "pong" }
 	| { type: "directory_listing"; payload: { path: string; entries: DirectoryEntry[] } }

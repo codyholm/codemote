@@ -144,13 +144,84 @@ interface DirectoryListingMessage {
 	entries: Array<{ name: string; isDirectory: boolean; isGitRepo: boolean }>;
 }
 
+interface GitStatusMessage {
+	type: "git_status";
+	sessionId: string;
+}
+
+interface GitStatusResultMessage {
+	type: "git_status_result";
+	sessionId: string;
+	status: {
+		branch: string;
+		ahead: number;
+		behind: number;
+		staged: number;
+		unstaged: number;
+		untracked: number;
+	};
+}
+
+interface GitPullMessage {
+	type: "git_pull";
+	sessionId: string;
+}
+
+interface GitPullResultMessage {
+	type: "git_pull_result";
+	sessionId: string;
+	summary: string;
+}
+
+interface GitPushMessage {
+	type: "git_push";
+	sessionId: string;
+}
+
+interface GitPushResultMessage {
+	type: "git_push_result";
+	sessionId: string;
+	summary: string;
+}
+
+interface GitWorktreeAddMessage {
+	type: "git_worktree_add";
+	sessionId: string;
+	branch: string;
+}
+
+interface GitWorktreeResultMessage {
+	type: "git_worktree_result";
+	sessionId: string;
+	path: string;
+	branch: string;
+}
+
+interface GitSubmitPRMessage {
+	type: "git_submit_pr";
+	sessionId: string;
+	title?: string;
+	body?: string;
+}
+
+interface GitPRResultMessage {
+	type: "git_pr_result";
+	sessionId: string;
+	url: string;
+}
+
 type MobileInboundMessage =
 	| ApprovalResponseMessage
 	| SendPromptMessage
 	| StopMessage
 	| NewSessionMessage
 	| GetDiffMessage
-	| ListDirectoryMessage;
+	| ListDirectoryMessage
+	| GitStatusMessage
+	| GitPullMessage
+	| GitPushMessage
+	| GitWorktreeAddMessage
+	| GitSubmitPRMessage;
 
 type MobileOutboundMessage =
 	| SessionListMessage
@@ -159,7 +230,12 @@ type MobileOutboundMessage =
 	| ApprovalRequestMessage
 	| DiffMessage
 	| DeviceInfoMessage
-	| DirectoryListingMessage;
+	| DirectoryListingMessage
+	| GitStatusResultMessage
+	| GitPullResultMessage
+	| GitPushResultMessage
+	| GitWorktreeResultMessage
+	| GitPRResultMessage;
 
 const AUTO_RESUME_RUNTIMES: ReadonlySet<RuntimeType> = new Set(["claude", "opencode"]);
 
@@ -271,6 +347,41 @@ class UplinkWsClient {
 		});
 	}
 
+	async gitStatus(sessionId: string) {
+		return this.sendAndWait({
+			type: "git_status",
+			payload: { sessionId },
+		});
+	}
+
+	async gitPull(sessionId: string) {
+		return this.sendAndWait({
+			type: "git_pull",
+			payload: { sessionId },
+		});
+	}
+
+	async gitPush(sessionId: string) {
+		return this.sendAndWait({
+			type: "git_push",
+			payload: { sessionId },
+		});
+	}
+
+	async gitWorktreeAdd(sessionId: string, branch: string) {
+		return this.sendAndWait({
+			type: "git_worktree_add",
+			payload: { sessionId, branch },
+		});
+	}
+
+	async gitSubmitPR(sessionId: string, title?: string, body?: string) {
+		return this.sendAndWait({
+			type: "git_submit_pr",
+			payload: { sessionId, ...(title ? { title } : {}), ...(body ? { body } : {}) },
+		});
+	}
+
 	async close(): Promise<void> {
 		if (this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
 			return;
@@ -354,6 +465,16 @@ function expectedResponseType(commandType: UplinkCommand["type"]): UplinkRespons
 			return "diff";
 		case "list_directory":
 			return "directory_listing";
+		case "git_status":
+			return "git_status_result";
+		case "git_pull":
+			return "git_pull_result";
+		case "git_push":
+			return "git_push_result";
+		case "git_worktree_add":
+			return "git_worktree_result";
+		case "git_submit_pr":
+			return "git_pr_result";
 		default:
 			return "error";
 	}
@@ -473,6 +594,21 @@ export async function startRelayUplinkBridge(
 				return;
 			case "get_diff":
 				await handleGetDiff(message);
+				return;
+			case "git_status":
+				await handleGitStatus(message);
+				return;
+			case "git_pull":
+				await handleGitPull(message);
+				return;
+			case "git_push":
+				await handleGitPush(message);
+				return;
+			case "git_worktree_add":
+				await handleGitWorktreeAdd(message);
+				return;
+			case "git_submit_pr":
+				await handleGitSubmitPR(message);
 				return;
 			case "list_directory":
 				await handleListDirectory(message);
@@ -705,6 +841,134 @@ export async function startRelayUplinkBridge(
 				type: "directory_listing",
 				path: message.path ?? "",
 				entries: [],
+			});
+		}
+	}
+
+	async function handleGitStatus(message: GitStatusMessage): Promise<void> {
+		try {
+			const response = await uplinkClient.gitStatus(message.sessionId);
+			if (response.type !== "git_status_result") {
+				throw new Error("Unexpected git_status response");
+			}
+			sendToMobile({
+				type: "git_status_result",
+				sessionId: response.payload.sessionId,
+				status: response.payload.status,
+			});
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to get git status: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			sendToMobile({
+				type: "git_status_result",
+				sessionId: message.sessionId,
+				status: {
+					branch: "unknown",
+					ahead: 0,
+					behind: 0,
+					staged: 0,
+					unstaged: 0,
+					untracked: 0,
+				},
+			});
+		}
+	}
+
+	async function handleGitPull(message: GitPullMessage): Promise<void> {
+		try {
+			const response = await uplinkClient.gitPull(message.sessionId);
+			if (response.type !== "git_pull_result") {
+				throw new Error("Unexpected git_pull response");
+			}
+			sendToMobile({
+				type: "git_pull_result",
+				sessionId: response.payload.sessionId,
+				summary: response.payload.summary,
+			});
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to git pull: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			sendToMobile({
+				type: "git_pull_result",
+				sessionId: message.sessionId,
+				summary: `Pull failed: ${error instanceof Error ? error.message : String(error)}`,
+			});
+		}
+	}
+
+	async function handleGitPush(message: GitPushMessage): Promise<void> {
+		try {
+			const response = await uplinkClient.gitPush(message.sessionId);
+			if (response.type !== "git_push_result") {
+				throw new Error("Unexpected git_push response");
+			}
+			sendToMobile({
+				type: "git_push_result",
+				sessionId: response.payload.sessionId,
+				summary: response.payload.summary,
+			});
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to git push: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			sendToMobile({
+				type: "git_push_result",
+				sessionId: message.sessionId,
+				summary: `Push failed: ${error instanceof Error ? error.message : String(error)}`,
+			});
+		}
+	}
+
+	async function handleGitWorktreeAdd(message: GitWorktreeAddMessage): Promise<void> {
+		try {
+			const response = await uplinkClient.gitWorktreeAdd(message.sessionId, message.branch);
+			if (response.type !== "git_worktree_result") {
+				throw new Error("Unexpected git_worktree_add response");
+			}
+			sendToMobile({
+				type: "git_worktree_result",
+				sessionId: response.payload.sessionId,
+				path: response.payload.path,
+				branch: response.payload.branch,
+			});
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to create worktree: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			sendToMobile({
+				type: "git_worktree_result",
+				sessionId: message.sessionId,
+				path: "",
+				branch: `Failed: ${error instanceof Error ? error.message : String(error)}`,
+			});
+		}
+	}
+
+	async function handleGitSubmitPR(message: GitSubmitPRMessage): Promise<void> {
+		try {
+			const response = await uplinkClient.gitSubmitPR(
+				message.sessionId,
+				message.title,
+				message.body,
+			);
+			if (response.type !== "git_pr_result") {
+				throw new Error("Unexpected git_submit_pr response");
+			}
+			sendToMobile({
+				type: "git_pr_result",
+				sessionId: response.payload.sessionId,
+				url: response.payload.url,
+			});
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to submit PR: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			sendToMobile({
+				type: "git_pr_result",
+				sessionId: message.sessionId,
+				url: `Failed: ${error instanceof Error ? error.message : String(error)}`,
 			});
 		}
 	}
@@ -1019,6 +1283,54 @@ function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 			msg.path = path.trim();
 		}
 		return msg;
+	}
+
+	if (type === "git_status") {
+		const sessionId = (payload as { sessionId?: unknown }).sessionId;
+		if (typeof sessionId === "string") {
+			return { type: "git_status", sessionId };
+		}
+		return null;
+	}
+
+	if (type === "git_pull") {
+		const sessionId = (payload as { sessionId?: unknown }).sessionId;
+		if (typeof sessionId === "string") {
+			return { type: "git_pull", sessionId };
+		}
+		return null;
+	}
+
+	if (type === "git_push") {
+		const sessionId = (payload as { sessionId?: unknown }).sessionId;
+		if (typeof sessionId === "string") {
+			return { type: "git_push", sessionId };
+		}
+		return null;
+	}
+
+	if (type === "git_worktree_add") {
+		const sessionId = (payload as { sessionId?: unknown }).sessionId;
+		const branch = (payload as { branch?: unknown }).branch;
+		if (typeof sessionId === "string" && typeof branch === "string") {
+			return { type: "git_worktree_add", sessionId, branch };
+		}
+		return null;
+	}
+
+	if (type === "git_submit_pr") {
+		const sessionId = (payload as { sessionId?: unknown }).sessionId;
+		const title = (payload as { title?: unknown }).title;
+		const body = (payload as { body?: unknown }).body;
+		if (typeof sessionId === "string") {
+			return {
+				type: "git_submit_pr",
+				sessionId,
+				...(typeof title === "string" ? { title } : {}),
+				...(typeof body === "string" ? { body } : {}),
+			};
+		}
+		return null;
 	}
 
 	return null;
