@@ -33,6 +33,15 @@ export interface Workspace {
 }
 
 /**
+ * A directory entry returned by list_directory
+ */
+export interface DirectoryEntry {
+	name: string;
+	isDirectory: boolean;
+	isGitRepo: boolean;
+}
+
+/**
  * Session state
  */
 export interface Session {
@@ -68,6 +77,7 @@ export type UplinkCommand =
 			payload: { sessionId: string; scope: "staged" | "unstaged" | "all" };
 	  }
 	| { type: "list_sessions" }
+	| { type: "list_directory"; payload: { path?: string } }
 	| { type: "ping" };
 
 /**
@@ -80,6 +90,7 @@ export type UplinkResponse =
 	| { type: "diff"; payload: { sessionId: string; diff: string } }
 	| { type: "sessions"; payload: Session[] }
 	| { type: "pong" }
+	| { type: "directory_listing"; payload: { path: string; entries: DirectoryEntry[] } }
 	| { type: "error"; payload: { message: string; code: string } }
 	| { type: "event"; payload: StreamEvent };
 

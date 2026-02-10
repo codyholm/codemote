@@ -1,3 +1,6 @@
+import { readdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import type { RuntimeType, StreamEvent } from "@codemote/common";
 import { WebSocket, WebSocketServer } from "ws";
 import { EventBus } from "./events.js";
@@ -10,7 +13,13 @@ import {
 } from "./executors/index.js";
 import { MockExecutor } from "./mock-executor.js";
 import { SessionManager } from "./session.js";
-import type { Session, UplinkCommand, UplinkConfig, UplinkResponse } from "./types.js";
+import type {
+	DirectoryEntry,
+	Session,
+	UplinkCommand,
+	UplinkConfig,
+	UplinkResponse,
+} from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
@@ -262,9 +271,57 @@ export class UplinkServer {
 				return { type: "diff", payload: { sessionId: command.payload.sessionId, diff } };
 			}
 
+			case "list_directory": {
+				const requestedPath = command.payload.path?.trim() || homedir();
+				const resolvedPath = resolve(requestedPath);
+				const entries = await this.listDirectory(resolvedPath);
+				return { type: "directory_listing", payload: { path: resolvedPath, entries } };
+			}
+
 			default:
 				throw new Error("Unknown command type");
 		}
+	}
+
+	private async listDirectory(dirPath: string): Promise<DirectoryEntry[]> {
+		const dirents = await readdir(dirPath, { withFileTypes: true });
+		const candidates = dirents.filter(
+			(d) => (d.isDirectory() || d.isSymbolicLink()) && !d.name.startsWith("."),
+		);
+
+		const results = await Promise.all(
+			candidates.map(async (d): Promise<DirectoryEntry | null> => {
+				const fullPath = join(dirPath, d.name);
+
+				// For symlinks, verify the target is actually a directory
+				if (d.isSymbolicLink()) {
+					try {
+						const targetStat = await stat(fullPath);
+						if (!targetStat.isDirectory()) return null;
+					} catch {
+						return null; // broken symlink
+					}
+				}
+
+				let isGitRepo = false;
+				try {
+					await stat(join(fullPath, ".git"));
+					isGitRepo = true;
+				} catch {
+					// not a git repo
+				}
+				return { name: d.name, isDirectory: true, isGitRepo };
+			}),
+		);
+
+		const entries = results.filter((e): e is DirectoryEntry => e !== null);
+
+		entries.sort((a, b) => {
+			if (a.isGitRepo !== b.isGitRepo) return a.isGitRepo ? -1 : 1;
+			return a.name.localeCompare(b.name);
+		});
+
+		return entries.slice(0, 200);
 	}
 
 	private broadcast(response: UplinkResponse): void {

@@ -49,6 +49,7 @@ interface SessionInfo {
 	status: SessionStatus;
 	createdAt: number;
 	runtimeSessionId?: string;
+	workspace?: string;
 }
 
 interface SessionListMessage {
@@ -121,6 +122,7 @@ interface NewSessionMessage {
 	runtime: RuntimeType;
 	prompt: string;
 	resumeSessionId?: string;
+	workspace?: string;
 }
 
 type DiffScope = "staged" | "unstaged" | "all";
@@ -131,12 +133,24 @@ interface GetDiffMessage {
 	scope: DiffScope;
 }
 
+interface ListDirectoryMessage {
+	type: "list_directory";
+	path?: string;
+}
+
+interface DirectoryListingMessage {
+	type: "directory_listing";
+	path: string;
+	entries: Array<{ name: string; isDirectory: boolean; isGitRepo: boolean }>;
+}
+
 type MobileInboundMessage =
 	| ApprovalResponseMessage
 	| SendPromptMessage
 	| StopMessage
 	| NewSessionMessage
-	| GetDiffMessage;
+	| GetDiffMessage
+	| ListDirectoryMessage;
 
 type MobileOutboundMessage =
 	| SessionListMessage
@@ -144,7 +158,8 @@ type MobileOutboundMessage =
 	| SessionStatusMessage
 	| ApprovalRequestMessage
 	| DiffMessage
-	| DeviceInfoMessage;
+	| DeviceInfoMessage
+	| DirectoryListingMessage;
 
 const AUTO_RESUME_RUNTIMES: ReadonlySet<RuntimeType> = new Set(["claude", "opencode"]);
 
@@ -249,6 +264,13 @@ class UplinkWsClient {
 		});
 	}
 
+	async listDirectory(path?: string) {
+		return this.sendAndWait({
+			type: "list_directory",
+			payload: { ...(path ? { path } : {}) },
+		});
+	}
+
 	async close(): Promise<void> {
 		if (this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
 			return;
@@ -330,6 +352,8 @@ function expectedResponseType(commandType: UplinkCommand["type"]): UplinkRespons
 			return "stopped";
 		case "get_diff":
 			return "diff";
+		case "list_directory":
+			return "directory_listing";
 		default:
 			return "error";
 	}
@@ -450,6 +474,9 @@ export async function startRelayUplinkBridge(
 			case "get_diff":
 				await handleGetDiff(message);
 				return;
+			case "list_directory":
+				await handleListDirectory(message);
+				return;
 			case "approval_response":
 				await handleApprovalResponse(message);
 				return;
@@ -459,7 +486,12 @@ export async function startRelayUplinkBridge(
 	async function handleNewSession(message: NewSessionMessage): Promise<void> {
 		const resumeSessionId = resolveResumeSessionId(message);
 		try {
-			await startAndTrackSession(message.runtime, message.prompt, resumeSessionId);
+			await startAndTrackSession(
+				message.runtime,
+				message.prompt,
+				resumeSessionId,
+				message.workspace,
+			);
 		} catch (error) {
 			let sessionStartError: unknown = error;
 			if (resumeSessionId) {
@@ -469,7 +501,7 @@ export async function startRelayUplinkBridge(
 					}; retrying with a fresh session`,
 				);
 				try {
-					await startAndTrackSession(message.runtime, message.prompt);
+					await startAndTrackSession(message.runtime, message.prompt, undefined, message.workspace);
 					return;
 				} catch (fallbackError) {
 					sessionStartError = fallbackError;
@@ -515,8 +547,14 @@ export async function startRelayUplinkBridge(
 		runtime: RuntimeType,
 		prompt: string,
 		resumeSessionId?: string,
+		workspace?: string,
 	): Promise<{ sessionId: string }> {
-		const started = await uplinkClient.startRun(runtime, repoPath, prompt, resumeSessionId);
+		const started = await uplinkClient.startRun(
+			runtime,
+			workspace || repoPath,
+			prompt,
+			resumeSessionId,
+		);
 		if (started.type !== "run_started") {
 			throw new Error("Unexpected start_run response");
 		}
@@ -528,6 +566,7 @@ export async function startRelayUplinkBridge(
 			status: "starting",
 			createdAt: Date.now(),
 			...(resumeSessionId ? { runtimeSessionId: resumeSessionId } : {}),
+			...(workspace ? { workspace } : {}),
 		});
 		sendSessionList();
 		return { sessionId };
@@ -646,6 +685,30 @@ export async function startRelayUplinkBridge(
 		}
 	}
 
+	async function handleListDirectory(message: ListDirectoryMessage): Promise<void> {
+		try {
+			const response = await uplinkClient.listDirectory(message.path);
+			if (response.type !== "directory_listing") {
+				throw new Error("Unexpected list_directory response");
+			}
+
+			sendToMobile({
+				type: "directory_listing",
+				path: response.payload.path,
+				entries: response.payload.entries,
+			});
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to list directory: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			sendToMobile({
+				type: "directory_listing",
+				path: message.path ?? "",
+				entries: [],
+			});
+		}
+	}
+
 	function sendSessionList(): void {
 		const sessionsList = Array.from(sessions.values()).sort((a, b) => b.createdAt - a.createdAt);
 		log?.(
@@ -671,6 +734,7 @@ export async function startRelayUplinkBridge(
 		startedAt?: number;
 		createdAt?: number;
 		runtimeSessionId?: string;
+		workspace?: { workingDir: string };
 	}): SessionInfo {
 		return {
 			id: session.id,
@@ -678,6 +742,7 @@ export async function startRelayUplinkBridge(
 			status: session.status,
 			createdAt: session.createdAt ?? session.startedAt ?? Date.now(),
 			...(session.runtimeSessionId ? { runtimeSessionId: session.runtimeSessionId } : {}),
+			...(session.workspace ? { workspace: session.workspace.workingDir } : {}),
 		};
 	}
 
@@ -884,6 +949,7 @@ function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 		const runtime = (payload as { runtime?: unknown }).runtime;
 		const prompt = (payload as { prompt?: unknown }).prompt;
 		const resumeSessionId = (payload as { resumeSessionId?: unknown }).resumeSessionId;
+		const workspace = (payload as { workspace?: unknown }).workspace;
 		if (
 			(runtime === "opencode" ||
 				runtime === "claude" ||
@@ -891,10 +957,14 @@ function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 				runtime === "gemini") &&
 			typeof prompt === "string"
 		) {
+			const msg: NewSessionMessage = { type: "new_session", runtime, prompt };
 			if (typeof resumeSessionId === "string" && resumeSessionId.trim().length > 0) {
-				return { type: "new_session", runtime, prompt, resumeSessionId: resumeSessionId.trim() };
+				msg.resumeSessionId = resumeSessionId.trim();
 			}
-			return { type: "new_session", runtime, prompt };
+			if (typeof workspace === "string" && workspace.trim().length > 0) {
+				msg.workspace = workspace.trim();
+			}
+			return msg;
 		}
 		return null;
 	}
@@ -940,6 +1010,15 @@ function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 			return { type: "approval_response", sessionId, requestId, approved };
 		}
 		return null;
+	}
+
+	if (type === "list_directory") {
+		const path = (payload as { path?: unknown }).path;
+		const msg: ListDirectoryMessage = { type: "list_directory" };
+		if (typeof path === "string" && path.trim().length > 0) {
+			msg.path = path.trim();
+		}
+		return msg;
 	}
 
 	return null;

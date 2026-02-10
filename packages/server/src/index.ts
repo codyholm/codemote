@@ -41,6 +41,7 @@ export type {
 	RunResult,
 	WorkspaceConfig,
 	Workspace,
+	DirectoryEntry,
 	Session,
 	UplinkCommand,
 	UplinkResponse,
