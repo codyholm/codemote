@@ -124,13 +124,15 @@ export class WorkspaceManager {
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			if (msg.includes("no upstream") || msg.includes("has no upstream")) {
-				await workspaceGit.push(["-u", "origin", branch]);
+				const remotes = await workspaceGit.getRemotes();
+				const remote = remotes[0]?.name ?? "origin";
+				await workspaceGit.push(["-u", remote, branch]);
 			} else {
 				throw err;
 			}
 		}
 
-		return `Pushed ${branch} to origin.`;
+		return `Pushed ${branch} to remote.`;
 	}
 
 	/**
