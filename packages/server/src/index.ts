@@ -4,7 +4,6 @@
 export { createRelayServer, type RelayServerConfig } from "./relay/server.js";
 export { PairingCodeService } from "./relay/services/codes.js";
 export { RoomManager } from "./relay/services/rooms.js";
-export { createDatabase } from "./relay/db/schema.js";
 export type { RelayEnvelope, PairingSession, ConnectedClient } from "./relay/index.js";
 export { RELAY_VERSION } from "./relay/index.js";
 

@@ -56,8 +56,6 @@ export interface ServerConfig {
 	onPINRegenerate?: (pin: string) => void;
 	/** Callback when a client successfully connects */
 	onClientConnected?: () => void;
-	/** Path to SQLite database (optional) */
-	dbPath?: string;
 	/** Repository path for uplink */
 	repoPath?: string;
 	/** Runtime types to enable in uplink */
@@ -124,7 +122,7 @@ interface RelayStats {
  * @returns Server handle for control and monitoring
  */
 export async function startServer(config: ServerConfig): Promise<ServerHandle> {
-	const { port, onPINRegenerate, onClientConnected, dbPath, repoPath, runtimes } = config;
+	const { port, onPINRegenerate, onClientConnected, repoPath, runtimes } = config;
 
 	const tlsDisableRequested =
 		process.env["GUILD_REMOTE_DISABLE_TLS"] === "1" ||
@@ -164,7 +162,6 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	const relayConfig: Partial<RelayServerConfig> = {
 		port,
 		host: "0.0.0.0",
-		...(dbPath ? { dbPath } : {}),
 		...(tlsInfo ? { tls: { keyPath: tlsInfo.keyPath, certPath: tlsInfo.certPath } } : {}),
 	};
 

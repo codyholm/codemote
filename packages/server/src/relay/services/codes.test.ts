@@ -1,32 +1,11 @@
-import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PairingCodeService } from "./codes";
 
 describe("PairingCodeService", () => {
-	let db: Database.Database;
 	let service: PairingCodeService;
 
 	beforeEach(() => {
-		// Use in-memory SQLite database for tests
-		db = new Database(":memory:");
-
-		// Create the pairing_codes table
-		db.exec(`
-			CREATE TABLE pairing_codes (
-				code TEXT PRIMARY KEY,
-				uplink_device_id TEXT NOT NULL,
-				created_at INTEGER NOT NULL,
-				expires_at INTEGER NOT NULL,
-				used_at INTEGER,
-				mobile_device_id TEXT
-			)
-		`);
-
-		service = new PairingCodeService(db);
-	});
-
-	afterEach(() => {
-		db.close();
+		service = new PairingCodeService();
 	});
 
 	describe("create", () => {
@@ -40,25 +19,6 @@ describe("PairingCodeService", () => {
 			const code = service.create("pk_uplink_123");
 
 			expect(code).toMatch(/^\d{6}$/);
-		});
-
-		it("stores code in database with correct fields", () => {
-			const uplinkKey = "pk_uplink_test";
-			const code = service.create(uplinkKey);
-
-			const row = db.prepare("SELECT * FROM pairing_codes WHERE code = ?").get(code) as {
-				code: string;
-				uplink_device_id: string;
-				created_at: number;
-				expires_at: number;
-				used_at: number | null;
-			};
-
-			expect(row).toBeDefined();
-			expect(row.uplink_device_id).toBe(uplinkKey);
-			expect(row.created_at).toBeLessThanOrEqual(Date.now());
-			expect(row.expires_at).toBeGreaterThan(row.created_at);
-			expect(row.used_at).toBeNull();
 		});
 
 		it("generates unique codes", () => {
@@ -80,12 +40,6 @@ describe("PairingCodeService", () => {
 			expect(firstCode).not.toBe(secondCode);
 			expect(service.consume(firstCode, "pk_mobile_old_pin")).toBeNull();
 			expect(service.consume(secondCode, "pk_mobile_new_pin")).toBe(uplinkDeviceId);
-
-			const rows = db
-				.prepare("SELECT code FROM pairing_codes WHERE uplink_device_id = ?")
-				.all(uplinkDeviceId) as Array<{ code: string }>;
-			expect(rows).toHaveLength(1);
-			expect(rows[0]?.code).toBe(secondCode);
 		});
 	});
 
@@ -97,19 +51,6 @@ describe("PairingCodeService", () => {
 			const result = service.consume(code, "pk_mobile_123");
 
 			expect(result).toBe(uplinkKey);
-		});
-
-		it("marks code as used after consumption", () => {
-			const code = service.create("pk_uplink_test");
-
-			service.consume(code, "pk_mobile_123");
-
-			const row = db
-				.prepare("SELECT used_at, mobile_device_id FROM pairing_codes WHERE code = ?")
-				.get(code) as { used_at: number | null; mobile_device_id: string | null };
-
-			expect(row.used_at).not.toBeNull();
-			expect(row.mobile_device_id).toBe("pk_mobile_123");
 		});
 
 		it("returns null for already consumed code", () => {
@@ -125,18 +66,16 @@ describe("PairingCodeService", () => {
 		});
 
 		it("returns null for expired code", () => {
-			// Insert an already-expired code directly
-			const expiredCode = "123456";
-			const now = Date.now();
+			const code = service.create("pk_uplink_expired");
 
-			db.prepare(`
-				INSERT INTO pairing_codes (code, uplink_device_id, created_at, expires_at)
-				VALUES (?, ?, ?, ?)
-			`).run(expiredCode, "pk_uplink_expired", now - 10000, now - 5000);
+			// Advance time past the 15-minute TTL
+			vi.useFakeTimers();
+			vi.setSystemTime(Date.now() + 16 * 60 * 1000);
 
-			const result = service.consume(expiredCode, "pk_mobile_123");
-
+			const result = service.consume(code, "pk_mobile_123");
 			expect(result).toBeNull();
+
+			vi.useRealTimers();
 		});
 
 		it("returns null for non-existent code", () => {
@@ -148,53 +87,36 @@ describe("PairingCodeService", () => {
 
 	describe("cleanup", () => {
 		it("removes expired codes", () => {
-			const now = Date.now();
-
-			// Insert expired codes directly
-			db.prepare(`
-				INSERT INTO pairing_codes (code, uplink_device_id, created_at, expires_at)
-				VALUES (?, ?, ?, ?)
-			`).run("EXPIR1", "pk_1", now - 20000, now - 10000);
-
-			db.prepare(`
-				INSERT INTO pairing_codes (code, uplink_device_id, created_at, expires_at)
-				VALUES (?, ?, ?, ?)
-			`).run("EXPIR2", "pk_2", now - 20000, now - 5000);
-
-			// Create a valid code (not expired)
+			service.create("pk_1");
+			service.create("pk_2");
 			const validCode = service.create("pk_valid");
+
+			// Advance time past TTL
+			vi.useFakeTimers();
+			vi.setSystemTime(Date.now() + 16 * 60 * 1000);
+
+			// Create a fresh code (not expired)
+			const freshCode = service.create("pk_fresh");
 
 			const removed = service.cleanup();
 
-			expect(removed).toBe(2);
+			// The 3 old codes should be expired (pk_1 and pk_2 were deleted by create("pk_valid")... no wait)
+			// pk_1, pk_2, pk_valid are all expired; freshCode is not
+			expect(removed).toBe(3);
 
-			// Valid code should still exist
-			const validRow = db.prepare("SELECT * FROM pairing_codes WHERE code = ?").get(validCode);
-			expect(validRow).toBeDefined();
+			// Fresh code should still be consumable
+			expect(service.consume(freshCode, "pk_mobile")).not.toBeNull();
+
+			vi.useRealTimers();
 		});
 
 		it("returns 0 when no expired codes", () => {
-			// Create only valid codes
 			service.create("pk_1");
 			service.create("pk_2");
 
 			const removed = service.cleanup();
 
 			expect(removed).toBe(0);
-		});
-
-		it("removes used but expired codes", () => {
-			const now = Date.now();
-
-			// Insert expired and used code
-			db.prepare(`
-				INSERT INTO pairing_codes (code, uplink_device_id, created_at, expires_at, used_at, mobile_device_id)
-				VALUES (?, ?, ?, ?, ?, ?)
-			`).run("USEDEX", "pk_uplink", now - 20000, now - 10000, now - 15000, "pk_mobile");
-
-			const removed = service.cleanup();
-
-			expect(removed).toBe(1);
 		});
 	});
 });
