@@ -121,9 +121,13 @@ export class WorkspaceManager {
 
 		try {
 			await workspaceGit.push();
-		} catch {
-			// No upstream set — push with -u
-			await workspaceGit.push(["-u", "origin", branch]);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (msg.includes("no upstream") || msg.includes("has no upstream")) {
+				await workspaceGit.push(["-u", "origin", branch]);
+			} else {
+				throw err;
+			}
 		}
 
 		return `Pushed ${branch} to origin.`;
@@ -157,9 +161,17 @@ export class WorkspaceManager {
 		const workspace = this.workspaces.get(id);
 		if (!workspace) throw new WorkspaceNotFoundError(id);
 
+		// Validate input lengths
+		if (title && title.length > 256) {
+			throw new Error("PR title must be 256 characters or fewer.");
+		}
+		if (body && body.length > 10_000) {
+			throw new Error("PR body must be 10,000 characters or fewer.");
+		}
+
 		// Check gh is available
 		try {
-			await execFileAsync("which", ["gh"]);
+			await execFileAsync("gh", ["--version"]);
 		} catch {
 			throw new Error("GitHub CLI (gh) is not installed. Install it from https://cli.github.com");
 		}

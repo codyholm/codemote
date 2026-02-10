@@ -860,6 +860,18 @@ export async function startRelayUplinkBridge(
 			log?.(
 				`[Bridge] Failed to get git status: ${error instanceof Error ? error.message : String(error)}`,
 			);
+			sendToMobile({
+				type: "git_status_result",
+				sessionId: message.sessionId,
+				status: {
+					branch: "unknown",
+					ahead: 0,
+					behind: 0,
+					staged: 0,
+					unstaged: 0,
+					untracked: 0,
+				},
+			});
 		}
 	}
 
