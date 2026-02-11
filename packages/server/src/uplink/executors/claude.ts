@@ -67,6 +67,8 @@ interface ClaudeStreamEvent {
 	id?: string;
 	/** Tool use block ID reference (present on tool_result events to match back to the tool_use) */
 	tool_use_id?: string;
+	/** Parent tool use ID (non-null when event is from a sub-agent spawned by Task) */
+	parent_tool_use_id?: string;
 }
 
 /**
@@ -370,6 +372,7 @@ export class ClaudeExecutor extends BaseExecutor {
 	 */
 	private handleClaudeEvent(sessionId: string, event: ClaudeStreamEvent): void {
 		const claudeSession = this.claudeSessions.get(sessionId);
+		const parentToolUseId = event.parent_tool_use_id ?? undefined;
 
 		switch (event.type) {
 			case "result":
@@ -380,7 +383,12 @@ export class ClaudeExecutor extends BaseExecutor {
 				}
 				// Emit the result as a structured message
 				if ((event as unknown as { result?: string }).result) {
-					this.emitMessage(sessionId, "assistant", (event as unknown as { result: string }).result);
+					this.emitMessage(
+						sessionId,
+						"assistant",
+						(event as unknown as { result: string }).result,
+						parentToolUseId,
+					);
 				}
 				this.emitStatus(sessionId, "idle");
 				break;
@@ -396,7 +404,7 @@ export class ClaudeExecutor extends BaseExecutor {
 			case "assistant_message":
 			case "message":
 				if (event.content) {
-					this.emitMessage(sessionId, "assistant", event.content);
+					this.emitMessage(sessionId, "assistant", event.content, parentToolUseId);
 				}
 				break;
 
@@ -416,7 +424,7 @@ export class ClaudeExecutor extends BaseExecutor {
 						claudeSession.pendingToolCalls.set(event.id, { toolCallId, toolName });
 					}
 					const argsString = event.args !== undefined ? JSON.stringify(event.args) : undefined;
-					this.emitToolCall(sessionId, toolCallId, toolName, argsString);
+					this.emitToolCall(sessionId, toolCallId, toolName, argsString, parentToolUseId);
 				} else {
 					// Fallback if somehow session not found
 					this.emitOutput(sessionId, `[Tool: ${event.tool_name || "unknown"}]\n`);
@@ -434,6 +442,7 @@ export class ClaudeExecutor extends BaseExecutor {
 							pending.toolName,
 							event.output,
 							event.error,
+							parentToolUseId,
 						);
 						break;
 					}

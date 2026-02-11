@@ -776,7 +776,9 @@ export async function startRelayUplinkBridge(
 				const payload = event.payload as {
 					role?: string;
 					content?: string;
+					parentToolUseId?: string;
 				};
+				if (payload.parentToolUseId) return;
 				sendToMobile({
 					type: "session_message",
 					sessionId: event.sessionId,
@@ -790,7 +792,9 @@ export async function startRelayUplinkBridge(
 					toolCallId?: string;
 					toolName?: string;
 					arguments?: string;
+					parentToolUseId?: string;
 				};
+				if (payload.parentToolUseId) return;
 				const msg: SessionToolCallMessage = {
 					type: "session_tool_call",
 					sessionId: event.sessionId,
@@ -809,7 +813,9 @@ export async function startRelayUplinkBridge(
 					toolName?: string;
 					output?: string;
 					error?: string;
+					parentToolUseId?: string;
 				};
+				if (payload.parentToolUseId) return;
 				const msg: SessionToolResultMessage = {
 					type: "session_tool_result",
 					sessionId: event.sessionId,

@@ -40,12 +40,14 @@ export interface StreamEvent {
 export interface MessagePayload {
 	role: "assistant" | "user";
 	content: string;
+	parentToolUseId?: string;
 }
 
 export interface ToolCallPayload {
 	toolCallId: string;
 	toolName: string;
 	arguments?: string;
+	parentToolUseId?: string;
 }
 
 export interface ToolResultPayload {
@@ -53,6 +55,7 @@ export interface ToolResultPayload {
 	toolName: string;
 	output?: string;
 	error?: string;
+	parentToolUseId?: string;
 }
 
 // Executor interface types

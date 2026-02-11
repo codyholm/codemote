@@ -154,8 +154,17 @@ export abstract class BaseExecutor {
 	/**
 	 * Emit a structured message event for a session
 	 */
-	protected emitMessage(sessionId: string, role: MessagePayload["role"], content: string): void {
-		const payload: MessagePayload = { role, content };
+	protected emitMessage(
+		sessionId: string,
+		role: MessagePayload["role"],
+		content: string,
+		parentToolUseId?: string,
+	): void {
+		const payload: MessagePayload = {
+			role,
+			content,
+			...(parentToolUseId ? { parentToolUseId } : {}),
+		};
 		this.eventBus.emit(createEvent("session.message", sessionId, payload));
 	}
 
@@ -167,11 +176,13 @@ export abstract class BaseExecutor {
 		toolCallId: string,
 		toolName: string,
 		args?: string,
+		parentToolUseId?: string,
 	): void {
 		const payload: ToolCallPayload = {
 			toolCallId,
 			toolName,
 			...(args !== undefined ? { arguments: args } : {}),
+			...(parentToolUseId ? { parentToolUseId } : {}),
 		};
 		this.eventBus.emit(createEvent("session.tool_call", sessionId, payload));
 	}
@@ -185,12 +196,14 @@ export abstract class BaseExecutor {
 		toolName: string,
 		output?: string,
 		error?: string,
+		parentToolUseId?: string,
 	): void {
 		const payload: ToolResultPayload = {
 			toolCallId,
 			toolName,
 			...(output !== undefined ? { output } : {}),
 			...(error !== undefined ? { error } : {}),
+			...(parentToolUseId ? { parentToolUseId } : {}),
 		};
 		this.eventBus.emit(createEvent("session.tool_result", sessionId, payload));
 	}
