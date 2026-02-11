@@ -11,11 +11,6 @@ out/
 *.tsbuildinfo
 *.tgz
 
-# Expo
-.expo/
-ios/
-android/
-
 # Environment
 .env
 .env.local
@@ -55,9 +50,8 @@ npm-debug.log*
 # Guild (generated)
 .guild/exports/
 .guild/.archive/
-happy-cli-main/*
-happy-main/*
-happy-server-main/*
+masterreference
+.guild/handoff-workspace-feature.md
 
 # Codex
 .codex/

@@ -27,16 +27,47 @@ import { startServer } from "./server.js";
 import { ensureLocalTLS } from "./tls.js";
 import { renderUI, updateStatus } from "./ui.js";
 
+import { readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import readline from "node:readline";
+import { fileURLToPath } from "node:url";
 
 import type { RuntimeType } from "@codemote/server";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(readFileSync(resolve(__dirname, "../package.json"), "utf-8"));
+
+const args = process.argv.slice(2);
+
+if (args.includes("--version") || args.includes("-v")) {
+	console.log(pkg.version);
+	process.exit(0);
+}
+
+if (args.includes("--help") || args.includes("-h")) {
+	console.log(`codemote v${pkg.version} — Control AI coding agents from your phone
+
+Usage: codemote [options]
+
+Options:
+  -h, --help     Show this help message
+  -v, --version  Show version number
+
+Environment:
+  PORT               Server port (default: 8080)
+  CODEMOTE_START_DIR Default directory for project browsing (default: cwd)
+
+${pkg.homepage}`);
+	process.exit(0);
+}
 
 async function main() {
 	const port = Number.parseInt(process.env["PORT"] || "8080", 10);
 	let interactive = false;
-	const configuredRepoPath = process.env["CODEMOTE_REPO_PATH"]?.trim();
+	const configuredRepoPath = (
+		process.env["CODEMOTE_START_DIR"] || process.env["CODEMOTE_REPO_PATH"]
+	)?.trim();
 	const inferredRepoPath = process.env["INIT_CWD"]?.trim() || process.cwd();
 	const repoPath = resolve(configuredRepoPath || inferredRepoPath);
 

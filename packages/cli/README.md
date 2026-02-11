@@ -1,6 +1,6 @@
 # Codemote
 
-Control AI coding agents from your phone. Start Claude Code, OpenCode, Codex, or Gemini sessions from an iOS app and watch them work in real time.
+Control AI coding agents from your phone. Start Claude Code, Codex, OpenCode, or Gemini sessions and watch them work in real time.
 
 ## Quick Start
 
@@ -8,41 +8,42 @@ Control AI coding agents from your phone. Start Claude Code, OpenCode, Codex, or
 npx codemote
 ```
 
-This starts a local server, displays a QR code and PIN, and waits for the Codemote iOS app to connect.
+Scan the QR code with your iPhone camera or open the Codemote app and enter the PIN. That's it.
 
 ## How It Works
 
-1. Run `npx codemote` in your project directory
-2. Scan the QR code with your iPhone camera, or open the Codemote app and enter the PIN
-3. Once paired, start AI coding sessions from your phone
-4. Watch output stream in real time, send follow-up prompts, and manage sessions remotely
+1. **Run `npx codemote`** in your terminal — a QR code and PIN appear
+2. **Pair your phone** — scan the QR code or enter the PIN in the Codemote iOS app
+3. **Pick a project** — browse directories on your machine from the app
+4. **Start a session** — choose an AI agent, type a prompt, and watch it work
+5. **Stay in the loop** — stream output in real time, send follow-ups, manage sessions on the go
 
-Codemote runs entirely on your machine. No data leaves your network. The phone connects directly to your computer over your local network.
+Everything runs on your machine. Your phone connects directly over your local network — no data leaves your computer.
 
 ## Requirements
 
-- Node.js 20 or later
-- One or more AI coding agents installed: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenCode](https://github.com/anomalyco/opencode), [Codex](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli)
-- Codemote iOS app (available on TestFlight)
+- **Node.js 22+**
+- **At least one AI coding agent** installed on your machine:
+  [Claude Code](https://docs.anthropic.com/en/docs/claude-code) ·
+  [Codex](https://github.com/openai/codex) ·
+  [OpenCode](https://github.com/anomalyco/opencode) ·
+  [Gemini CLI](https://github.com/google-gemini/gemini-cli)
+- **Codemote iOS app** — TestFlight access is provided directly to invited testers
 
 ## Configuration
 
-Codemote works out of the box with zero configuration. These environment variables are available for advanced use:
+Works out of the box. These environment variables are available if needed:
 
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8080` | Server port |
-| `CODEMOTE_REPO_PATH` | Current directory | Working directory for sessions |
-| `CLAUDE_PATH` | `claude` | Path to Claude Code executable |
-| `CODEX_PATH` | `codex` | Path to Codex executable |
-| `GEMINI_PATH` | `gemini` | Path to Gemini CLI executable |
+| `CODEMOTE_START_DIR` | Current directory | Starting directory for project browsing |
 
 ## Security
 
-- All connections use TLS by default (self-signed certificate, generated locally)
-- Pairing requires a 6-digit PIN displayed only on your terminal
-- No data is sent to external servers. Everything runs locally.
-- The relay, uplink, and bridge all run in a single process on your machine
+- TLS encrypted by default (self-signed cert, generated locally)
+- Pairing requires a 6-digit PIN shown only in your terminal
+- In LAN mode your phone connects directly to your machine and traffic stays on your local network, with no external server involved
 
 ## License
 

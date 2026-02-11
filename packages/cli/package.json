@@ -1,9 +1,18 @@
 {
 	"name": "codemote",
-	"version": "0.1.0",
+	"version": "0.7.3",
 	"description": "Control AI coding agents from your phone",
 	"license": "MIT",
 	"author": "Cody Holm",
+	"homepage": "https://codemote.app",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/codyholm/codemote.git",
+		"directory": "packages/cli"
+	},
+	"bugs": {
+		"url": "https://github.com/codyholm/codemote/issues"
+	},
 	"keywords": ["ai", "coding", "claude", "opencode", "codex", "gemini", "remote", "mobile", "cli"],
 	"type": "module",
 	"main": "./dist/cli.js",
