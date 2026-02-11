@@ -1,9 +1,12 @@
 import type {
+	MessagePayload,
 	RunOptions,
 	RunResult,
 	RuntimeType,
 	SessionStatus,
 	StreamEvent,
+	ToolCallPayload,
+	ToolResultPayload,
 } from "@codemote/common";
 import { SessionNotActiveError, SessionNotFoundError } from "@codemote/common";
 import { type EventBus, createEvent } from "./events.js";
@@ -146,6 +149,63 @@ export abstract class BaseExecutor {
 	 */
 	protected emitDiffUpdated(sessionId: string): void {
 		this.eventBus.emit(createEvent("git.diff_updated", sessionId, {}));
+	}
+
+	/**
+	 * Emit a structured message event for a session
+	 */
+	protected emitMessage(
+		sessionId: string,
+		role: MessagePayload["role"],
+		content: string,
+		parentToolUseId?: string,
+	): void {
+		const payload: MessagePayload = {
+			role,
+			content,
+			...(parentToolUseId ? { parentToolUseId } : {}),
+		};
+		this.eventBus.emit(createEvent("session.message", sessionId, payload));
+	}
+
+	/**
+	 * Emit a tool call event for a session
+	 */
+	protected emitToolCall(
+		sessionId: string,
+		toolCallId: string,
+		toolName: string,
+		args?: string,
+		parentToolUseId?: string,
+	): void {
+		const payload: ToolCallPayload = {
+			toolCallId,
+			toolName,
+			...(args !== undefined ? { arguments: args } : {}),
+			...(parentToolUseId ? { parentToolUseId } : {}),
+		};
+		this.eventBus.emit(createEvent("session.tool_call", sessionId, payload));
+	}
+
+	/**
+	 * Emit a tool result event for a session
+	 */
+	protected emitToolResult(
+		sessionId: string,
+		toolCallId: string,
+		toolName: string,
+		output?: string,
+		error?: string,
+		parentToolUseId?: string,
+	): void {
+		const payload: ToolResultPayload = {
+			toolCallId,
+			toolName,
+			...(output !== undefined ? { output } : {}),
+			...(error !== undefined ? { error } : {}),
+			...(parentToolUseId ? { parentToolUseId } : {}),
+		};
+		this.eventBus.emit(createEvent("session.tool_result", sessionId, payload));
 	}
 
 	// ========================================

@@ -63,6 +63,30 @@ interface SessionOutputMessage {
 	text: string;
 }
 
+interface SessionMessageMessage {
+	type: "session_message";
+	sessionId: string;
+	role: "assistant" | "user";
+	content: string;
+}
+
+interface SessionToolCallMessage {
+	type: "session_tool_call";
+	sessionId: string;
+	toolCallId: string;
+	toolName: string;
+	arguments?: string;
+}
+
+interface SessionToolResultMessage {
+	type: "session_tool_result";
+	sessionId: string;
+	toolCallId: string;
+	toolName: string;
+	output?: string;
+	error?: string;
+}
+
 interface SessionStatusMessage {
 	type: "session_status";
 	sessionId: string;
@@ -226,6 +250,9 @@ type MobileInboundMessage =
 type MobileOutboundMessage =
 	| SessionListMessage
 	| SessionOutputMessage
+	| SessionMessageMessage
+	| SessionToolCallMessage
+	| SessionToolResultMessage
 	| SessionStatusMessage
 	| ApprovalRequestMessage
 	| DiffMessage
@@ -743,6 +770,65 @@ export async function startRelayUplinkBridge(
 					sessionId: event.sessionId,
 					text: payload.text ?? "",
 				});
+				return;
+			}
+			case "session.message": {
+				const payload = event.payload as {
+					role?: string;
+					content?: string;
+					parentToolUseId?: string;
+				};
+				if (payload.parentToolUseId) return;
+				sendToMobile({
+					type: "session_message",
+					sessionId: event.sessionId,
+					role: (payload.role as "assistant" | "user") ?? "assistant",
+					content: payload.content ?? "",
+				});
+				return;
+			}
+			case "session.tool_call": {
+				const payload = event.payload as {
+					toolCallId?: string;
+					toolName?: string;
+					arguments?: string;
+					parentToolUseId?: string;
+				};
+				if (payload.parentToolUseId) return;
+				const msg: SessionToolCallMessage = {
+					type: "session_tool_call",
+					sessionId: event.sessionId,
+					toolCallId: payload.toolCallId ?? "",
+					toolName: payload.toolName ?? "unknown",
+				};
+				if (payload.arguments !== undefined) {
+					msg.arguments = payload.arguments;
+				}
+				sendToMobile(msg);
+				return;
+			}
+			case "session.tool_result": {
+				const payload = event.payload as {
+					toolCallId?: string;
+					toolName?: string;
+					output?: string;
+					error?: string;
+					parentToolUseId?: string;
+				};
+				if (payload.parentToolUseId) return;
+				const msg: SessionToolResultMessage = {
+					type: "session_tool_result",
+					sessionId: event.sessionId,
+					toolCallId: payload.toolCallId ?? "",
+					toolName: payload.toolName ?? "unknown",
+				};
+				if (payload.output !== undefined) {
+					msg.output = payload.output;
+				}
+				if (payload.error !== undefined) {
+					msg.error = payload.error;
+				}
+				sendToMobile(msg);
 				return;
 			}
 			case "session.status": {

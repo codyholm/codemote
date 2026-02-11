@@ -46,6 +46,8 @@ interface ClaudeSession {
 	buffer: string;
 	/** Whether process is running */
 	running: boolean;
+	/** Map from Claude SDK tool_use block ID to our generated toolCallId */
+	pendingToolCalls: Map<string, { toolCallId: string; toolName: string }>;
 }
 
 /**
@@ -61,6 +63,12 @@ interface ClaudeStreamEvent {
 	output?: string;
 	message?: string;
 	error?: string;
+	/** Tool use block ID from Claude SDK (present on tool_use events) */
+	id?: string;
+	/** Tool use block ID reference (present on tool_result events to match back to the tool_use) */
+	tool_use_id?: string;
+	/** Parent tool use ID (non-null when event is from a sub-agent spawned by Task) */
+	parent_tool_use_id?: string;
 }
 
 /**
@@ -124,6 +132,7 @@ export class ClaudeExecutor extends BaseExecutor {
 			process: null,
 			buffer: "",
 			running: true,
+			pendingToolCalls: new Map(),
 		};
 
 		this.claudeSessions.set(session.id, claudeSession);
@@ -305,6 +314,10 @@ export class ClaudeExecutor extends BaseExecutor {
 		);
 	}
 
+	private generateToolCallId(): string {
+		return `tc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	}
+
 	/**
 	 * Handle raw output data from the Claude process
 	 *
@@ -359,6 +372,7 @@ export class ClaudeExecutor extends BaseExecutor {
 	 */
 	private handleClaudeEvent(sessionId: string, event: ClaudeStreamEvent): void {
 		const claudeSession = this.claudeSessions.get(sessionId);
+		const parentToolUseId = event.parent_tool_use_id ?? undefined;
 
 		switch (event.type) {
 			case "result":
@@ -367,9 +381,14 @@ export class ClaudeExecutor extends BaseExecutor {
 					claudeSession.claudeSessionId = event.session_id;
 					this.sessionManager.setRuntimeSessionId(sessionId, event.session_id);
 				}
-				// Emit the result as output
+				// Emit the result as a structured message
 				if ((event as unknown as { result?: string }).result) {
-					this.emitOutput(sessionId, (event as unknown as { result: string }).result);
+					this.emitMessage(
+						sessionId,
+						"assistant",
+						(event as unknown as { result: string }).result,
+						parentToolUseId,
+					);
 				}
 				this.emitStatus(sessionId, "idle");
 				break;
@@ -385,30 +404,56 @@ export class ClaudeExecutor extends BaseExecutor {
 			case "assistant_message":
 			case "message":
 				if (event.content) {
-					this.emitOutput(sessionId, event.content);
+					this.emitMessage(sessionId, "assistant", event.content, parentToolUseId);
 				}
 				break;
 
 			case "partial_message":
+				// Streaming text deltas go through session.output for real-time display
 				if (event.content) {
 					this.emitOutput(sessionId, event.content);
 				}
 				break;
 
 			case "tool_use":
-				// Claude is using a tool (file edit, bash, etc.)
-				this.emitOutput(sessionId, `[Tool: ${event.tool_name || "unknown"}]\n`);
+				if (claudeSession) {
+					const toolCallId = this.generateToolCallId();
+					const toolName = event.tool_name || "unknown";
+					// Track by Claude SDK block ID so we can match tool_result later
+					if (event.id) {
+						claudeSession.pendingToolCalls.set(event.id, { toolCallId, toolName });
+					}
+					const argsString = event.args !== undefined ? JSON.stringify(event.args) : undefined;
+					this.emitToolCall(sessionId, toolCallId, toolName, argsString, parentToolUseId);
+				} else {
+					// Fallback if somehow session not found
+					this.emitOutput(sessionId, `[Tool: ${event.tool_name || "unknown"}]\n`);
+				}
 				break;
 
 			case "tool_result":
+				if (claudeSession && event.tool_use_id) {
+					const pending = claudeSession.pendingToolCalls.get(event.tool_use_id);
+					if (pending) {
+						claudeSession.pendingToolCalls.delete(event.tool_use_id);
+						this.emitToolResult(
+							sessionId,
+							pending.toolCallId,
+							pending.toolName,
+							event.output,
+							event.error,
+							parentToolUseId,
+						);
+						break;
+					}
+				}
+				// Fallback: no matching tool_use found, emit as raw output
 				if (event.output) {
 					this.emitOutput(sessionId, `${event.output}\n`);
 				}
 				break;
 
 			case "permission_request":
-				// Route permission requests as attention events
-				// The mobile app should surface these to the user
 				this.emitAttention(sessionId, "permission_required", {
 					tool: event.tool_name,
 					description: event.description,
@@ -427,8 +472,6 @@ export class ClaudeExecutor extends BaseExecutor {
 				break;
 
 			default:
-				// Log unknown event types for debugging
-				// but don't emit them as output to avoid noise
 				break;
 		}
 	}
