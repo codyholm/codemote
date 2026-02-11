@@ -108,19 +108,19 @@ exit 0
 		expect(result.sessionId).toBeDefined();
 		expect(result.runId).toBeDefined();
 
-		await waitFor(() => events.some((e) => (e as { type: string }).type === "session.output"));
+		await waitFor(() => events.some((e) => (e as { type: string }).type === "session.message"));
 
 		// Should have received events
 		expect(events.length).toBeGreaterThan(0);
 
-		// Should have output events with content from mock Claude
-		const outputEvents = events.filter((e) => (e as { type: string }).type === "session.output");
-		expect(outputEvents.length).toBeGreaterThan(0);
+		// Should have message events with content from mock Claude
+		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
+		expect(messageEvents.length).toBeGreaterThan(0);
 
 		// Verify we received the mock Claude message
-		const hasClaudeMessage = outputEvents.some((e) => {
-			const payload = (e as { payload?: { text?: string } }).payload;
-			return payload?.text?.includes("Hello from mock Claude");
+		const hasClaudeMessage = messageEvents.some((e) => {
+			const payload = (e as { payload?: { content?: string } }).payload;
+			return payload?.content?.includes("Hello from mock Claude");
 		});
 		expect(hasClaudeMessage).toBe(true);
 

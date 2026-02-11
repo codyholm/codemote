@@ -23,6 +23,9 @@ export type SessionStatus = "starting" | "running" | "idle" | "ended" | "error";
 // Unified stream event types
 export type StreamEventType =
 	| "session.output"
+	| "session.message"
+	| "session.tool_call"
+	| "session.tool_result"
 	| "session.status"
 	| "attention.required"
 	| "git.diff_updated";
@@ -32,6 +35,24 @@ export interface StreamEvent {
 	timestamp: number;
 	sessionId: string;
 	payload: unknown;
+}
+
+export interface MessagePayload {
+	role: "assistant" | "user";
+	content: string;
+}
+
+export interface ToolCallPayload {
+	toolCallId: string;
+	toolName: string;
+	arguments?: string;
+}
+
+export interface ToolResultPayload {
+	toolCallId: string;
+	toolName: string;
+	output?: string;
+	error?: string;
 }
 
 // Executor interface types
