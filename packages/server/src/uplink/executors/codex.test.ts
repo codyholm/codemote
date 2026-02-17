@@ -31,21 +31,27 @@ describe("CodexExecutor", () => {
 		await git.add(".");
 		await git.commit("Initial commit");
 
-		// Create mock codex executable shell script that outputs realistic streaming JSON
-		// Codex outputs JSON Lines to stderr and final message to stdout
+		// Create a mock codex executable that validates argument order and emits
+		// modern JSONL events on stdout.
 		mockCodexPath = join(testDir, "mock-codex");
 		const mockScriptContent = `#!/bin/sh
-# Mock Codex CLI - outputs streaming JSON events to stderr, final output to stdout
+# Validate top-level flags come before exec
+if [ "$1" != "--ask-for-approval" ] || [ "$2" != "on-request" ] || [ "$3" != "--sandbox" ] || [ "$4" != "workspace-write" ] || [ "$5" != "exec" ] || [ "$6" != "--json" ]; then
+	echo "unexpected args: $*" >&2
+	exit 2
+fi
 
-# Emit JSON Lines events to stderr
->&2 echo '{"type":"thread.started","thread_id":"mock-thread"}'
+echo '{"type":"thread.started","thread_id":"mock-thread"}'
 sleep 0.1
->&2 echo '{"type":"item.message","content":"Hello from Codex!"}'
+echo '{"type":"turn.started"}'
 sleep 0.1
->&2 echo '{"type":"turn.completed"}'
-
-# Emit final message to stdout
-echo "Task completed successfully."
+echo '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Hello from Codex!"}}'
+sleep 0.1
+echo '{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"echo hi","aggregated_output":"","exit_code":null,"status":"in_progress"}}'
+sleep 0.1
+echo '{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"echo hi","aggregated_output":"hi","exit_code":0,"status":"completed"}}'
+sleep 0.1
+echo '{"type":"turn.completed"}'
 exit 0
 `;
 		await writeFile(mockCodexPath, mockScriptContent);
@@ -100,7 +106,7 @@ exit 0
 		expect(result.runId).toBeDefined();
 
 		// Wait for mock script to complete and events to propagate
-		await new Promise((r) => setTimeout(r, 800));
+		await new Promise((r) => setTimeout(r, 1500));
 
 		// Should have received events
 		expect(events.length).toBeGreaterThan(0);
@@ -108,6 +114,37 @@ exit 0
 		// Should have status events
 		const statusEvents = events.filter((e) => (e as { type: string }).type === "session.status");
 		expect(statusEvents.length).toBeGreaterThan(0);
+
+		// Should map agent messages into structured session messages
+		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
+		expect(messageEvents.length).toBeGreaterThan(0);
+		expect((messageEvents[0] as { payload: { content?: string } }).payload.content).toContain(
+			"Hello from Codex!",
+		);
+
+		// Should map command execution into tool call + result
+		const toolCallEvents = events.filter(
+			(e) => (e as { type: string }).type === "session.tool_call",
+		);
+		const toolResultEvents = events.filter(
+			(e) => (e as { type: string }).type === "session.tool_result",
+		);
+		expect(toolCallEvents.length).toBeGreaterThan(0);
+		expect(toolResultEvents.length).toBeGreaterThan(0);
+		const callPayload = toolCallEvents[0] as {
+			payload: { toolCallId?: string; toolName?: string; arguments?: string };
+		};
+		const resultPayload = toolResultEvents[0] as {
+			payload: { toolCallId?: string; toolName?: string; output?: string };
+		};
+		expect(callPayload.payload.toolCallId).toBeDefined();
+		expect(resultPayload.payload.toolCallId).toBe(callPayload.payload.toolCallId);
+		expect(callPayload.payload.toolName).toBe("shell");
+		expect(resultPayload.payload.toolName).toBe("shell");
+		expect(resultPayload.payload.output).toContain("hi");
+
+		// Thread id should be captured as runtime session id for future resume.
+		expect(sessionManager.get(result.sessionId)?.runtimeSessionId).toBe("mock-thread");
 
 		// Mark as cleaned up so afterEach doesn't try to stop again
 		activeSessionId = null;
@@ -118,9 +155,9 @@ exit 0
 		const longRunningMockPath = join(testDir, "mock-codex-long");
 		const longRunningScript = `#!/bin/sh
 # Long-running mock Codex for testing stop functionality
->&2 echo '{"type":"thread.started","thread_id":"mock-thread"}'
+echo '{"type":"thread.started","thread_id":"mock-thread"}'
 sleep 10
->&2 echo '{"type":"turn.completed"}'
+echo '{"type":"turn.completed"}'
 `;
 		await writeFile(longRunningMockPath, longRunningScript);
 		await chmod(longRunningMockPath, 0o755);
