@@ -2,7 +2,10 @@
  * Tests for server integration
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { type ServerHandle, startServer } from "./server.js";
 
@@ -81,6 +84,61 @@ describe("Server Integration", () => {
 
 			expect(originalPIN).toMatch(/^\d{6}$/);
 			expect(newPIN).toMatch(/^\d{6}$/);
+		});
+
+		it("lists and revokes trusted devices through server handle", async () => {
+			const prevDisable = process.env["GUILD_REMOTE_DISABLE_TLS"];
+			const prevAllow = process.env["GUILD_REMOTE_ALLOW_INSECURE"];
+			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-test-"));
+			process.env["GUILD_REMOTE_DISABLE_TLS"] = "1";
+			process.env["GUILD_REMOTE_ALLOW_INSECURE"] = "1";
+			try {
+				server = await startServer({
+					port: testPort + 45,
+					pairingStorePath: join(fixtureDir, "trusted-pairings.json"),
+				});
+
+				const mobileWs = new WebSocket(`ws://127.0.0.1:${testPort + 45}/ws`);
+				await waitForOpen(mobileWs);
+
+				const pairPromise = waitForMessageOfType(mobileWs, "paired");
+				mobileWs.send(
+					JSON.stringify({
+						type: "pair",
+						deviceId: "mobile-trusted-1",
+						pin: server.pin,
+						deviceType: "mobile",
+					}),
+				);
+				await pairPromise;
+
+				const trustedBefore = await server.listTrustedDevices();
+				expect(trustedBefore.some((record) => record.mobileDeviceId === "mobile-trusted-1")).toBe(
+					true,
+				);
+
+				const removed = await server.revokeTrustedDevice("mobile-trusted-1");
+				expect(removed).toBe(true);
+
+				const trustedAfter = await server.listTrustedDevices();
+				expect(trustedAfter.some((record) => record.mobileDeviceId === "mobile-trusted-1")).toBe(
+					false,
+				);
+
+				mobileWs.close();
+			} finally {
+				await rm(fixtureDir, { recursive: true, force: true });
+				if (prevDisable === undefined) {
+					Reflect.deleteProperty(process.env, "GUILD_REMOTE_DISABLE_TLS");
+				} else {
+					process.env["GUILD_REMOTE_DISABLE_TLS"] = prevDisable;
+				}
+				if (prevAllow === undefined) {
+					Reflect.deleteProperty(process.env, "GUILD_REMOTE_ALLOW_INSECURE");
+				} else {
+					process.env["GUILD_REMOTE_ALLOW_INSECURE"] = prevAllow;
+				}
+			}
 		});
 
 		it("does not crash when receiving malformed encrypted payloads", async () => {

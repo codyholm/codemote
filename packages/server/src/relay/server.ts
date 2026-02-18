@@ -1,10 +1,13 @@
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import websocket from "@fastify/websocket";
 import Fastify from "fastify";
 import { RELAY_VERSION } from "./index.js";
 import { registerWebSocketRoutes } from "./routes/ws.js";
 import { PairingCodeService } from "./services/codes.js";
 import { RoomManager } from "./services/rooms.js";
+import { type TrustedPairingRecord, TrustedPairingsStore } from "./services/trusted-pairings.js";
 
 export interface RelayServerTLSConfig {
 	key?: string | Buffer;
@@ -21,6 +24,8 @@ export interface RelayServerConfig {
 	port: number;
 	/** Host to bind to (default: 0.0.0.0) */
 	host: string;
+	/** Path to trusted pairings store JSON file */
+	pairingStorePath?: string;
 	/** Optional TLS config (enables HTTPS/WSS) */
 	tls?: RelayServerTLSConfig;
 }
@@ -75,6 +80,25 @@ export async function createRelayServer(config: Partial<RelayServerConfig> = {})
 	// Initialize services
 	const codes = new PairingCodeService();
 	const rooms = new RoomManager();
+	const trustedPairingsEnabled = !["0", "false"].includes(
+		(process.env["CODEMOTE_TRUSTED_PAIRINGS"] ?? "").toLowerCase(),
+	);
+	const pairingStorePath =
+		cfg.pairingStorePath ??
+		process.env["CODEMOTE_PAIRING_STORE_PATH"] ??
+		join(homedir(), ".codemote", "trusted-pairings.json");
+	const trustedPairings = new TrustedPairingsStore({
+		filePath: pairingStorePath,
+		enabled: trustedPairingsEnabled,
+		log: (message) => app.log.warn(message),
+	});
+	if (trustedPairingsEnabled) {
+		app.log.info(
+			`[relay] trusted-pair-store path=${pairingStorePath} loaded_records=${trustedPairings.recordCount()}`,
+		);
+	} else {
+		app.log.info("[relay] trusted-pair-store disabled");
+	}
 
 	// Health check endpoint
 	app.get("/health", async () => {
@@ -88,7 +112,7 @@ export async function createRelayServer(config: Partial<RelayServerConfig> = {})
 	});
 
 	// Register WebSocket routes
-	registerWebSocketRoutes(app, rooms, codes);
+	registerWebSocketRoutes(app, rooms, codes, { trustedPairings });
 
 	// Cleanup interval for expired pairing codes (every 60 seconds)
 	const cleanupInterval = setInterval(() => {
@@ -105,6 +129,12 @@ export async function createRelayServer(config: Partial<RelayServerConfig> = {})
 
 	return {
 		app,
+		listTrustedDevices: (uplinkDeviceId: string): TrustedPairingRecord[] =>
+			trustedPairings.listForUplink(uplinkDeviceId),
+		revokeTrustedDevice: (uplinkDeviceId: string, mobileDeviceId: string): boolean =>
+			trustedPairings.revoke(uplinkDeviceId, mobileDeviceId),
+		revokeAllTrustedDevices: (uplinkDeviceId: string): number =>
+			trustedPairings.revokeAllForUplink(uplinkDeviceId),
 		/**
 		 * Start the server
 		 */

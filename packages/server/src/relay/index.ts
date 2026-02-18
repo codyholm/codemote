@@ -10,6 +10,10 @@ export { createRelayServer, type RelayServerConfig } from "./server.js";
 // Service exports
 export { PairingCodeService } from "./services/codes.js";
 export { RoomManager } from "./services/rooms.js";
+export {
+	TrustedPairingsStore,
+	type TrustedPairingRecord,
+} from "./services/trusted-pairings.js";
 
 /**
  * Generic relay message envelope.

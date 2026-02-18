@@ -4,6 +4,10 @@
 export { createRelayServer, type RelayServerConfig } from "./relay/server.js";
 export { PairingCodeService } from "./relay/services/codes.js";
 export { RoomManager } from "./relay/services/rooms.js";
+export {
+	TrustedPairingsStore,
+	type TrustedPairingRecord,
+} from "./relay/services/trusted-pairings.js";
 export type { RelayEnvelope, PairingSession, ConnectedClient } from "./relay/index.js";
 export { RELAY_VERSION } from "./relay/index.js";
 
