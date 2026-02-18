@@ -491,8 +491,10 @@ export class CodexExecutor extends BaseExecutor {
 	private emitLegacyCommandEvent(sessionId: string, event: CodexEvent): void {
 		const toolCallId = this.generateToolCallId();
 		const toolName = "shell";
-		this.emitToolCall(sessionId, toolCallId, toolName, event.command);
-		this.emitToolResult(sessionId, toolCallId, toolName, event.output);
+		const command = this.asString(event.command);
+		const output = this.asString(event.output);
+		this.emitToolCall(sessionId, toolCallId, toolName, command);
+		this.emitToolResult(sessionId, toolCallId, toolName, output);
 	}
 
 	private registerToolCall(
