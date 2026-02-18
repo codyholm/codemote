@@ -5,7 +5,7 @@ import { createRelayServer } from "./server.js";
 async function main() {
 	const port = Number.parseInt(process.env["PORT"] || "8080", 10);
 	const host = process.env["HOST"] || "0.0.0.0";
-	const dbPath = process.env["DB_PATH"];
+	const pairingStorePath = process.env["CODEMOTE_PAIRING_STORE_PATH"] ?? process.env["DB_PATH"];
 	const tlsKeyPath = process.env["TLS_KEY_PATH"];
 	const tlsCertPath = process.env["TLS_CERT_PATH"];
 
@@ -20,7 +20,7 @@ async function main() {
 	const server = await createRelayServer({
 		port,
 		host,
-		...(dbPath && { dbPath }),
+		...(pairingStorePath && { pairingStorePath }),
 		...(tlsKeyPath && tlsCertPath
 			? {
 					tls: {

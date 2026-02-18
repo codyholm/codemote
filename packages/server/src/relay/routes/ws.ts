@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import type { WebSocket } from "ws";
 import type { PairingCodeService } from "../services/codes.js";
 import type { RoomManager } from "../services/rooms.js";
+import type { TrustedPairingsStore } from "../services/trusted-pairings.js";
 
 /**
  * WebSocket message format
@@ -9,7 +10,7 @@ import type { RoomManager } from "../services/rooms.js";
  */
 export interface WsMessage {
 	/** Message type */
-	type: "register" | "pair" | "resume" | "message";
+	type: "register" | "pair" | "resume" | "unpair" | "message";
 	/** Sender's device identifier */
 	deviceId?: string;
 	/** Device type (mobile app or uplink companion) */
@@ -22,6 +23,10 @@ export interface WsMessage {
 	uplinkDeviceId?: string;
 	/** Message payload (plaintext JSON over TLS) */
 	payload?: unknown;
+}
+
+interface RegisterWebSocketRoutesOptions {
+	trustedPairings?: TrustedPairingsStore;
 }
 
 interface PairingRateLimiterConfig {
@@ -224,7 +229,9 @@ export function registerWebSocketRoutes(
 	app: FastifyInstance,
 	rooms: RoomManager,
 	codes: PairingCodeService,
+	options: RegisterWebSocketRoutesOptions = {},
 ): void {
+	const { trustedPairings } = options;
 	const pairingRateLimiter = new PairingRateLimiter({
 		maxAttempts: 5,
 		windowMs: 60_000,
@@ -336,6 +343,7 @@ export function registerWebSocketRoutes(
 					const pairedSet = pairedMobilesByUplink.get(uplinkDeviceId) ?? new Set<string>();
 					pairedSet.add(msg.deviceId);
 					pairedMobilesByUplink.set(uplinkDeviceId, pairedSet);
+					trustedPairings?.markPaired(uplinkDeviceId, msg.deviceId);
 
 					rooms.join(uplinkDeviceId, {
 						ws,
@@ -367,10 +375,34 @@ export function registerWebSocketRoutes(
 						return;
 					}
 
-					const allowed = pairedMobilesByUplink.get(msg.uplinkDeviceId)?.has(msg.deviceId);
+					const allowedFromMemory =
+						pairedMobilesByUplink.get(msg.uplinkDeviceId)?.has(msg.deviceId) ?? false;
+					const allowedFromStore =
+						trustedPairings?.isTrusted(msg.uplinkDeviceId, msg.deviceId) ?? false;
+					const allowMemoryFallback =
+						!(trustedPairings?.isEnabled() ?? false) ||
+						(trustedPairings?.hasPersistenceFailure() ?? false);
+					const allowed = allowedFromStore || (allowMemoryFallback && allowedFromMemory);
+
 					if (!allowed) {
 						ws.send(JSON.stringify({ type: "error", message: "Not paired" }));
 						return;
+					}
+
+					const resumeSource = allowedFromStore ? "persisted" : "memory";
+					const pairedSet = pairedMobilesByUplink.get(msg.uplinkDeviceId) ?? new Set<string>();
+					pairedSet.add(msg.deviceId);
+					pairedMobilesByUplink.set(msg.uplinkDeviceId, pairedSet);
+					app.log.info(
+						`[relay] resume_allowed source=${resumeSource} uplink=${msg.uplinkDeviceId.slice(0, 8)} mobile=${msg.deviceId.slice(0, 8)}`,
+					);
+
+					if (allowedFromStore) {
+						trustedPairings?.markSeen(msg.uplinkDeviceId, msg.deviceId);
+					} else if (allowMemoryFallback && trustedPairings?.isEnabled()) {
+						// Persistence write failures should not break current-process resume.
+						// Try to recover durable state opportunistically once resumed.
+						trustedPairings?.markPaired(msg.uplinkDeviceId, msg.deviceId);
 					}
 
 					clientDeviceId = msg.deviceId;
@@ -391,6 +423,43 @@ export function registerWebSocketRoutes(
 						msg.deviceId,
 						JSON.stringify({
 							type: "paired",
+							uplinkDeviceId: msg.uplinkDeviceId,
+							mobileDeviceId: msg.deviceId,
+						}),
+					);
+					break;
+				}
+
+				case "unpair": {
+					if (!msg.deviceId || msg.deviceType !== "mobile" || !msg.uplinkDeviceId) {
+						ws.send(JSON.stringify({ type: "error", message: "Invalid unpair request" }));
+						return;
+					}
+
+					const pairedSet = pairedMobilesByUplink.get(msg.uplinkDeviceId);
+					const removedFromMemory = pairedSet?.delete(msg.deviceId) ?? false;
+					if (pairedSet && pairedSet.size === 0) {
+						pairedMobilesByUplink.delete(msg.uplinkDeviceId);
+					}
+					const removedFromStore =
+						trustedPairings?.revoke(msg.uplinkDeviceId, msg.deviceId) ?? false;
+					app.log.info(
+						`[relay] unpair mobile=${msg.deviceId.slice(0, 8)} uplink=${msg.uplinkDeviceId.slice(0, 8)} removed_memory=${removedFromMemory} removed_store=${removedFromStore}`,
+					);
+
+					rooms.broadcast(
+						msg.deviceId,
+						JSON.stringify({
+							type: "unpaired",
+							uplinkDeviceId: msg.uplinkDeviceId,
+							mobileDeviceId: msg.deviceId,
+						}),
+					);
+					rooms.leave(msg.deviceId);
+
+					ws.send(
+						JSON.stringify({
+							type: "unpaired",
 							uplinkDeviceId: msg.uplinkDeviceId,
 							mobileDeviceId: msg.deviceId,
 						}),

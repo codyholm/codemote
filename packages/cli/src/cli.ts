@@ -57,6 +57,8 @@ Options:
 Environment:
   PORT               Server port (default: 8080)
   CODEMOTE_START_DIR Default directory for project browsing (default: cwd)
+  CODEMOTE_TRUSTED_PAIRINGS Enable trusted pairing persistence (default: true)
+  CODEMOTE_PAIRING_STORE_PATH Override trusted pairing store JSON path
 
 ${pkg.homepage}`);
 	process.exit(0);
@@ -118,7 +120,9 @@ async function main() {
 	// Optional interactive terminal commands (for starting sessions)
 	if (process.stdin.isTTY) {
 		interactive = true;
-		console.log("\nCommands: claude|opencode|codex|gemini <prompt>  (or: help)");
+		console.log(
+			"\nCommands: claude|opencode|codex|gemini <prompt> | devices | unpair <mobileDeviceId> | unpair-all | help",
+		);
 		const rl = readline.createInterface({
 			input: process.stdin,
 			output: process.stdout,
@@ -136,7 +140,7 @@ async function main() {
 
 			if (trimmed === "help") {
 				console.log(
-					"\nCommands:\n  claude <prompt>\n  opencode <prompt>\n  codex <prompt>\n  gemini <prompt>\n  quit\n",
+					"\nCommands:\n  claude <prompt>\n  opencode <prompt>\n  codex <prompt>\n  gemini <prompt>\n  devices\n  unpair <mobileDeviceId>\n  unpair-all\n  quit\n",
 				);
 				rl.prompt();
 				return;
@@ -149,6 +153,66 @@ async function main() {
 			}
 
 			const [first, ...rest] = trimmed.split(/\s+/);
+
+			if (first === "devices") {
+				try {
+					const trustedDevices = await server.listTrustedDevices();
+					if (trustedDevices.length === 0) {
+						console.log("No trusted devices.");
+					} else {
+						console.log("Trusted devices:");
+						for (const device of trustedDevices) {
+							console.log(
+								`  ${device.mobileDeviceId}  paired=${formatTimestamp(device.pairedAt)}  last_seen=${formatTimestamp(device.lastSeenAt)}`,
+							);
+						}
+					}
+				} catch (err) {
+					console.error(
+						`Failed to list trusted devices: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+				rl.prompt();
+				return;
+			}
+
+			if (first === "unpair") {
+				const mobileDeviceId = rest[0]?.trim();
+				if (!mobileDeviceId) {
+					console.log("Usage: unpair <mobileDeviceId>");
+					rl.prompt();
+					return;
+				}
+
+				try {
+					const removed = await server.revokeTrustedDevice(mobileDeviceId);
+					if (removed) {
+						console.log(`Unpaired device: ${mobileDeviceId}`);
+					} else {
+						console.log(`Device was not paired: ${mobileDeviceId}`);
+					}
+				} catch (err) {
+					console.error(
+						`Failed to unpair device: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+				rl.prompt();
+				return;
+			}
+
+			if (first === "unpair-all") {
+				try {
+					const removed = await server.revokeAllTrustedDevices();
+					console.log(`Unpaired ${removed} trusted device${removed === 1 ? "" : "s"}.`);
+				} catch (err) {
+					console.error(
+						`Failed to unpair devices: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+				rl.prompt();
+				return;
+			}
+
 			const runtime = first as RuntimeType;
 			const prompt = rest.join(" ").trim();
 
@@ -210,3 +274,9 @@ main().catch((err) => {
 	console.error("[CLI] Failed to start:", err);
 	process.exit(1);
 });
+
+function formatTimestamp(timestamp: number): string {
+	const date = new Date(timestamp);
+	if (Number.isNaN(date.getTime())) return "unknown";
+	return date.toISOString();
+}

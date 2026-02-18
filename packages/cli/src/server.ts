@@ -42,6 +42,7 @@ import https from "node:https";
 import {
 	type RelayServerConfig,
 	type RuntimeType,
+	type TrustedPairingRecord,
 	type UplinkConfig,
 	UplinkServer,
 	createRelayServer,
@@ -60,6 +61,8 @@ export interface ServerConfig {
 	repoPath?: string;
 	/** Runtime types to enable in uplink */
 	runtimes?: RuntimeType[];
+	/** Override path for trusted pairings store */
+	pairingStorePath?: string;
 }
 
 export interface ServerHandle {
@@ -81,6 +84,12 @@ export interface ServerHandle {
 	regeneratePIN: () => Promise<void>;
 	/** Start a new runtime session from the terminal */
 	startSession: (runtime: RuntimeType, prompt: string) => Promise<{ sessionId: string }>;
+	/** List trusted mobile devices for the current uplink */
+	listTrustedDevices: () => Promise<TrustedPairingRecord[]>;
+	/** Revoke one trusted mobile device for the current uplink */
+	revokeTrustedDevice: (mobileDeviceId: string) => Promise<boolean>;
+	/** Revoke all trusted mobile devices for the current uplink */
+	revokeAllTrustedDevices: () => Promise<number>;
 }
 
 interface RelayStats {
@@ -122,7 +131,7 @@ interface RelayStats {
  * @returns Server handle for control and monitoring
  */
 export async function startServer(config: ServerConfig): Promise<ServerHandle> {
-	const { port, onPINRegenerate, onClientConnected, repoPath, runtimes } = config;
+	const { port, onPINRegenerate, onClientConnected, repoPath, runtimes, pairingStorePath } = config;
 
 	const tlsDisableRequested =
 		process.env["GUILD_REMOTE_DISABLE_TLS"] === "1" ||
@@ -162,6 +171,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	const relayConfig: Partial<RelayServerConfig> = {
 		port,
 		host: "0.0.0.0",
+		...(pairingStorePath ? { pairingStorePath } : {}),
 		...(tlsInfo ? { tls: { keyPath: tlsInfo.keyPath, certPath: tlsInfo.certPath } } : {}),
 	};
 
@@ -285,6 +295,18 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 		async startSession(runtime: RuntimeType, prompt: string) {
 			return bridge.startSession(runtime, prompt);
+		},
+
+		async listTrustedDevices() {
+			return relay.listTrustedDevices(bridge.uplinkDeviceId);
+		},
+
+		async revokeTrustedDevice(mobileDeviceId: string) {
+			return relay.revokeTrustedDevice(bridge.uplinkDeviceId, mobileDeviceId);
+		},
+
+		async revokeAllTrustedDevices() {
+			return relay.revokeAllTrustedDevices(bridge.uplinkDeviceId);
 		},
 	};
 }
