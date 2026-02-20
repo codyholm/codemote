@@ -773,7 +773,7 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
-	it("does not auto-resume opencode sessions when creating a new session", async () => {
+	it("auto-resumes opencode sessions when creating a new session", async () => {
 		let startRunPayload: JsonRecord | null = null;
 
 		uplinkWss.on("connection", (socket) => {
@@ -844,7 +844,7 @@ describe("RelayUplinkBridge", () => {
 				sessionId: "sess-new-1",
 			});
 			expect(startRunPayload).toBeTruthy();
-			expect(startRunPayload?.["resumeSessionId"]).toBeUndefined();
+			expect(startRunPayload?.["resumeSessionId"]).toBe("ses_existing_123");
 		} finally {
 			await bridge.stop();
 		}
