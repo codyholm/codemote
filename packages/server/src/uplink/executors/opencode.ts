@@ -557,12 +557,20 @@ export class OpenCodeExecutor extends BaseExecutor {
 		}
 
 		let stderr = "";
+		const spawnState: { errorMessage: string | null } = { errorMessage: null };
 		if (!this.serverProcess || this.serverProcess.exitCode !== null) {
 			const args = ["serve", "--hostname", url.hostname, "--port", String(parsedPort)];
 			const child = spawn(this.config.commandPath, args, {
 				stdio: ["ignore", "ignore", "pipe"],
 			});
 			this.serverProcess = child;
+			child.on("error", (error) => {
+				spawnState.errorMessage =
+					error instanceof Error ? error.message : new Error(String(error)).message;
+				if (this.serverProcess === child) {
+					this.serverProcess = null;
+				}
+			});
 			child.stderr?.on("data", (chunk: Buffer | string) => {
 				if (stderr.length < 4000) {
 					stderr += chunk.toString();
@@ -580,6 +588,15 @@ export class OpenCodeExecutor extends BaseExecutor {
 		while (Date.now() < deadline) {
 			if (signal?.aborted) {
 				throw new Error("OpenCode server startup aborted");
+			}
+			const spawnErrorMessage = spawnState.errorMessage;
+			if (spawnErrorMessage) {
+				const detail = stderr.trim();
+				throw new Error(
+					detail.length > 0
+						? `Failed to start OpenCode server: ${spawnErrorMessage}. ${detail}`
+						: `Failed to start OpenCode server: ${spawnErrorMessage}`,
+				);
 			}
 			if (await this.isServerReachable(url, signal)) {
 				return;

@@ -402,6 +402,23 @@ describe("OpenCodeExecutor", () => {
 
 		activeSessionId = null;
 	});
+
+	it("fails gracefully when OpenCode daemon binary cannot be spawned", async () => {
+		const unavailablePort = await reserveLoopbackPort();
+		activeExecutor = new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
+			serverUrl: `http://127.0.0.1:${unavailablePort}`,
+			commandPath: "__missing_opencode_binary__",
+			autoStartServer: true,
+		});
+
+		await expect(
+			activeExecutor.startRun({
+				profile: "opencode",
+				workspace: testDir,
+				initialPrompt: "hello",
+			}),
+		).rejects.toThrow("Failed to start OpenCode server");
+	});
 });
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -423,4 +440,17 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 	} catch {
 		return text;
 	}
+}
+
+async function reserveLoopbackPort(): Promise<number> {
+	const server = createServer();
+	await new Promise<void>((resolve) => {
+		server.listen(0, "127.0.0.1", () => resolve());
+	});
+	const addr = server.address();
+	if (!addr || typeof addr === "string") {
+		throw new Error("Failed to reserve loopback port");
+	}
+	await new Promise<void>((resolve) => server.close(() => resolve()));
+	return addr.port;
 }

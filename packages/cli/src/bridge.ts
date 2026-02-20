@@ -341,18 +341,24 @@ class UplinkWsClient {
 		});
 	}
 
-	async sendInput(sessionId: string, input: string) {
-		return this.sendAndWait({
-			type: "send_input",
-			payload: { sessionId, input },
-		});
+	async sendInput(sessionId: string, input: string, options?: { bypassQueue?: boolean }) {
+		return this.sendAndWait(
+			{
+				type: "send_input",
+				payload: { sessionId, input },
+			},
+			options,
+		);
 	}
 
 	async stopSession(sessionId: string) {
-		return this.sendAndWait({
-			type: "stop",
-			payload: { sessionId },
-		});
+		return this.sendAndWait(
+			{
+				type: "stop",
+				payload: { sessionId },
+			},
+			{ bypassQueue: true },
+		);
 	}
 
 	async getDiff(sessionId: string, scope: DiffScope) {
@@ -430,7 +436,7 @@ class UplinkWsClient {
 		}
 
 		if (msg.type === "error") {
-			const waiter = this.pending.shift();
+			const waiter = this.pending.pop();
 			if (waiter) {
 				clearTimeout(waiter.timeout);
 				waiter.reject(new Error(msg.payload.message));
@@ -438,10 +444,12 @@ class UplinkWsClient {
 			return;
 		}
 
-		const waiter = this.pending.shift();
-		if (!waiter) {
+		const waiterIndex = this.pending.findIndex((entry) => entry.expectedType === msg.type);
+		if (waiterIndex < 0) {
 			return;
 		}
+		const [waiter] = this.pending.splice(waiterIndex, 1);
+		if (!waiter) return;
 
 		clearTimeout(waiter.timeout);
 		if (msg.type !== waiter.expectedType) {
@@ -452,7 +460,13 @@ class UplinkWsClient {
 		waiter.resolve(msg);
 	}
 
-	private sendAndWait(command: UplinkCommand): Promise<UplinkResponse> {
+	private sendAndWait(
+		command: UplinkCommand,
+		options?: { bypassQueue?: boolean },
+	): Promise<UplinkResponse> {
+		if (options?.bypassQueue) {
+			return this.sendAndWaitImmediate(command);
+		}
 		return this.enqueueCommand(() => this.sendAndWaitImmediate(command));
 	}
 
@@ -905,7 +919,9 @@ export async function startRelayUplinkBridge(
 
 		approvalRequests.delete(message.requestId);
 		try {
-			await uplinkClient.sendInput(pending.sessionId, message.approved ? "y" : "n");
+			await uplinkClient.sendInput(pending.sessionId, message.approved ? "y" : "n", {
+				bypassQueue: true,
+			});
 		} catch (error) {
 			notifySessionCommandFailure(pending.sessionId, "Approval response", error);
 		}

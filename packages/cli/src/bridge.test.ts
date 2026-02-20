@@ -600,6 +600,179 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
+	it("forwards stop immediately while a send_input command is still awaiting response", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+		let sendInputCommandAt = 0;
+		let sendInputAckAt = 0;
+		let stopCommandAt = 0;
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				const type = command["type"];
+
+				if (type === "list_sessions") {
+					socket.send(
+						JSON.stringify({
+							type: "sessions",
+							payload: [
+								{
+									id: "sess-stop-1",
+									runId: "run-stop-1",
+									runtime: "gemini",
+									status: "idle",
+									workspace: {
+										id: "ws-stop-1",
+										workingDir: tempRepoDir,
+										createdAt: Date.now(),
+									},
+									startedAt: Date.now() - 5_000,
+									endedAt: null,
+									lastActivityAt: Date.now() - 2_000,
+								},
+							],
+						}),
+					);
+					return;
+				}
+
+				if (type === "send_input") {
+					sendInputCommandAt = Date.now();
+					setTimeout(() => {
+						sendInputAckAt = Date.now();
+						socket.send(
+							JSON.stringify({
+								type: "input_sent",
+								payload: { sessionId: "sess-stop-1" },
+							}),
+						);
+					}, 300);
+					return;
+				}
+
+				if (type === "stop") {
+					stopCommandAt = Date.now();
+					socket.send(
+						JSON.stringify({
+							type: "stopped",
+							payload: { sessionId: "sess-stop-1" },
+						}),
+					);
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "666666" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-test-6" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: "mobile-test-6",
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				} else if (socket === relayUplinkSocket) {
+					relayMobileSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			const payloads: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				payloads.push(payload);
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-test-6",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					payloads.some((payload) => {
+						if (payload["type"] !== "session_list") return false;
+						const sessions = payload["sessions"];
+						return (
+							Array.isArray(sessions) &&
+							sessions.some((session) => (session as JsonRecord)["id"] === "sess-stop-1")
+						);
+					}),
+				8000,
+			);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: {
+						type: "send_prompt",
+						sessionId: "sess-stop-1",
+						prompt: "long-running input",
+					},
+				}),
+			);
+			await waitForCondition(() => sendInputCommandAt > 0, 8000);
+
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: {
+						type: "stop",
+						sessionId: "sess-stop-1",
+					},
+				}),
+			);
+
+			await waitForCondition(() => stopCommandAt > 0, 8000);
+			await waitForCondition(() => sendInputAckAt > 0, 8000);
+
+			expect(stopCommandAt).toBeGreaterThan(sendInputCommandAt);
+			expect(stopCommandAt).toBeLessThan(sendInputAckAt);
+		} finally {
+			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+				mobileSocket.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
 	it("does not auto-resume opencode sessions when creating a new session", async () => {
 		let startRunPayload: JsonRecord | null = null;
 
