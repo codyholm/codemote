@@ -264,7 +264,7 @@ type MobileOutboundMessage =
 	| GitWorktreeResultMessage
 	| GitPRResultMessage;
 
-const AUTO_RESUME_RUNTIMES: ReadonlySet<RuntimeType> = new Set(["claude", "opencode"]);
+const AUTO_RESUME_RUNTIMES: ReadonlySet<RuntimeType> = new Set(["claude"]);
 
 export interface RelayUplinkBridgeConfig {
 	relayUrl: string;
@@ -295,6 +295,7 @@ class UplinkWsClient {
 		reject: (err: Error) => void;
 		timeout: ReturnType<typeof setTimeout>;
 	}> = [];
+	private commandQueue: Promise<void> = Promise.resolve();
 
 	constructor(
 		private readonly ws: WebSocket,
@@ -340,18 +341,24 @@ class UplinkWsClient {
 		});
 	}
 
-	async sendInput(sessionId: string, input: string) {
-		return this.sendAndWait({
-			type: "send_input",
-			payload: { sessionId, input },
-		});
+	async sendInput(sessionId: string, input: string, options?: { bypassQueue?: boolean }) {
+		return this.sendAndWait(
+			{
+				type: "send_input",
+				payload: { sessionId, input },
+			},
+			options,
+		);
 	}
 
 	async stopSession(sessionId: string) {
-		return this.sendAndWait({
-			type: "stop",
-			payload: { sessionId },
-		});
+		return this.sendAndWait(
+			{
+				type: "stop",
+				payload: { sessionId },
+			},
+			{ bypassQueue: true },
+		);
 	}
 
 	async getDiff(sessionId: string, scope: DiffScope) {
@@ -429,7 +436,7 @@ class UplinkWsClient {
 		}
 
 		if (msg.type === "error") {
-			const waiter = this.pending.shift();
+			const waiter = this.pending.pop();
 			if (waiter) {
 				clearTimeout(waiter.timeout);
 				waiter.reject(new Error(msg.payload.message));
@@ -437,10 +444,12 @@ class UplinkWsClient {
 			return;
 		}
 
-		const waiter = this.pending.shift();
-		if (!waiter) {
+		const waiterIndex = this.pending.findIndex((entry) => entry.expectedType === msg.type);
+		if (waiterIndex < 0) {
 			return;
 		}
+		const [waiter] = this.pending.splice(waiterIndex, 1);
+		if (!waiter) return;
 
 		clearTimeout(waiter.timeout);
 		if (msg.type !== waiter.expectedType) {
@@ -451,17 +460,14 @@ class UplinkWsClient {
 		waiter.resolve(msg);
 	}
 
-	private sendAndWait(command: UplinkCommand): Promise<UplinkResponse> {
-		const expectedType = expectedResponseType(command.type);
-
-		return new Promise((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				reject(new Error(`Timed out waiting for uplink response: ${expectedType}`));
-			}, 20_000);
-
-			this.pending.push({ expectedType, resolve, reject, timeout });
-			this.ws.send(JSON.stringify(command));
-		});
+	private sendAndWait(
+		command: UplinkCommand,
+		options?: { bypassQueue?: boolean },
+	): Promise<UplinkResponse> {
+		if (options?.bypassQueue) {
+			return this.sendAndWaitImmediate(command);
+		}
+		return this.enqueueCommand(() => this.sendAndWaitImmediate(command));
 	}
 
 	private rejectAll(err: Error): void {
@@ -473,6 +479,43 @@ class UplinkWsClient {
 			clearTimeout(waiter.timeout);
 			waiter.reject(err);
 		}
+	}
+
+	private enqueueCommand(run: () => Promise<UplinkResponse>): Promise<UplinkResponse> {
+		const queued = this.commandQueue.then(run, run);
+		this.commandQueue = queued.then(
+			() => undefined,
+			() => undefined,
+		);
+		return queued;
+	}
+
+	private sendAndWaitImmediate(command: UplinkCommand): Promise<UplinkResponse> {
+		const expectedType = expectedResponseType(command.type);
+		const timeoutMs = commandTimeoutFor(command.type);
+
+		return new Promise((resolve, reject) => {
+			const waiter: {
+				expectedType: UplinkResponse["type"];
+				resolve: (msg: UplinkResponse) => void;
+				reject: (err: Error) => void;
+				timeout: ReturnType<typeof setTimeout>;
+			} = {
+				expectedType,
+				resolve,
+				reject,
+				timeout: setTimeout(() => {
+					// Remove timed-out waiter so a late response can't poison subsequent commands.
+					const idx = this.pending.indexOf(waiter);
+					if (idx >= 0) {
+						this.pending.splice(idx, 1);
+					}
+					reject(new Error(`Timed out waiting for uplink response: ${expectedType}`));
+				}, timeoutMs),
+			};
+			this.pending.push(waiter);
+			this.ws.send(JSON.stringify(command));
+		});
 	}
 }
 
@@ -507,6 +550,36 @@ function expectedResponseType(commandType: UplinkCommand["type"]): UplinkRespons
 	}
 }
 
+function commandTimeoutFor(commandType: UplinkCommand["type"]): number {
+	const defaultMs = 20_000;
+	const longRunningDefaultMs = 120_000;
+	const globalOverride = parseTimeoutOverride(process.env["CODEMOTE_UPLINK_COMMAND_TIMEOUT_MS"]);
+	const longOverride = parseTimeoutOverride(process.env["CODEMOTE_UPLINK_LONG_COMMAND_TIMEOUT_MS"]);
+
+	const baseMs = globalOverride ?? defaultMs;
+	const longRunningMs = longOverride ?? Math.max(baseMs, longRunningDefaultMs);
+
+	switch (commandType) {
+		case "start_run":
+		case "send_input":
+			return longRunningMs;
+		default:
+			return baseMs;
+	}
+}
+
+function parseTimeoutOverride(raw: string | undefined): number | undefined {
+	if (!raw) {
+		return undefined;
+	}
+
+	const parsed = Number.parseInt(raw, 10);
+	if (!Number.isFinite(parsed) || parsed <= 0) {
+		return undefined;
+	}
+	return parsed;
+}
+
 export async function startRelayUplinkBridge(
 	config: RelayUplinkBridgeConfig,
 ): Promise<RelayUplinkBridgeHandle> {
@@ -537,7 +610,13 @@ export async function startRelayUplinkBridge(
 	await syncSessionsFromUplink();
 
 	relayWs.on("message", (data: WebSocket.RawData) => {
-		void handleRelayMessage(data);
+		void handleRelayMessage(data).catch((error) => {
+			log?.(
+				`[Bridge] Failed to handle relay message: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		});
 	});
 
 	relayWs.on("close", () => {
@@ -614,10 +693,10 @@ export async function startRelayUplinkBridge(
 				await handleNewSession(message);
 				return;
 			case "send_prompt":
-				await uplinkClient.sendInput(message.sessionId, message.prompt);
+				await handleSendPrompt(message);
 				return;
 			case "stop":
-				await uplinkClient.stopSession(message.sessionId);
+				await handleStop(message);
 				return;
 			case "get_diff":
 				await handleGetDiff(message);
@@ -643,6 +722,58 @@ export async function startRelayUplinkBridge(
 			case "approval_response":
 				await handleApprovalResponse(message);
 				return;
+		}
+	}
+
+	function errorMessage(error: unknown): string {
+		return error instanceof Error ? error.message : String(error);
+	}
+
+	function ensureErrorSession(sessionId: string): void {
+		const existing = sessions.get(sessionId);
+		if (existing) {
+			existing.status = "error";
+			return;
+		}
+
+		sessions.set(sessionId, {
+			id: sessionId,
+			runtime: "opencode",
+			status: "error",
+			createdAt: Date.now(),
+		});
+	}
+
+	function notifySessionCommandFailure(sessionId: string, action: string, error: unknown): void {
+		const message = errorMessage(error);
+		log?.(`[Bridge] ${action} failed for session ${sessionId}: ${message}`);
+		ensureErrorSession(sessionId);
+		sendToMobile({
+			type: "session_status",
+			sessionId,
+			status: "error",
+		});
+		sendToMobile({
+			type: "session_output",
+			sessionId,
+			text: `${action} failed. ${message}`,
+		});
+		sendSessionList();
+	}
+
+	async function handleSendPrompt(message: SendPromptMessage): Promise<void> {
+		try {
+			await uplinkClient.sendInput(message.sessionId, message.prompt);
+		} catch (error) {
+			notifySessionCommandFailure(message.sessionId, "Send prompt", error);
+		}
+	}
+
+	async function handleStop(message: StopMessage): Promise<void> {
+		try {
+			await uplinkClient.stopSession(message.sessionId);
+		} catch (error) {
+			notifySessionCommandFailure(message.sessionId, "Stop session", error);
 		}
 	}
 
@@ -696,14 +827,43 @@ export async function startRelayUplinkBridge(
 		if (!AUTO_RESUME_RUNTIMES.has(message.runtime)) {
 			return undefined;
 		}
-		if (message.resumeSessionId && message.resumeSessionId.trim().length > 0) {
-			return message.resumeSessionId.trim();
+
+		const explicitResumeSessionId = normalizeResumeSessionId(
+			message.runtime,
+			message.resumeSessionId,
+		);
+		if (explicitResumeSessionId) {
+			return explicitResumeSessionId;
 		}
 
 		const latestRuntimeSession = Array.from(sessions.values())
 			.filter((session) => session.runtime === message.runtime && !!session.runtimeSessionId)
 			.sort((a, b) => b.createdAt - a.createdAt)[0];
-		return latestRuntimeSession?.runtimeSessionId;
+
+		return normalizeResumeSessionId(message.runtime, latestRuntimeSession?.runtimeSessionId);
+	}
+
+	function normalizeResumeSessionId(
+		runtime: RuntimeType,
+		runtimeSessionId: string | undefined,
+	): string | undefined {
+		if (!runtimeSessionId) {
+			return undefined;
+		}
+
+		const trimmed = runtimeSessionId.trim();
+		if (trimmed.length === 0) {
+			return undefined;
+		}
+
+		// OpenCode server session ids are prefixed with "ses_". Older persisted
+		// ids can have incompatible shapes and cause immediate runtime errors.
+		if (runtime === "opencode" && !trimmed.startsWith("ses_")) {
+			log?.(`[Bridge] Ignoring incompatible OpenCode resume id: ${trimmed.slice(0, 12)}...`);
+			return undefined;
+		}
+
+		return trimmed;
 	}
 
 	async function startAndTrackSession(
@@ -723,13 +883,17 @@ export async function startRelayUplinkBridge(
 		}
 
 		const sessionId = started.payload.sessionId;
+		const existing = sessions.get(sessionId);
+		const status = existing?.status ?? "starting";
+		const runtimeSessionId = existing?.runtimeSessionId ?? resumeSessionId;
+		const workspacePath = existing?.workspace ?? workspace;
 		sessions.set(sessionId, {
 			id: sessionId,
 			runtime,
-			status: "starting",
-			createdAt: Date.now(),
-			...(resumeSessionId ? { runtimeSessionId: resumeSessionId } : {}),
-			...(workspace ? { workspace } : {}),
+			status,
+			createdAt: existing?.createdAt ?? Date.now(),
+			...(runtimeSessionId ? { runtimeSessionId } : {}),
+			...(workspacePath ? { workspace: workspacePath } : {}),
 		});
 		sendSessionList();
 		return { sessionId };
@@ -754,7 +918,13 @@ export async function startRelayUplinkBridge(
 		}
 
 		approvalRequests.delete(message.requestId);
-		await uplinkClient.sendInput(pending.sessionId, message.approved ? "y" : "n");
+		try {
+			await uplinkClient.sendInput(pending.sessionId, message.approved ? "y" : "n", {
+				bypassQueue: true,
+			});
+		} catch (error) {
+			notifySessionCommandFailure(pending.sessionId, "Approval response", error);
+		}
 	}
 
 	async function handleUplinkEvent(event: StreamEvent): Promise<void> {
@@ -1073,7 +1243,23 @@ export async function startRelayUplinkBridge(
 			return;
 		}
 
-		log?.(`[Bridge] sendToMobile: type=${message.type}`);
+		if (message.type === "session_message") {
+			const preview = message.content.replace(/\s+/g, " ").trim().slice(0, 120);
+			log?.(
+				`[Bridge] sendToMobile: type=session_message sessionId=${message.sessionId} role=${message.role} len=${message.content.length} preview=${preview}`,
+			);
+		} else if (message.type === "session_output") {
+			const preview = message.text.replace(/\s+/g, " ").trim().slice(0, 120);
+			log?.(
+				`[Bridge] sendToMobile: type=session_output sessionId=${message.sessionId} len=${message.text.length} preview=${preview}`,
+			);
+		} else if (message.type === "session_status") {
+			log?.(
+				`[Bridge] sendToMobile: type=session_status sessionId=${message.sessionId} status=${message.status}`,
+			);
+		} else {
+			log?.(`[Bridge] sendToMobile: type=${message.type}`);
+		}
 		relayWs.send(JSON.stringify({ type: "message", payload: message }));
 	}
 

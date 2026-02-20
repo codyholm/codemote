@@ -1,6 +1,11 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import type { RunOptions, RuntimeType } from "@codemote/common";
+import {
+	type RunOptions,
+	type RuntimeType,
+	SessionNotActiveError,
+	SessionNotFoundError,
+} from "@codemote/common";
 import { BaseExecutor } from "../executor.js";
 import type { Session } from "../types.js";
 
@@ -53,7 +58,7 @@ interface CodexEvent {
 	type: string;
 	thread_id?: string;
 	session_id?: string;
-	content?: string;
+	content?: unknown;
 	command?: string;
 	output?: string;
 	path?: string;
@@ -63,7 +68,8 @@ interface CodexEvent {
 	item?: {
 		id?: string;
 		type?: string;
-		text?: string;
+		text?: unknown;
+		content?: unknown;
 		command?: string;
 		aggregated_output?: string;
 		exit_code?: number | null;
@@ -132,6 +138,37 @@ export class CodexExecutor extends BaseExecutor {
 		});
 
 		this.attachProcessHandlers(session.id, codexSession, proc);
+	}
+
+	/**
+	 * Send input to an existing Codex session.
+	 *
+	 * Codex `exec --json` processes are short-lived and typically exit after each
+	 * turn. If a follow-up arrives after the prior turn ended, resume the same
+	 * runtime session using the captured runtime session id.
+	 */
+	override async sendInput(sessionId: string, input: string): Promise<void> {
+		const session = this.sessionManager.get(sessionId);
+		if (!session) {
+			throw new SessionNotFoundError(sessionId);
+		}
+
+		if (session.status === "ended") {
+			const runtimeSessionId = session.runtimeSessionId?.trim();
+			if (!runtimeSessionId) {
+				throw new SessionNotActiveError(sessionId);
+			}
+			this.sessionManager.touch(sessionId);
+			this.emitStatus(sessionId, "starting");
+			await this.resumeSession(sessionId, runtimeSessionId, input);
+			return;
+		}
+
+		if (session.status === "error") {
+			throw new SessionNotActiveError(sessionId);
+		}
+
+		await super.sendInput(sessionId, input);
 	}
 
 	/**
@@ -392,7 +429,10 @@ export class CodexExecutor extends BaseExecutor {
 
 			case "item.message":
 				if (event.content) {
-					this.emitMessage(sessionId, "assistant", event.content);
+					const content = this.extractMessageText(event.content);
+					if (content) {
+						this.emitMessage(sessionId, "assistant", content);
+					}
 				}
 				break;
 
@@ -437,7 +477,7 @@ export class CodexExecutor extends BaseExecutor {
 	private handleItemCompleted(sessionId: string, item: NonNullable<CodexEvent["item"]>): void {
 		switch (item.type) {
 			case "agent_message": {
-				const text = this.asString(item.text);
+				const text = this.extractMessageText(item.text ?? item.content);
 				if (text) {
 					this.emitMessage(sessionId, "assistant", text);
 				}
@@ -563,6 +603,31 @@ export class CodexExecutor extends BaseExecutor {
 
 	private asString(value: unknown): string | undefined {
 		return typeof value === "string" && value.length > 0 ? value : undefined;
+	}
+
+	private extractMessageText(value: unknown): string | undefined {
+		if (typeof value === "string") {
+			return value.length > 0 ? value : undefined;
+		}
+
+		if (Array.isArray(value)) {
+			const parts = value
+				.map((entry) => this.extractMessageText(entry))
+				.filter((entry): entry is string => entry !== undefined && entry.length > 0);
+			if (parts.length === 0) return undefined;
+			return parts.join("");
+		}
+
+		if (value && typeof value === "object") {
+			const record = value as Record<string, unknown>;
+			return (
+				this.extractMessageText(record["text"]) ??
+				this.extractMessageText(record["output_text"]) ??
+				this.extractMessageText(record["content"])
+			);
+		}
+
+		return undefined;
 	}
 
 	private asNumber(value: unknown): number | null {

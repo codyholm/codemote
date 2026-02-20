@@ -150,6 +150,126 @@ exit 0
 		activeSessionId = null;
 	});
 
+	it("normalizes structured item.message content", async () => {
+		const structuredMockPath = join(testDir, "mock-codex-structured");
+		const structuredScript = `#!/bin/sh
+echo '{"type":"thread.started","thread_id":"mock-thread"}'
+sleep 0.1
+echo '{"type":"turn.started"}'
+sleep 0.1
+echo '{"type":"item.message","content":[{"type":"output_text","text":"Answer: "},{"type":"output_text","text":"15"}]}'
+sleep 0.1
+echo '{"type":"turn.completed"}'
+exit 0
+`;
+		await writeFile(structuredMockPath, structuredScript);
+		await chmod(structuredMockPath, 0o755);
+
+		activeExecutor = new CodexExecutor(workspaceManager, sessionManager, eventBus, {
+			codexPath: structuredMockPath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "codex",
+			workspace: testDir,
+			initialPrompt: "Hello",
+		});
+		activeSessionId = result.sessionId;
+
+		await new Promise((r) => setTimeout(r, 800));
+
+		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
+		expect(messageEvents.length).toBeGreaterThan(0);
+		expect((messageEvents[0] as { payload: { content?: string } }).payload.content).toBe(
+			"Answer: 15",
+		);
+
+		activeSessionId = null;
+	});
+
+	it("resumes ended sessions when sending follow-up input", async () => {
+		const resumeMockPath = join(testDir, "mock-codex-resume");
+		const resumeScript = `#!/bin/sh
+if [ "$1" != "--ask-for-approval" ] || [ "$2" != "on-request" ] || [ "$3" != "--sandbox" ] || [ "$4" != "workspace-write" ] || [ "$5" != "exec" ]; then
+	echo "unexpected args: $*" >&2
+	exit 2
+fi
+
+if [ "$6" = "--json" ]; then
+	echo '{"type":"thread.started","thread_id":"resume-thread"}'
+	sleep 0.1
+	echo '{"type":"turn.started"}'
+	sleep 0.1
+	echo '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"17"}}'
+	sleep 0.1
+	echo '{"type":"turn.completed"}'
+	exit 0
+fi
+
+if [ "$6" = "resume" ]; then
+	if [ -z "$7" ] || [ "$8" != "--json" ]; then
+		echo "unexpected resume args: $*" >&2
+		exit 2
+	fi
+	echo '{"type":"thread.started","thread_id":"'"$7"'"}'
+	sleep 0.1
+	echo '{"type":"turn.started"}'
+	sleep 0.1
+	echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"You asked: \\"What is 8 + 9?\\""}}'
+	sleep 0.1
+	echo '{"type":"turn.completed"}'
+	exit 0
+fi
+
+echo "unexpected args: $*" >&2
+exit 2
+`;
+		await writeFile(resumeMockPath, resumeScript);
+		await chmod(resumeMockPath, 0o755);
+
+		activeExecutor = new CodexExecutor(workspaceManager, sessionManager, eventBus, {
+			codexPath: resumeMockPath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "codex",
+			workspace: testDir,
+			initialPrompt: "What is 8 + 9?",
+		});
+		activeSessionId = result.sessionId;
+
+		await new Promise((r) => setTimeout(r, 900));
+		expect(sessionManager.get(result.sessionId)?.status).toBe("ended");
+		expect(sessionManager.get(result.sessionId)?.runtimeSessionId).toBe("resume-thread");
+
+		await activeExecutor.sendInput(result.sessionId, "What question did I ask you?");
+		await new Promise((r) => setTimeout(r, 900));
+
+		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
+		const messageContents = messageEvents.map((e) =>
+			((e as { payload: { content?: string } }).payload.content ?? "").trim(),
+		);
+		expect(messageContents.some((content) => content.includes("17"))).toBe(true);
+		expect(messageContents.some((content) => content.includes('You asked: "What is 8 + 9?"'))).toBe(
+			true,
+		);
+
+		const startingEvents = events.filter(
+			(e) =>
+				(e as { type: string }).type === "session.status" &&
+				(e as { payload: { status?: string } }).payload.status === "starting",
+		);
+		expect(startingEvents.length).toBeGreaterThan(1);
+
+		activeSessionId = null;
+	});
+
 	it("stops session and cleans up resources", async () => {
 		// Create a mock script that runs longer
 		const longRunningMockPath = join(testDir, "mock-codex-long");
