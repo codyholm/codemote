@@ -1,8 +1,13 @@
+import { type ChildProcess, spawn } from "node:child_process";
 import type { RunOptions, RuntimeType } from "@codemote/common";
 import { BaseExecutor } from "../executor.js";
 import type { Session } from "../types.js";
 
 const OPENCODE_HTTP_TIMEOUT_MS = 5000; // 5 seconds for local requests
+const OPENCODE_HISTORY_RECOVERY_TIMEOUT_MS = 30_000;
+const OPENCODE_HISTORY_POLL_INTERVAL_MS = 500;
+const OPENCODE_SERVER_BOOT_TIMEOUT_MS = 10_000;
+const OPENCODE_SERVER_BOOT_POLL_INTERVAL_MS = 250;
 
 export interface OpenCodePermissionRule {
 	permission: string;
@@ -20,6 +25,10 @@ export interface OpenCodeConfig {
 	username: string;
 	/** Basic auth password (from env or config) */
 	password: string | null;
+	/** Binary path used when auto-starting the OpenCode daemon */
+	commandPath: string;
+	/** Auto-start local OpenCode daemon when server URL is unreachable */
+	autoStartServer: boolean;
 	/** Permission rules applied when creating new OpenCode sessions */
 	permissionRules: OpenCodePermissionRule[];
 }
@@ -28,6 +37,8 @@ const DEFAULT_OPENCODE_CONFIG: OpenCodeConfig = {
 	serverUrl: "http://127.0.0.1:4096",
 	username: "opencode",
 	password: null,
+	commandPath: "opencode",
+	autoStartServer: true,
 	permissionRules: [{ permission: "*", pattern: "*", action: "allow" }],
 };
 
@@ -62,6 +73,15 @@ interface OpenCodeMessageResponse {
 	[key: string]: unknown;
 }
 
+interface OpenCodeHistoryMessage {
+	info?: {
+		role?: string;
+		[key: string]: unknown;
+	};
+	parts?: OpenCodeMessagePart[];
+	[key: string]: unknown;
+}
+
 interface OpenCodeRequestOptions extends RequestInit {
 	query?: Record<string, string | number | boolean | null | undefined>;
 }
@@ -83,6 +103,8 @@ export class OpenCodeExecutor extends BaseExecutor {
 
 	private config: OpenCodeConfig;
 	private openCodeSessions = new Map<string, OpenCodeSession>();
+	private serverProcess: ChildProcess | null = null;
+	private serverBootTask: Promise<void> | null = null;
 
 	constructor(
 		workspaceManager: ConstructorParameters<typeof BaseExecutor>[0],
@@ -102,6 +124,13 @@ export class OpenCodeExecutor extends BaseExecutor {
 		}
 		if (process.env["OPENCODE_SERVER_USERNAME"]) {
 			this.config.username = process.env["OPENCODE_SERVER_USERNAME"];
+		}
+		if (process.env["OPENCODE_PATH"]) {
+			this.config.commandPath = process.env["OPENCODE_PATH"];
+		}
+		const autoStart = this.parseBooleanEnv(process.env["OPENCODE_AUTO_START_SERVER"]);
+		if (autoStart !== null) {
+			this.config.autoStartServer = autoStart;
 		}
 	}
 
@@ -180,29 +209,193 @@ export class OpenCodeExecutor extends BaseExecutor {
 		if (!ocSession || !session) throw new Error("OpenCode session not found");
 		this.emitStatus(sessionId, "running");
 
+		const request = {
+			method: "POST",
+			query: { directory: session.workspace.workingDir },
+			body: JSON.stringify({
+				parts: [{ type: "text", text: content }],
+			}),
+			signal: ocSession.abortController.signal,
+		} satisfies OpenCodeRequestOptions;
+
+		let payload: OpenCodeMessageResponse | null = null;
+		try {
+			const response = await this.apiRequest(
+				`/session/${encodeURIComponent(ocSession.openCodeSessionId)}/message`,
+				request,
+			);
+
+			if (!response.ok) {
+				throw new Error(
+					`Failed to send OpenCode message: ${response.status} ${await this.getErrorBody(response)}`,
+				);
+			}
+
+			payload = (await response.json()) as OpenCodeMessageResponse;
+		} catch (error) {
+			if (!this.shouldAttemptHistoryRecovery(error)) {
+				throw error;
+			}
+
+			payload = await this.recoverTimedOutMessage(
+				ocSession.openCodeSessionId,
+				session.workspace.workingDir,
+				content,
+				ocSession.abortController.signal,
+			);
+			if (!payload) {
+				throw new Error("Request failed");
+			}
+		}
+
+		let handled = this.handleOpenCodeMessageResponse(sessionId, payload);
+		if (!handled.hasError && !handled.emittedAnyPart) {
+			const recovered = await this.recoverTimedOutMessage(
+				ocSession.openCodeSessionId,
+				session.workspace.workingDir,
+				content,
+				ocSession.abortController.signal,
+			);
+			if (recovered) {
+				handled = this.handleOpenCodeMessageResponse(sessionId, recovered);
+			}
+		}
+		if (!handled.hasError) {
+			this.emitStatus(sessionId, "idle");
+		}
+	}
+
+	private shouldAttemptHistoryRecovery(error: unknown): boolean {
+		if (!(error instanceof Error)) {
+			return false;
+		}
+
+		return (
+			error.name === "SyntaxError" ||
+			error.message.includes("Unexpected end of JSON input") ||
+			error.message.includes("timed out")
+		);
+	}
+
+	private async recoverTimedOutMessage(
+		openCodeSessionId: string,
+		workingDir: string,
+		submittedPrompt: string,
+		signal: AbortSignal,
+	): Promise<OpenCodeMessageResponse | null> {
+		const deadline = Date.now() + OPENCODE_HISTORY_RECOVERY_TIMEOUT_MS;
+
+		while (Date.now() < deadline) {
+			if (signal.aborted) {
+				return null;
+			}
+
+			try {
+				const messages = await this.fetchMessageHistory(openCodeSessionId, workingDir, signal);
+				const recovered = this.extractAssistantResponseFromHistory(messages, submittedPrompt);
+				if (recovered) {
+					return recovered;
+				}
+			} catch (error) {
+				if (error instanceof Error && error.name === "AbortError") {
+					return null;
+				}
+			}
+
+			await new Promise((resolve) => setTimeout(resolve, OPENCODE_HISTORY_POLL_INTERVAL_MS));
+		}
+
+		return null;
+	}
+
+	private async fetchMessageHistory(
+		openCodeSessionId: string,
+		workingDir: string,
+		signal: AbortSignal,
+	): Promise<OpenCodeHistoryMessage[]> {
 		const response = await this.apiRequest(
-			`/session/${encodeURIComponent(ocSession.openCodeSessionId)}/message`,
+			`/session/${encodeURIComponent(openCodeSessionId)}/message`,
 			{
-				method: "POST",
-				query: { directory: session.workspace.workingDir },
-				body: JSON.stringify({
-					parts: [{ type: "text", text: content }],
-				}),
-				signal: ocSession.abortController.signal,
+				method: "GET",
+				query: { directory: workingDir },
+				signal,
 			},
 		);
 
 		if (!response.ok) {
 			throw new Error(
-				`Failed to send OpenCode message: ${response.status} ${await this.getErrorBody(response)}`,
+				`Failed to fetch OpenCode message history: ${response.status} ${await this.getErrorBody(response)}`,
 			);
 		}
 
-		const payload = (await response.json()) as OpenCodeMessageResponse;
-		const hasError = this.handleOpenCodeMessageResponse(sessionId, payload);
-		if (!hasError) {
-			this.emitStatus(sessionId, "idle");
+		const payload = (await response.json()) as unknown;
+		return Array.isArray(payload) ? (payload as OpenCodeHistoryMessage[]) : [];
+	}
+
+	private extractAssistantResponseFromHistory(
+		messages: OpenCodeHistoryMessage[],
+		submittedPrompt: string,
+	): OpenCodeMessageResponse | null {
+		const normalizedPrompt = submittedPrompt.trim();
+		if (normalizedPrompt.length === 0) {
+			return null;
 		}
+
+		let promptIndex = -1;
+		for (let idx = messages.length - 1; idx >= 0; idx--) {
+			const message = messages[idx];
+			if (!message || !Array.isArray(message.parts) || message.parts.length !== 1) {
+				continue;
+			}
+			const [part] = message.parts;
+			if (part?.type !== "text") {
+				continue;
+			}
+			const text = typeof part.text === "string" ? part.text.trim() : "";
+			if (text === normalizedPrompt) {
+				promptIndex = idx;
+				break;
+			}
+		}
+
+		if (promptIndex < 0 || promptIndex >= messages.length - 1) {
+			return null;
+		}
+
+		const responseMessages = messages.slice(promptIndex + 1);
+		const assistantMessage = responseMessages.find((message) =>
+			typeof message.info?.role === "string"
+				? message.info.role === "assistant"
+				: Array.isArray(message.parts) && message.parts.some((part) => part.type !== "text"),
+		);
+
+		if (!assistantMessage || !Array.isArray(assistantMessage.parts)) {
+			return null;
+		}
+		const hasRenderableParts = assistantMessage.parts.some((part) => {
+			if (part.type === "text") {
+				return typeof part.text === "string" && part.text.length > 0;
+			}
+			return (
+				part.type === "error" ||
+				part.type === "permission_request" ||
+				part.type === "tool" ||
+				part.type === "file_change"
+			);
+		});
+		if (!hasRenderableParts) {
+			return null;
+		}
+
+		return {
+			info: {
+				role:
+					typeof assistantMessage.info?.role === "string"
+						? assistantMessage.info.role
+						: "assistant",
+			},
+			parts: assistantMessage.parts,
+		};
 	}
 
 	/**
@@ -211,17 +404,19 @@ export class OpenCodeExecutor extends BaseExecutor {
 	private handleOpenCodeMessageResponse(
 		sessionId: string,
 		response: OpenCodeMessageResponse,
-	): boolean {
+	): { hasError: boolean; emittedAnyPart: boolean } {
 		if (!Array.isArray(response.parts)) {
-			return false;
+			return { hasError: false, emittedAnyPart: false };
 		}
 
 		let hasError = false;
+		let emittedAnyPart = false;
 		for (const part of response.parts) {
 			switch (part.type) {
 				case "text":
 					if (typeof part.text === "string" && part.text.length > 0) {
 						this.emitOutput(sessionId, part.text);
+						emittedAnyPart = true;
 					}
 					break;
 				case "permission_request":
@@ -229,13 +424,16 @@ export class OpenCodeExecutor extends BaseExecutor {
 						action: part.action,
 						description: part.description,
 					});
+					emittedAnyPart = true;
 					break;
 				case "file_change":
 				case "tool":
 					this.emitDiffUpdated(sessionId);
+					emittedAnyPart = true;
 					break;
 				case "error":
 					hasError = true;
+					emittedAnyPart = true;
 					this.emitStatus(sessionId, "error");
 					if (typeof part.message === "string" && part.message.length > 0) {
 						this.emitOutput(sessionId, `Error: ${part.message}\n`);
@@ -243,7 +441,7 @@ export class OpenCodeExecutor extends BaseExecutor {
 					break;
 			}
 		}
-		return hasError;
+		return { hasError, emittedAnyPart };
 	}
 
 	/**
@@ -273,37 +471,186 @@ export class OpenCodeExecutor extends BaseExecutor {
 			headers["Authorization"] = `Basic ${credentials}`;
 		}
 
-		// Add timeout using AbortController
-		// Combine timeout with any caller-provided signal so both can abort the request
+		try {
+			return await this.fetchWithTimeout(url, requestInit, headers);
+		} catch (error) {
+			if (await this.shouldRetryAfterBoot(error, url, requestInit.signal)) {
+				return this.fetchWithTimeout(url, requestInit, headers);
+			}
+			throw error;
+		}
+	}
+
+	private async fetchWithTimeout(
+		url: URL,
+		requestInit: RequestInit,
+		headers: Record<string, string>,
+	): Promise<Response> {
 		const timeoutController = new AbortController();
 		const timeoutId = setTimeout(() => timeoutController.abort(), OPENCODE_HTTP_TIMEOUT_MS);
-
-		// Use AbortSignal.any() to respect both timeout and caller signals
 		const signal = requestInit.signal
 			? AbortSignal.any([requestInit.signal, timeoutController.signal])
 			: timeoutController.signal;
 
 		try {
-			const response = await fetch(url, {
+			return await fetch(url, {
 				...requestInit,
 				headers,
 				signal,
 			});
-			clearTimeout(timeoutId);
-			return response;
 		} catch (error) {
-			clearTimeout(timeoutId);
 			if (error instanceof Error && error.name === "AbortError") {
-				// Distinguish between timeout-triggered aborts and caller-triggered aborts
 				if (timeoutController.signal.aborted) {
 					throw new Error(
 						`OpenCode request timed out after ${OPENCODE_HTTP_TIMEOUT_MS}ms: ${url.pathname}`,
 					);
 				}
-				// Re-throw caller's abort as-is
 			}
 			throw error;
+		} finally {
+			clearTimeout(timeoutId);
 		}
+	}
+
+	private async shouldRetryAfterBoot(
+		error: unknown,
+		url: URL,
+		signal: AbortSignal | null | undefined,
+	): Promise<boolean> {
+		if (!this.config.autoStartServer || signal?.aborted) {
+			return false;
+		}
+		if (!this.isLoopbackURL(url)) {
+			return false;
+		}
+		if (!this.isConnectionRefusedError(error)) {
+			return false;
+		}
+
+		await this.ensureLocalServerRunning(url, signal);
+		return true;
+	}
+
+	private async ensureLocalServerRunning(
+		url: URL,
+		signal: AbortSignal | null | undefined,
+	): Promise<void> {
+		if (await this.isServerReachable(url, signal)) {
+			return;
+		}
+
+		if (this.serverBootTask) {
+			await this.serverBootTask;
+			return;
+		}
+
+		this.serverBootTask = this.bootServer(url, signal).finally(() => {
+			this.serverBootTask = null;
+		});
+		await this.serverBootTask;
+	}
+
+	private async bootServer(url: URL, signal: AbortSignal | null | undefined): Promise<void> {
+		const parsedPort = Number.parseInt(url.port, 10);
+		if (!Number.isFinite(parsedPort) || parsedPort <= 0) {
+			throw new Error(`Cannot auto-start OpenCode server for URL without explicit port: ${url}`);
+		}
+
+		let stderr = "";
+		if (!this.serverProcess || this.serverProcess.exitCode !== null) {
+			const args = ["serve", "--hostname", url.hostname, "--port", String(parsedPort)];
+			const child = spawn(this.config.commandPath, args, {
+				stdio: ["ignore", "ignore", "pipe"],
+			});
+			this.serverProcess = child;
+			child.stderr?.on("data", (chunk: Buffer | string) => {
+				if (stderr.length < 4000) {
+					stderr += chunk.toString();
+				}
+			});
+			child.on("exit", () => {
+				if (this.serverProcess === child) {
+					this.serverProcess = null;
+				}
+			});
+		}
+
+		const deadline = Date.now() + OPENCODE_SERVER_BOOT_TIMEOUT_MS;
+
+		while (Date.now() < deadline) {
+			if (signal?.aborted) {
+				throw new Error("OpenCode server startup aborted");
+			}
+			if (await this.isServerReachable(url, signal)) {
+				return;
+			}
+			const exited = this.serverProcess?.exitCode;
+			if (typeof exited === "number") {
+				const detail = stderr.trim();
+				throw new Error(
+					detail.length > 0
+						? `OpenCode server exited during startup (${exited}): ${detail}`
+						: `OpenCode server exited during startup (${exited})`,
+				);
+			}
+			await new Promise((resolve) => setTimeout(resolve, OPENCODE_SERVER_BOOT_POLL_INTERVAL_MS));
+		}
+
+		throw new Error(
+			`Timed out waiting for OpenCode server at ${url.protocol}//${url.hostname}:${parsedPort}`,
+		);
+	}
+
+	private async isServerReachable(
+		url: URL,
+		signal: AbortSignal | null | undefined,
+	): Promise<boolean> {
+		const probeController = new AbortController();
+		const timeoutId = setTimeout(() => probeController.abort(), 1000);
+		const probeSignal = signal
+			? AbortSignal.any([signal, probeController.signal])
+			: probeController.signal;
+
+		try {
+			await fetch(url, { method: "GET", signal: probeSignal });
+			return true;
+		} catch {
+			return false;
+		} finally {
+			clearTimeout(timeoutId);
+		}
+	}
+
+	private isLoopbackURL(url: URL): boolean {
+		if (url.protocol !== "http:" && url.protocol !== "https:") {
+			return false;
+		}
+		return url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "::1";
+	}
+
+	private isConnectionRefusedError(error: unknown): boolean {
+		if (!(error instanceof Error)) {
+			return false;
+		}
+		const cause = error.cause as { code?: string } | undefined;
+		if (cause?.code === "ECONNREFUSED") {
+			return true;
+		}
+		return error.message.includes("ECONNREFUSED");
+	}
+
+	private parseBooleanEnv(value: string | undefined): boolean | null {
+		if (!value) {
+			return null;
+		}
+		const normalized = value.trim().toLowerCase();
+		if (normalized === "1" || normalized === "true" || normalized === "yes") {
+			return true;
+		}
+		if (normalized === "0" || normalized === "false" || normalized === "no") {
+			return false;
+		}
+		return null;
 	}
 
 	private async createSession(workingDir: string, signal: AbortSignal): Promise<string> {

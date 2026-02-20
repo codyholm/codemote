@@ -16,6 +16,18 @@ interface CapturedRequest {
 	body: unknown;
 }
 
+interface HistoryEntry {
+	info?: {
+		role?: string;
+		[key: string]: unknown;
+	};
+	parts: Array<{
+		type: string;
+		text?: string;
+		[key: string]: unknown;
+	}>;
+}
+
 describe("OpenCodeExecutor", () => {
 	let testDir: string;
 	let workspaceManager: WorkspaceManager;
@@ -26,11 +38,13 @@ describe("OpenCodeExecutor", () => {
 	let activeExecutor: OpenCodeExecutor | null = null;
 	let activeSessionId: string | null = null;
 	let requests: CapturedRequest[] = [];
+	let messageHistory = new Map<string, HistoryEntry[]>();
 
 	beforeEach(async () => {
 		activeExecutor = null;
 		activeSessionId = null;
 		requests = [];
+		messageHistory = new Map();
 
 		// Create test git repo
 		testDir = await mkdtemp(join(tmpdir(), "opencode-test-"));
@@ -71,6 +85,13 @@ describe("OpenCodeExecutor", () => {
 				}
 
 				const messageMatch = url.pathname.match(/^\/session\/([^/]+)\/message$/);
+				if (req.method === "GET" && messageMatch) {
+					const sessionId = decodeURIComponent(messageMatch[1] ?? "");
+					res.statusCode = 200;
+					res.end(JSON.stringify(messageHistory.get(sessionId) ?? []));
+					return;
+				}
+
 				if (req.method === "POST" && messageMatch) {
 					const sessionId = decodeURIComponent(messageMatch[1] ?? "");
 					const text =
@@ -91,7 +112,57 @@ describe("OpenCodeExecutor", () => {
 						return;
 					}
 
+					const history = messageHistory.get(sessionId) ?? [];
+					history.push({
+						parts: [{ type: "text", text }],
+					});
+					messageHistory.set(sessionId, history);
+
+					if (text === "force-history-recovery") {
+						history.push({
+							info: { role: "assistant" },
+							parts: [
+								{ type: "step-start" },
+								{ type: "text", text: "Recovered: force-history-recovery" },
+								{ type: "step-finish" },
+							],
+						});
+
+						// Return malformed JSON so executor must recover from message history.
+						res.statusCode = 200;
+						res.end("{");
+						return;
+					}
+
+					if (text === "force-empty-response-then-history") {
+						const delayedAssistant = {
+							info: { role: "assistant" },
+							parts: [{ type: "step-start" }, { type: "step-finish" }],
+						};
+						history.push(delayedAssistant);
+						setTimeout(() => {
+							delayedAssistant.parts = [
+								{ type: "step-start" },
+								{ type: "text", text: "Recovered: force-empty-response-then-history" },
+								{ type: "step-finish" },
+							];
+						}, 50);
+
+						res.statusCode = 200;
+						res.end(
+							JSON.stringify({
+								info: { role: "assistant", sessionID: sessionId },
+								parts: [{ type: "step-start" }, { type: "step-finish" }],
+							}),
+						);
+						return;
+					}
+
 					res.statusCode = 200;
+					history.push({
+						info: { role: "assistant" },
+						parts: [{ type: "text", text: `Echo: ${text}` }],
+					});
 					res.end(
 						JSON.stringify({
 							info: { role: "assistant", sessionID: sessionId },
@@ -246,6 +317,61 @@ describe("OpenCodeExecutor", () => {
 		const statuses = statusEvents.map((event) => (event.payload as { status: string }).status);
 		expect(statuses.filter((status) => status === "running").length).toBeGreaterThanOrEqual(2);
 		expect(statuses.filter((status) => status === "idle").length).toBeGreaterThanOrEqual(2);
+		expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
+	});
+
+	it("recovers assistant output from history when message response body is malformed", async () => {
+		activeExecutor = new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
+			serverUrl: `http://127.0.0.1:${serverPort}`,
+		});
+		const events: Array<{ type: string; payload: unknown }> = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "opencode",
+			workspace: testDir,
+			initialPrompt: "Initial message",
+		});
+		activeSessionId = result.sessionId;
+		events.length = 0;
+
+		await activeExecutor.sendInput(result.sessionId, "force-history-recovery");
+
+		const outputEvents = events.filter((event) => event.type === "session.output");
+		const outputText = outputEvents
+			.map((event) => (event.payload as { text: string }).text)
+			.join("\n");
+		expect(outputText).toContain("Recovered: force-history-recovery");
+
+		const historyRequests = requests.filter(
+			(request) => request.method === "GET" && request.path === "/session/mock-session-123/message",
+		);
+		expect(historyRequests.length).toBeGreaterThan(0);
+		expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
+	});
+
+	it("recovers assistant output when immediate response has no renderable parts", async () => {
+		activeExecutor = new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
+			serverUrl: `http://127.0.0.1:${serverPort}`,
+		});
+		const events: Array<{ type: string; payload: unknown }> = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "opencode",
+			workspace: testDir,
+			initialPrompt: "Initial message",
+		});
+		activeSessionId = result.sessionId;
+		events.length = 0;
+
+		await activeExecutor.sendInput(result.sessionId, "force-empty-response-then-history");
+
+		const outputEvents = events.filter((event) => event.type === "session.output");
+		const outputText = outputEvents
+			.map((event) => (event.payload as { text: string }).text)
+			.join("\n");
+		expect(outputText).toContain("Recovered: force-empty-response-then-history");
 		expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
 	});
 
