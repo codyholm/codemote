@@ -917,7 +917,19 @@ export async function startRelayUplinkBridge(
 		}
 
 		const resumeSessionId = resolveLatestRuntimeSessionId(runtime);
-		return startAndTrackSession(runtime, cleanPrompt, resumeSessionId);
+		try {
+			return await startAndTrackSession(runtime, cleanPrompt, resumeSessionId);
+		} catch (error) {
+			if (!resumeSessionId) {
+				throw error;
+			}
+			log?.(
+				`[Bridge] Resume failed for local ${runtime} start ${resumeSessionId}: ${
+					error instanceof Error ? error.message : String(error)
+				}; retrying with a fresh session`,
+			);
+			return startAndTrackSession(runtime, cleanPrompt);
+		}
 	}
 
 	async function handleApprovalResponse(message: ApprovalResponseMessage): Promise<void> {
