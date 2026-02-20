@@ -130,14 +130,8 @@ export type UplinkResponse =
  */
 export interface RuntimeConfigs {
 	opencode?: {
-		serverUrl?: string;
-		username?: string;
-		password?: string | null;
-		permissionRules?: Array<{
-			permission: string;
-			pattern: string;
-			action: "allow" | "deny" | "ask";
-		}>;
+		opencodePath?: string;
+		extraArgs?: string[];
 	};
 	claude?: {
 		claudePath?: string;

@@ -773,7 +773,7 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
-	it("does not auto-resume opencode sessions when creating a new session", async () => {
+	it("auto-resumes opencode sessions when creating a new session", async () => {
 		let startRunPayload: JsonRecord | null = null;
 
 		uplinkWss.on("connection", (socket) => {
@@ -844,7 +844,93 @@ describe("RelayUplinkBridge", () => {
 				sessionId: "sess-new-1",
 			});
 			expect(startRunPayload).toBeTruthy();
-			expect(startRunPayload?.["resumeSessionId"]).toBeUndefined();
+			expect(startRunPayload?.["resumeSessionId"]).toBe("ses_existing_123");
+		} finally {
+			await bridge.stop();
+		}
+	}, 20_000);
+
+	it("falls back to a fresh local start when opencode auto-resume fails", async () => {
+		const startRunPayloads: JsonRecord[] = [];
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				const type = command["type"];
+
+				if (type === "list_sessions") {
+					socket.send(
+						JSON.stringify({
+							type: "sessions",
+							payload: [
+								{
+									id: "sess-old-2",
+									runId: "run-old-2",
+									runtime: "opencode",
+									status: "idle",
+									runtimeSessionId: "ses_stale_456",
+									workspace: {
+										id: "ws-old-2",
+										workingDir: tempRepoDir,
+										createdAt: Date.now(),
+									},
+									startedAt: Date.now() - 12_000,
+									endedAt: null,
+									lastActivityAt: Date.now() - 6_000,
+								},
+							],
+						}),
+					);
+					return;
+				}
+
+				if (type === "start_run") {
+					const payload = (command["payload"] as JsonRecord | undefined) ?? {};
+					startRunPayloads.push(payload);
+					if (startRunPayloads.length === 1) {
+						socket.send(
+							JSON.stringify({
+								type: "error",
+								payload: { message: "resume id no longer valid" },
+							}),
+						);
+						return;
+					}
+					socket.send(
+						JSON.stringify({
+							type: "run_started",
+							payload: {
+								sessionId: "sess-new-2",
+								runId: "run-new-2",
+							},
+						}),
+					);
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				if (message["type"] === "register") {
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "666666" }));
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+
+		try {
+			await expect(bridge.startSession("opencode", "fallback validation")).resolves.toEqual({
+				sessionId: "sess-new-2",
+			});
+			expect(startRunPayloads.length).toBe(2);
+			expect(startRunPayloads[0]?.["resumeSessionId"]).toBe("ses_stale_456");
+			expect(startRunPayloads[1]?.["resumeSessionId"]).toBeUndefined();
 		} finally {
 			await bridge.stop();
 		}

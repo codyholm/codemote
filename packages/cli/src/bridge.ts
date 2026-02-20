@@ -264,7 +264,7 @@ type MobileOutboundMessage =
 	| GitWorktreeResultMessage
 	| GitPRResultMessage;
 
-const AUTO_RESUME_RUNTIMES: ReadonlySet<RuntimeType> = new Set(["claude"]);
+const AUTO_RESUME_RUNTIMES: ReadonlySet<RuntimeType> = new Set(["claude", "opencode"]);
 
 export interface RelayUplinkBridgeConfig {
 	relayUrl: string;
@@ -836,11 +836,19 @@ export async function startRelayUplinkBridge(
 			return explicitResumeSessionId;
 		}
 
+		return resolveLatestRuntimeSessionId(message.runtime);
+	}
+
+	function resolveLatestRuntimeSessionId(runtime: RuntimeType): string | undefined {
+		if (!AUTO_RESUME_RUNTIMES.has(runtime)) {
+			return undefined;
+		}
+
 		const latestRuntimeSession = Array.from(sessions.values())
-			.filter((session) => session.runtime === message.runtime && !!session.runtimeSessionId)
+			.filter((session) => session.runtime === runtime && !!session.runtimeSessionId)
 			.sort((a, b) => b.createdAt - a.createdAt)[0];
 
-		return normalizeResumeSessionId(message.runtime, latestRuntimeSession?.runtimeSessionId);
+		return normalizeResumeSessionId(runtime, latestRuntimeSession?.runtimeSessionId);
 	}
 
 	function normalizeResumeSessionId(
@@ -908,7 +916,20 @@ export async function startRelayUplinkBridge(
 			throw new Error("Prompt is required");
 		}
 
-		return startAndTrackSession(runtime, cleanPrompt);
+		const resumeSessionId = resolveLatestRuntimeSessionId(runtime);
+		try {
+			return await startAndTrackSession(runtime, cleanPrompt, resumeSessionId);
+		} catch (error) {
+			if (!resumeSessionId) {
+				throw error;
+			}
+			log?.(
+				`[Bridge] Resume failed for local ${runtime} start ${resumeSessionId}: ${
+					error instanceof Error ? error.message : String(error)
+				}; retrying with a fresh session`,
+			);
+			return startAndTrackSession(runtime, cleanPrompt);
+		}
 	}
 
 	async function handleApprovalResponse(message: ApprovalResponseMessage): Promise<void> {

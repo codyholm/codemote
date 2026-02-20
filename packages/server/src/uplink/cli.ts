@@ -37,36 +37,18 @@ async function main(): Promise<void> {
 			return result.status === 0 || result.status === 1;
 		};
 
-		const canReach = async (url: string): Promise<boolean> => {
-			const controller = new AbortController();
-			const timeout = setTimeout(() => controller.abort(), 1000);
-			try {
-				await fetch(url, { method: "GET", signal: controller.signal });
-				return true;
-			} catch {
-				return false;
-			} finally {
-				clearTimeout(timeout);
-			}
-		};
-
-		if (
-			config.runtimes.includes("opencode") &&
-			(config.runtimeConfigs?.opencode || process.env["OPENCODE_SERVER_URL"])
-		) {
-			const serverUrl =
-				process.env["OPENCODE_SERVER_URL"] ||
-				config.runtimeConfigs?.opencode?.serverUrl ||
-				"http://127.0.0.1:4096";
-			if (await canReach(serverUrl)) {
+		if (config.runtimes.includes("opencode")) {
+			const opencodePath =
+				process.env["OPENCODE_PATH"] || config.runtimeConfigs?.opencode?.opencodePath || "opencode";
+			if (canSpawn(opencodePath)) {
 				executors.push(
 					new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
 						...config.runtimeConfigs?.opencode,
-						serverUrl,
+						opencodePath,
 					}),
 				);
 			} else {
-				console.log(`[SKIP] opencode (server unreachable at ${serverUrl})`);
+				console.log(`[SKIP] opencode (binary not runnable: ${opencodePath})`);
 			}
 		}
 
