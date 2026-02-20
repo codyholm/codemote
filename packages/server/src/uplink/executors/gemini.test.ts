@@ -139,6 +139,42 @@ exit 0
 		activeSessionId = null;
 	});
 
+	it("ignores unrelated JSON preamble before the headless payload", async () => {
+		const noisyMockPath = join(testDir, "mock-gemini-noisy");
+		const noisyScriptContent = `#!/bin/bash
+set -euo pipefail
+printf '{ "level": "info", "message": "warming up" }\\n'
+printf '{\\n  "session_id": "mock-session-noisy",\\n  "response": "Noisy hello"\\n}\\n'
+`;
+		await writeFile(noisyMockPath, noisyScriptContent);
+		await chmod(noisyMockPath, 0o755);
+
+		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
+			geminiPath: noisyMockPath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "gemini",
+			workspace: testDir,
+			initialPrompt: "Hello",
+		});
+		activeSessionId = result.sessionId;
+
+		const outputEvents = events.filter((e) => (e as { type: string }).type === "session.output");
+		const outputText = outputEvents
+			.map((e) => (e as { payload?: { text?: string } }).payload?.text ?? "")
+			.join("\n");
+
+		expect(outputText).toContain("Noisy hello");
+		expect(outputText).not.toContain("warming up");
+		expect(sessionManager.get(result.sessionId)?.runtimeSessionId).toBe("mock-session-noisy");
+
+		activeSessionId = null;
+	});
+
 	it("sends follow-up input using captured runtime session id", async () => {
 		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
 			geminiPath: mockGeminiPath,

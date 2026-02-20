@@ -209,6 +209,9 @@ export class GeminiExecutor extends BaseExecutor {
 					typeof parsed.response === "string" && parsed.response.length > 0
 						? parsed.response
 						: null;
+				if (!sessionId && !response) {
+					continue;
+				}
 				return { sessionId, response };
 			} catch {
 				// Keep scanning in case non-JSON preamble contains braces.

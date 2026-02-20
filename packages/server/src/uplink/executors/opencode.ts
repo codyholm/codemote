@@ -556,7 +556,9 @@ export class OpenCodeExecutor extends BaseExecutor {
 			throw new Error(`Cannot auto-start OpenCode server for URL without explicit port: ${url}`);
 		}
 
+		const stderrLimit = 4000;
 		let stderr = "";
+		let stderrTruncated = false;
 		const spawnState: { errorMessage: string | null } = { errorMessage: null };
 		if (!this.serverProcess || this.serverProcess.exitCode !== null) {
 			const args = ["serve", "--hostname", url.hostname, "--port", String(parsedPort)];
@@ -572,8 +574,10 @@ export class OpenCodeExecutor extends BaseExecutor {
 				}
 			});
 			child.stderr?.on("data", (chunk: Buffer | string) => {
-				if (stderr.length < 4000) {
-					stderr += chunk.toString();
+				stderr += chunk.toString();
+				if (stderr.length > stderrLimit) {
+					stderr = stderr.slice(-stderrLimit);
+					stderrTruncated = true;
 				}
 			});
 			child.on("exit", () => {
@@ -592,9 +596,12 @@ export class OpenCodeExecutor extends BaseExecutor {
 			const spawnErrorMessage = spawnState.errorMessage;
 			if (spawnErrorMessage) {
 				const detail = stderr.trim();
+				const truncationNote = stderrTruncated
+					? ` [stderr truncated to last ${stderrLimit} chars]`
+					: "";
 				throw new Error(
 					detail.length > 0
-						? `Failed to start OpenCode server: ${spawnErrorMessage}. ${detail}`
+						? `Failed to start OpenCode server: ${spawnErrorMessage}. ${detail}${truncationNote}`
 						: `Failed to start OpenCode server: ${spawnErrorMessage}`,
 				);
 			}
@@ -604,9 +611,12 @@ export class OpenCodeExecutor extends BaseExecutor {
 			const exited = this.serverProcess?.exitCode;
 			if (typeof exited === "number") {
 				const detail = stderr.trim();
+				const truncationNote = stderrTruncated
+					? ` [stderr truncated to last ${stderrLimit} chars]`
+					: "";
 				throw new Error(
 					detail.length > 0
-						? `OpenCode server exited during startup (${exited}): ${detail}`
+						? `OpenCode server exited during startup (${exited}): ${detail}${truncationNote}`
 						: `OpenCode server exited during startup (${exited})`,
 				);
 			}
@@ -642,7 +652,12 @@ export class OpenCodeExecutor extends BaseExecutor {
 		if (url.protocol !== "http:" && url.protocol !== "https:") {
 			return false;
 		}
-		return url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "::1";
+		return (
+			url.hostname === "localhost" ||
+			url.hostname === "::1" ||
+			url.hostname.startsWith("127.") ||
+			url.hostname.startsWith("::ffff:127.")
+		);
 	}
 
 	private isConnectionRefusedError(error: unknown): boolean {
