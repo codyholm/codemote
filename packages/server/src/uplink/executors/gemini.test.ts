@@ -108,7 +108,7 @@ exit 0
 		expect(executor.type).toBe("gemini");
 	});
 
-	it("starts a run and receives output", async () => {
+	it("starts a run and emits structured assistant messages", async () => {
 		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
 			geminiPath: mockGeminiPath,
 		});
@@ -123,14 +123,14 @@ exit 0
 		});
 		activeSessionId = result.sessionId;
 
-		await waitFor(() => events.some((e) => (e as { type: string }).type === "session.output"));
+		await waitFor(() => events.some((e) => (e as { type: string }).type === "session.message"));
 
-		const outputEvents = events.filter((e) => (e as { type: string }).type === "session.output");
-		expect(outputEvents.length).toBeGreaterThan(0);
+		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
+		expect(messageEvents.length).toBeGreaterThan(0);
 
-		const hasGeminiMessage = outputEvents.some((e) => {
-			const payload = (e as { payload?: { text?: string } }).payload;
-			return payload?.text?.includes("Hello from mock Gemini");
+		const hasGeminiMessage = messageEvents.some((e) => {
+			const payload = (e as { payload?: { content?: string } }).payload;
+			return payload?.content?.includes("Hello from mock Gemini");
 		});
 		expect(hasGeminiMessage).toBe(true);
 		expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
@@ -163,9 +163,9 @@ printf '{\\n  "session_id": "mock-session-noisy",\\n  "response": "Noisy hello"\
 		});
 		activeSessionId = result.sessionId;
 
-		const outputEvents = events.filter((e) => (e as { type: string }).type === "session.output");
-		const outputText = outputEvents
-			.map((e) => (e as { payload?: { text?: string } }).payload?.text ?? "")
+		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
+		const outputText = messageEvents
+			.map((e) => (e as { payload?: { content?: string } }).payload?.content ?? "")
 			.join("\n");
 
 		expect(outputText).toContain("Noisy hello");
@@ -194,9 +194,9 @@ printf '{\\n  "session_id": "mock-session-noisy",\\n  "response": "Noisy hello"\
 
 		await waitFor(() =>
 			events.some((e) => {
-				if ((e as { type: string }).type !== "session.output") return false;
-				const payload = (e as { payload?: { text?: string } }).payload;
-				return payload?.text?.includes("Follow-up from mock Gemini") ?? false;
+				if ((e as { type: string }).type !== "session.message") return false;
+				const payload = (e as { payload?: { content?: string } }).payload;
+				return payload?.content?.includes("Follow-up from mock Gemini") ?? false;
 			}),
 		);
 
@@ -211,9 +211,63 @@ printf '{\\n  "session_id": "mock-session-noisy",\\n  "response": "Noisy hello"\
 		const statuses = statusEvents.map((event) => {
 			return (event as { payload: { status: string } }).payload.status;
 		});
+		expect(statuses[0]).toBe("starting");
 		expect(statuses.filter((status) => status === "running").length).toBeGreaterThanOrEqual(2);
 		expect(statuses.filter((status) => status === "idle").length).toBeGreaterThanOrEqual(2);
 		expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
+
+		activeSessionId = null;
+	});
+
+	it("maps Gemini tool blocks to session.tool_call and session.tool_result events", async () => {
+		const toolMockPath = join(testDir, "mock-gemini-tool");
+		const toolMockScript = `#!/bin/bash
+set -euo pipefail
+printf '{\\n  "session_id": "mock-session-tools",\\n  "response": {"parts":[{"functionCall":{"id":"gem-call-1","name":"read_file","args":{"path":"README.md"}}},{"text":"Tool executed."},{"functionResponse":{"id":"gem-call-1","name":"read_file","response":{"content":"# Test"}}}]}\\n}\\n'
+`;
+		await writeFile(toolMockPath, toolMockScript);
+		await chmod(toolMockPath, 0o755);
+
+		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
+			geminiPath: toolMockPath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "gemini",
+			workspace: testDir,
+			initialPrompt: "tool-test",
+		});
+		activeSessionId = result.sessionId;
+
+		const toolCallEvents = events.filter(
+			(event) => (event as { type: string }).type === "session.tool_call",
+		);
+		const toolResultEvents = events.filter(
+			(event) => (event as { type: string }).type === "session.tool_result",
+		);
+		const messageEvents = events.filter(
+			(event) => (event as { type: string }).type === "session.message",
+		);
+
+		expect(toolCallEvents.length).toBe(1);
+		expect(toolResultEvents.length).toBe(1);
+		expect(messageEvents.length).toBeGreaterThan(0);
+
+		const callPayload = toolCallEvents[0] as {
+			payload: { toolCallId: string; toolName: string; arguments?: string };
+		};
+		const resultPayload = toolResultEvents[0] as {
+			payload: { toolCallId: string; toolName: string; output?: string };
+		};
+		expect(callPayload.payload.toolCallId).toBe("gem-call-1");
+		expect(resultPayload.payload.toolCallId).toBe("gem-call-1");
+		expect(callPayload.payload.toolName).toBe("read_file");
+		expect(resultPayload.payload.toolName).toBe("read_file");
+		expect(callPayload.payload.arguments).toContain("README.md");
+		expect(resultPayload.payload.output).toContain("content");
 
 		activeSessionId = null;
 	});

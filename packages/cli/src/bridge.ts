@@ -5,7 +5,10 @@ import { dirname, join } from "node:path";
 import { WebSocket } from "ws";
 
 import { WS_MAX_PAYLOAD_BYTES } from "./messageLimits.js";
+import type { EncryptedPayload } from "./protocol.js";
+import { ReplayGuard } from "./replayProtection.js";
 import { detectTailscaleEndpoint } from "./tailscale.js";
+import { validateEncryptedPayload } from "./validateEncryptedPayload.js";
 
 import type {
 	RuntimeType,
@@ -113,7 +116,7 @@ interface DiffMessage {
 }
 
 interface DeviceEndpointMessage {
-	kind: "tailscale";
+	kind: "local" | "tailscale" | "hosted";
 	url: string;
 }
 
@@ -166,6 +169,7 @@ interface DirectoryListingMessage {
 	type: "directory_listing";
 	path: string;
 	entries: Array<{ name: string; isDirectory: boolean; isGitRepo: boolean }>;
+	error?: string;
 }
 
 interface GitStatusMessage {
@@ -271,8 +275,27 @@ export interface RelayUplinkBridgeConfig {
 	relayWsOptions?: WebSocket.ClientOptions;
 	uplinkUrl: string;
 	repoPath: string;
+	/**
+	 * Preferred local endpoint URL that should be advertised back to mobile clients.
+	 * Example: wss://192.168.1.25:8080/ws
+	 */
+	localEndpointUrl?: string;
+	/**
+	 * Hosted endpoint URL that should be advertised when remote relay mode is enabled.
+	 */
+	hostedEndpointUrl?: string;
+	/**
+	 * Optional decoder for end-to-end encrypted relay payloads.
+	 * When omitted, encrypted payloads are rejected after validation + replay checks.
+	 */
+	decryptEncryptedPayload?: (payload: EncryptedPayload) => unknown;
 	onPairingCode?: (code: string) => void;
 	onMobilePaired?: () => void;
+	onSessionStatus?: (info: {
+		sessionId: string;
+		runtime: RuntimeType;
+		status: SessionStatus;
+	}) => void;
 	log?: (message: string) => void;
 }
 
@@ -583,8 +606,19 @@ function parseTimeoutOverride(raw: string | undefined): number | undefined {
 export async function startRelayUplinkBridge(
 	config: RelayUplinkBridgeConfig,
 ): Promise<RelayUplinkBridgeHandle> {
-	const { relayUrl, relayWsOptions, uplinkUrl, repoPath, onPairingCode, onMobilePaired, log } =
-		config;
+	const {
+		relayUrl,
+		relayWsOptions,
+		uplinkUrl,
+		repoPath,
+		localEndpointUrl,
+		hostedEndpointUrl,
+		decryptEncryptedPayload,
+		onPairingCode,
+		onMobilePaired,
+		onSessionStatus,
+		log,
+	} = config;
 
 	const uplinkDeviceId = await getOrCreateUplinkDeviceId();
 	const relayPort = relayPortFromURL(relayUrl);
@@ -592,6 +626,7 @@ export async function startRelayUplinkBridge(
 
 	const sessions = new Map<string, SessionInfo>();
 	const approvalRequests = new Map<string, { sessionId: string }>();
+	const replayGuard = new ReplayGuard();
 	let mobileDeviceId: string | null = null;
 	let pairingCode = "";
 
@@ -672,7 +707,27 @@ export async function startRelayUplinkBridge(
 				return;
 
 			case "message": {
-				const decoded = decodeMobileInbound(relayMessage.payload);
+				let inboundPayload: unknown = relayMessage.payload;
+				const encrypted = validateEncryptedPayload(relayMessage.payload);
+				if (encrypted.ok) {
+					const replayCheck = replayGuard.check(encrypted.value);
+					if (!replayCheck.ok) {
+						dropMessage(`encrypted_payload_rejected_${replayCheck.reason}`);
+						return;
+					}
+					if (!decryptEncryptedPayload) {
+						dropMessage("encrypted_payload_no_decoder");
+						return;
+					}
+					try {
+						inboundPayload = decryptEncryptedPayload(encrypted.value);
+					} catch {
+						dropMessage("encrypted_payload_decode_failed");
+						return;
+					}
+				}
+
+				const decoded = decodeMobileInbound(inboundPayload);
 				if (!decoded) {
 					dropMessage("invalid_mobile_message");
 					return;
@@ -1042,6 +1097,12 @@ export async function startRelayUplinkBridge(
 					sessionId: event.sessionId,
 					status,
 				});
+				const runtime = sessions.get(event.sessionId)?.runtime ?? "opencode";
+				onSessionStatus?.({
+					sessionId: event.sessionId,
+					runtime,
+					status,
+				});
 				await syncSessionRuntimeMetadata(event.sessionId);
 				sendSessionList();
 				return;
@@ -1111,13 +1172,13 @@ export async function startRelayUplinkBridge(
 				entries: response.payload.entries,
 			});
 		} catch (error) {
-			log?.(
-				`[Bridge] Failed to list directory: ${error instanceof Error ? error.message : String(error)}`,
-			);
+			const reason = error instanceof Error ? error.message : String(error);
+			log?.(`[Bridge] Failed to list directory: ${reason}`);
 			sendToMobile({
 				type: "directory_listing",
 				path: message.path ?? "",
 				entries: [],
+				error: reason,
 			});
 		}
 	}
@@ -1348,18 +1409,34 @@ export async function startRelayUplinkBridge(
 	}
 
 	async function sendDeviceInfoToMobile(): Promise<void> {
+		const endpoints: DeviceEndpointMessage[] = [];
+
+		const normalizedLocal = normalizeEndpointUrl(localEndpointUrl);
+		if (normalizedLocal) {
+			endpoints.push({ kind: "local", url: normalizedLocal });
+		}
+
 		const tailscaleEndpoint = await detectTailscaleEndpoint({
 			port: relayPort,
 			secure: relaySecure,
 		});
-		if (!tailscaleEndpoint) {
+		if (tailscaleEndpoint) {
+			endpoints.push({ kind: "tailscale", url: tailscaleEndpoint.url });
+		}
+
+		const normalizedHosted = normalizeEndpointUrl(hostedEndpointUrl);
+		if (normalizedHosted) {
+			endpoints.push({ kind: "hosted", url: normalizedHosted });
+		}
+
+		if (endpoints.length === 0) {
 			return;
 		}
 
 		sendToMobile({
 			type: "device_info",
 			uplinkDeviceId,
-			endpoints: [{ kind: "tailscale", url: tailscaleEndpoint.url }],
+			endpoints,
 		});
 	}
 
@@ -1383,6 +1460,23 @@ export async function startRelayUplinkBridge(
 			}
 		},
 	};
+}
+
+function normalizeEndpointUrl(value: string | undefined): string | null {
+	if (!value) {
+		return null;
+	}
+
+	const trimmed = value.trim();
+	if (trimmed.length === 0) {
+		return null;
+	}
+
+	try {
+		return new URL(trimmed).toString();
+	} catch {
+		return null;
+	}
 }
 
 async function getOrCreateUplinkDeviceId(): Promise<string> {

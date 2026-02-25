@@ -23,6 +23,14 @@ export interface WsMessage {
 	uplinkDeviceId?: string;
 	/** Message payload (plaintext JSON over TLS) */
 	payload?: unknown;
+	/** Optional relay mode hint for hosted/local feature negotiation */
+	relayMode?: "local" | "tailscale" | "hosted";
+	/** Optional app-layer encryption marker */
+	encrypted?: boolean;
+	/** Optional message identifier for end-to-end replay tracking */
+	messageId?: string;
+	/** Optional client timestamp (ms epoch) */
+	timestamp?: number;
 }
 
 interface RegisterWebSocketRoutesOptions {

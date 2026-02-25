@@ -32,12 +32,14 @@
  * - Transport is WSS by default using a self-signed cert under `~/.codemote/tls/`.
  */
 
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
+import { dirname } from "node:path";
 import {
 	type RelayServerConfig,
 	type RuntimeType,
+	type SessionStatus,
 	type TrustedPairingRecord,
 	type UplinkConfig,
 	UplinkServer,
@@ -53,6 +55,20 @@ export interface ServerConfig {
 	onPINRegenerate?: (pin: string) => void;
 	/** Callback when a client successfully connects */
 	onClientConnected?: () => void;
+	/** Callback when a session status event is observed */
+	onSessionStatus?: (info: {
+		sessionId: string;
+		runtime: RuntimeType;
+		status: SessionStatus;
+	}) => void;
+	/** Public local relay URL advertised to mobile clients (for endpoint hints) */
+	advertisedRelayUrl?: string;
+	/** Remote hosted relay URL (outbound uplink mode) */
+	remoteRelayUrl?: string;
+	/** Additional hosted endpoint URL hint to advertise */
+	hostedEndpointUrl?: string;
+	/** Optional path to machine-readable status JSON */
+	statusFilePath?: string;
 	/** Repository path for uplink */
 	repoPath?: string;
 	/** Runtime types to enable in uplink */
@@ -127,7 +143,22 @@ interface RelayStats {
  * @returns Server handle for control and monitoring
  */
 export async function startServer(config: ServerConfig): Promise<ServerHandle> {
-	const { port, onPINRegenerate, onClientConnected, repoPath, runtimes, pairingStorePath } = config;
+	const {
+		port,
+		onPINRegenerate,
+		onClientConnected,
+		onSessionStatus,
+		advertisedRelayUrl,
+		remoteRelayUrl,
+		hostedEndpointUrl,
+		statusFilePath,
+		repoPath,
+		runtimes,
+		pairingStorePath,
+	} = config;
+	const remoteRelayTarget = normalizeRelayWsUrl(remoteRelayUrl);
+	const hostedEndpointTarget = normalizeRelayWsUrl(hostedEndpointUrl);
+	const localRelayEnabled = !remoteRelayTarget;
 
 	const tlsDisableRequested =
 		process.env["GUILD_REMOTE_DISABLE_TLS"] === "1" ||
@@ -146,7 +177,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 	// Canonical pairing token is issued by the relay on register.
 	let currentPIN = "";
-	const tlsInfo = tlsDisabled ? undefined : await ensureLocalTLS();
+	const tlsInfo = localRelayEnabled && !tlsDisabled ? await ensureLocalTLS() : undefined;
 	const relayCertPem = tlsInfo ? await readFile(tlsInfo.certPath) : undefined;
 	if (tlsInfo) {
 		const daysRemaining = Math.floor((tlsInfo.certValidToMs - Date.now()) / (24 * 60 * 60 * 1000));
@@ -163,18 +194,22 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		}
 	}
 
-	// Start the relay server
-	const relayConfig: Partial<RelayServerConfig> = {
-		port,
-		host: "0.0.0.0",
-		...(pairingStorePath ? { pairingStorePath } : {}),
-		...(tlsInfo ? { tls: { keyPath: tlsInfo.keyPath, certPath: tlsInfo.certPath } } : {}),
-	};
+	let relay: Awaited<ReturnType<typeof createRelayServer>> | null = null;
 
-	const relay = await createRelayServer(relayConfig);
-	await relay.start();
+	if (localRelayEnabled) {
+		const relayConfig: Partial<RelayServerConfig> = {
+			port,
+			host: "0.0.0.0",
+			...(pairingStorePath ? { pairingStorePath } : {}),
+			...(tlsInfo ? { tls: { keyPath: tlsInfo.keyPath, certPath: tlsInfo.certPath } } : {}),
+		};
 
-	console.log(`[Server] Relay started on port ${port}`);
+		relay = await createRelayServer(relayConfig);
+		await relay.start();
+		console.log(`[Server] Relay started on port ${port}`);
+	} else {
+		console.log(`[Server] Remote relay mode enabled: ${remoteRelayTarget}`);
+	}
 
 	// Start the uplink server on next port
 	const uplinkConfig: Partial<UplinkConfig> = {
@@ -191,21 +226,75 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 	console.log(`[Server] Uplink started on port ${port + 1}`);
 
+	const statusState: {
+		running: boolean;
+		mode: "local" | "remote";
+		startedAt: string;
+		pin: string;
+		uplinkDeviceId?: string;
+		relayUrl?: string;
+		mobileConnected: boolean;
+		lastSession?: {
+			sessionId: string;
+			runtime: RuntimeType;
+			status: SessionStatus;
+			updatedAt: string;
+		};
+		stoppedAt?: string;
+	} = {
+		running: true,
+		mode: localRelayEnabled ? "local" : "remote",
+		startedAt: new Date().toISOString(),
+		pin: "",
+		mobileConnected: false,
+	};
+
+	const writeStatus = async (patch: Partial<typeof statusState>): Promise<void> => {
+		Object.assign(statusState, patch);
+		if (!statusFilePath) {
+			return;
+		}
+		await mkdir(dirname(statusFilePath), { recursive: true });
+		await writeFile(statusFilePath, `${JSON.stringify(statusState, null, 2)}\n`, "utf8");
+	};
+
 	// Connect an uplink "device" to the relay and bridge messages to the uplink server
+	const bridgeRelayUrl = remoteRelayTarget ?? `${wsScheme}://127.0.0.1:${port}`;
+	const bridgeHostedEndpointUrl = remoteRelayTarget ?? hostedEndpointTarget;
 	const bridge = await startRelayUplinkBridge({
-		relayUrl: `${wsScheme}://127.0.0.1:${port}`,
-		...(relayCertPem ? { relayWsOptions: { ca: relayCertPem } } : {}),
+		relayUrl: bridgeRelayUrl,
+		...(localRelayEnabled && relayCertPem ? { relayWsOptions: { ca: relayCertPem } } : {}),
 		uplinkUrl: `ws://127.0.0.1:${port + 1}`,
 		repoPath: uplinkConfig.repoPath ?? process.cwd(),
+		...(advertisedRelayUrl ? { localEndpointUrl: advertisedRelayUrl } : {}),
+		...(bridgeHostedEndpointUrl ? { hostedEndpointUrl: bridgeHostedEndpointUrl } : {}),
 		...(process.env["GUILD_REMOTE_DEBUG"] ? { log: (message) => console.log(message) } : {}),
 		onPairingCode: (pin) => {
 			currentPIN = pin;
+			void writeStatus({
+				pin,
+				relayUrl: bridgeRelayUrl,
+			});
 			onPINRegenerate?.(pin);
 		},
-		onMobilePaired: () => onClientConnected?.(),
+		onMobilePaired: () => {
+			void writeStatus({ mobileConnected: true });
+			onClientConnected?.();
+		},
+		onSessionStatus: (info) => {
+			void writeStatus({
+				lastSession: { ...info, updatedAt: new Date().toISOString() },
+			});
+			onSessionStatus?.(info);
+		},
 	});
 
 	currentPIN = bridge.pairingCode;
+	await writeStatus({
+		pin: currentPIN,
+		uplinkDeviceId: bridge.uplinkDeviceId,
+		relayUrl: bridgeRelayUrl,
+	});
 
 	console.log("[Server] Pairing PIN ready (redacted)");
 
@@ -221,16 +310,25 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		uplinkDeviceId: bridge.uplinkDeviceId,
 		uplinkPublicKey: bridge.uplinkPublicKey,
 
-		url: `${wsScheme}://localhost:${port}`,
+		url: localRelayEnabled ? `${wsScheme}://localhost:${port}` : bridgeRelayUrl,
 
 		async stop() {
 			console.log("[Server] Stopping servers...");
 			await bridge.stop();
-			await Promise.all([relay.stop(), uplink.stop()]);
+			await Promise.all([relay?.stop(), uplink.stop()]);
+			await writeStatus({ running: false, stoppedAt: new Date().toISOString() });
 			console.log("[Server] Stopped");
 		},
 
 		async getStats(): Promise<RelayStats> {
+			if (!localRelayEnabled || !relay) {
+				return {
+					rooms: 0,
+					connections: 0,
+					version: "remote-relay",
+				};
+			}
+
 			try {
 				const data = await new Promise<{
 					rooms: number;
@@ -294,15 +392,45 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		},
 
 		async listTrustedDevices() {
+			if (!relay) {
+				return [];
+			}
 			return relay.listTrustedDevices(bridge.uplinkDeviceId);
 		},
 
 		async revokeTrustedDevice(mobileDeviceId: string) {
+			if (!relay) {
+				return false;
+			}
 			return relay.revokeTrustedDevice(bridge.uplinkDeviceId, mobileDeviceId);
 		},
 
 		async revokeAllTrustedDevices() {
+			if (!relay) {
+				return 0;
+			}
 			return relay.revokeAllTrustedDevices(bridge.uplinkDeviceId);
 		},
 	};
+}
+
+function normalizeRelayWsUrl(raw: string | undefined): string | null {
+	if (!raw) {
+		return null;
+	}
+
+	const trimmed = raw.trim();
+	if (trimmed.length === 0) {
+		return null;
+	}
+
+	try {
+		const parsed = new URL(trimmed);
+		if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+			return null;
+		}
+		return parsed.toString();
+	} catch {
+		return null;
+	}
 }

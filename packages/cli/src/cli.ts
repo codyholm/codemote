@@ -24,6 +24,15 @@
 import { advertiseService } from "./mdns.js";
 import { buildPairingURL, generateQRCode, getLocalIP } from "./qrcode.js";
 import { startServer } from "./server.js";
+import {
+	installService,
+	readServiceLogs,
+	readServiceStatus,
+	resolveServicePaths,
+	startService,
+	stopService,
+	uninstallService,
+} from "./service.js";
 import { ensureLocalTLS } from "./tls.js";
 import { renderUI, updateStatus } from "./ui.js";
 
@@ -37,88 +46,133 @@ import type { RuntimeType } from "@codemote/server";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "../package.json"), "utf-8"));
+const rawArgs = process.argv.slice(2);
 
-const args = process.argv.slice(2);
+type StartupMode = "interactive" | "serve";
 
-if (args.includes("--version") || args.includes("-v")) {
-	console.log(pkg.version);
-	process.exit(0);
-}
-
-if (args.includes("--help") || args.includes("-h")) {
+function showHelp(): void {
 	console.log(`codemote v${pkg.version} — Control AI coding agents from your phone
 
-Usage: codemote [options]
+Usage:
+  codemote
+  codemote serve [--remote <relay-url>]
+  codemote service install|start|stop|status|uninstall|logs [--remote <relay-url>]
 
 Options:
   -h, --help     Show this help message
   -v, --version  Show version number
+  --remote       Enable hosted relay mode (optionally provide relay URL)
 
 Environment:
-  PORT               Server port (default: 8080)
-  CODEMOTE_START_DIR Default directory for project browsing (default: cwd)
-  CODEMOTE_TRUSTED_PAIRINGS Enable trusted pairing persistence (default: true)
-  CODEMOTE_PAIRING_STORE_PATH Override trusted pairing store JSON path
+  PORT                         Server port (default: 8080)
+  CODEMOTE_START_DIR           Default directory for project browsing (default: cwd)
+  CODEMOTE_TRUSTED_PAIRINGS    Enable trusted pairing persistence (default: true)
+  CODEMOTE_PAIRING_STORE_PATH  Override trusted pairing store JSON path
+  CODEMOTE_REMOTE_RELAY_URL    Default hosted relay URL for --remote
+  CODEMOTE_STATUS_FILE         Machine-readable status file path
 
 ${pkg.homepage}`);
-	process.exit(0);
 }
 
-async function main() {
+async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 	const port = Number.parseInt(process.env["PORT"] || "8080", 10);
-	let interactive = false;
+	let interactive = mode === "interactive";
 	const configuredRepoPath = (
 		process.env["CODEMOTE_START_DIR"] || process.env["CODEMOTE_REPO_PATH"]
 	)?.trim();
 	const inferredRepoPath = process.env["INIT_CWD"]?.trim() || process.cwd();
 	const repoPath = resolve(configuredRepoPath || inferredRepoPath);
+	const statusFilePath = process.env["CODEMOTE_STATUS_FILE"]?.trim() || undefined;
 
 	if (configuredRepoPath) {
 		await mkdir(repoPath, { recursive: true });
 	}
 
-	console.log("Starting Codemote...");
+	console.log(
+		remoteRelayUrl
+			? `Starting Codemote in hosted relay mode (${remoteRelayUrl})...`
+			: "Starting Codemote...",
+	);
 
 	// Start the server (relay + uplink + bridge)
+	const host = getLocalIP();
+	const localRelayUrl = `wss://${host}:${port}/ws`;
 	const server = await startServer({
 		port,
 		repoPath,
+		...(remoteRelayUrl ? { remoteRelayUrl } : {}),
+		...(!remoteRelayUrl ? { advertisedRelayUrl: localRelayUrl } : {}),
+		...(statusFilePath ? { statusFilePath } : {}),
 		onClientConnected: () => {
-			if (interactive) {
+			if (mode === "serve") {
+				console.log("[CLI] Mobile device connected");
+			} else if (interactive) {
 				console.log("Device connected");
 			} else {
-				updateStatus("   ✓ Device connected");
+				updateStatus("   ✓ Device connected. Waiting for session...");
+			}
+		},
+		onSessionStatus: ({ runtime, status }) => {
+			if (mode === "serve") {
+				if (status === "running" || status === "starting") {
+					console.log(`[CLI] Active session: ${runtime} (${status})`);
+				}
+				return;
+			}
+
+			if (interactive) {
+				return;
+			}
+
+			if (status === "running" || status === "starting") {
+				updateStatus(`   Active session: ${formatRuntimeLabel(runtime)}`);
+				return;
+			}
+
+			if (status === "idle") {
+				updateStatus("   ✓ Device connected. Waiting for next prompt...");
 			}
 		},
 	});
 
-	// Get local IP and build QR code URL
-	const host = getLocalIP();
-	const relayScheme = server.url.startsWith("wss://") ? "wss" : "ws";
-	const relayUrl = `${relayScheme}://${host}:${port}/ws`;
-	const tlsPin = relayScheme === "wss" ? (await ensureLocalTLS()).tlsPin : undefined;
-	const pairingURL = tlsPin
-		? buildPairingURL(host, port, server.pin, { tlsPin, relayUrl })
-		: buildPairingURL(host, port, server.pin);
-	const qrCode = await generateQRCode(pairingURL);
-
-	// Start mDNS advertisement
-	const mdns = advertiseService(port, server.pin);
-
-	console.log(`[CLI] mDNS advertising on port ${port}`);
+	const localMode = !remoteRelayUrl;
+	const mdns = localMode ? advertiseService(port, server.pin) : { destroy: () => undefined };
+	if (localMode) {
+		console.log(`[CLI] mDNS advertising on port ${port}`);
+	} else {
+		console.log("[CLI] mDNS disabled in hosted relay mode");
+	}
 	console.log(`[CLI] Session workspace root: ${repoPath}`);
 
-	// Render the UI
-	await renderUI({
-		qrCode,
-		pin: server.pin,
-		localURL: relayUrl,
-		status: "ready",
-		...(tlsPin ? { tlsPin } : {}),
-	});
+	const relayScheme = server.url.startsWith("wss://") ? "wss" : "ws";
+	const relayUrl = localMode
+		? `${relayScheme}://${host}:${port}/ws`
+		: (remoteRelayUrl ?? server.url);
+
+	if (mode === "interactive") {
+		let tlsPin: string | undefined;
+		if (localMode && relayScheme === "wss") {
+			tlsPin = (await ensureLocalTLS()).tlsPin;
+		}
+
+		const pairingURL = tlsPin
+			? buildPairingURL(host, port, server.pin, { tlsPin, relayUrl })
+			: buildPairingURL(host, port, server.pin);
+		const qrCode = await generateQRCode(pairingURL);
+
+		await renderUI({
+			qrCode,
+			pin: server.pin,
+			localURL: relayUrl,
+			status: "ready",
+			...(tlsPin ? { tlsPin } : {}),
+		});
+	} else {
+		console.log(`[CLI] Serve mode ready. Relay: ${relayUrl}`);
+	}
 
 	// Optional interactive terminal commands (for starting sessions)
-	if (process.stdin.isTTY) {
+	if (mode === "interactive" && process.stdin.isTTY) {
 		interactive = true;
 		console.log(
 			"\nCommands: claude|opencode|codex|gemini <prompt> | devices | unpair <mobileDeviceId> | unpair-all | help",
@@ -270,8 +324,113 @@ async function main() {
 	// The server and mDNS advertiser are now running in the background
 }
 
-main().catch((err) => {
-	console.error("[CLI] Failed to start:", err);
+async function runServiceSubcommand(args: string[]): Promise<void> {
+	const action = args[0];
+	if (!action) {
+		throw new Error("Missing service action. Use: install|start|stop|status|uninstall|logs");
+	}
+
+	const scriptPath = resolve(process.argv[1] ?? "packages/cli/dist/cli.js");
+	const { remoteRelayUrl } = extractRemoteOption(args.slice(1));
+
+	switch (action) {
+		case "install":
+			await installService({
+				nodePath: process.execPath,
+				scriptPath,
+				workingDirectory: process.cwd(),
+				...(remoteRelayUrl ? { remoteRelayUrl } : {}),
+			});
+			console.log("Service installed.");
+			console.log(`Log file: ${resolveServicePaths().logFile}`);
+			return;
+		case "start":
+			await startService();
+			console.log("Service started.");
+			return;
+		case "stop":
+			await stopService();
+			console.log("Service stopped.");
+			return;
+		case "status": {
+			const status = await readServiceStatus();
+			console.log(JSON.stringify(status, null, 2));
+			return;
+		}
+		case "uninstall":
+			await uninstallService();
+			console.log("Service uninstalled.");
+			return;
+		case "logs": {
+			const logs = await readServiceLogs();
+			console.log(logs.length > 0 ? logs : "No logs available.");
+			return;
+		}
+		default:
+			throw new Error(`Unknown service action: ${action}`);
+	}
+}
+
+function extractRemoteOption(args: string[]): { remaining: string[]; remoteRelayUrl?: string } {
+	const remaining: string[] = [];
+	let remoteRelayUrl: string | undefined;
+
+	for (let index = 0; index < args.length; index += 1) {
+		const arg = args[index];
+		if (arg === undefined) {
+			continue;
+		}
+		if (arg !== "--remote") {
+			remaining.push(arg);
+			continue;
+		}
+
+		const next = args[index + 1];
+		if (next && !next.startsWith("-")) {
+			remoteRelayUrl = next;
+			index += 1;
+		} else {
+			remoteRelayUrl =
+				process.env["CODEMOTE_REMOTE_RELAY_URL"]?.trim() || "wss://relay.codemote.app/ws";
+		}
+	}
+
+	return { remaining, ...(remoteRelayUrl ? { remoteRelayUrl } : {}) };
+}
+
+async function run(): Promise<void> {
+	if (rawArgs.includes("--version") || rawArgs.includes("-v")) {
+		console.log(pkg.version);
+		return;
+	}
+
+	if (rawArgs.includes("--help") || rawArgs.includes("-h")) {
+		showHelp();
+		return;
+	}
+
+	const command = rawArgs[0];
+	if (command === "serve") {
+		const { remoteRelayUrl } = extractRemoteOption(rawArgs.slice(1));
+		await startApp("serve", remoteRelayUrl);
+		return;
+	}
+
+	if (command === "service") {
+		await runServiceSubcommand(rawArgs.slice(1));
+		return;
+	}
+
+	if (command && !command.startsWith("-")) {
+		throw new Error(`Unknown command: ${command}`);
+	}
+
+	const { remoteRelayUrl } = extractRemoteOption(rawArgs);
+	await startApp("interactive", remoteRelayUrl);
+}
+
+run().catch((err) => {
+	console.error("[CLI] Failed:", err instanceof Error ? err.message : String(err));
 	process.exit(1);
 });
 
@@ -279,4 +438,17 @@ function formatTimestamp(timestamp: number): string {
 	const date = new Date(timestamp);
 	if (Number.isNaN(date.getTime())) return "unknown";
 	return date.toISOString();
+}
+
+function formatRuntimeLabel(runtime: RuntimeType): string {
+	switch (runtime) {
+		case "claude":
+			return "Claude";
+		case "opencode":
+			return "OpenCode";
+		case "codex":
+			return "Codex";
+		case "gemini":
+			return "Gemini";
+	}
 }

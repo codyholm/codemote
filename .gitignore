@@ -56,6 +56,9 @@ masterreference
 # Codex
 .codex/
 
+# Conductor (local-only)
+conductor/
+
 # iOS signing/build artifacts
 *.mobileprovision
 *.xcarchive/

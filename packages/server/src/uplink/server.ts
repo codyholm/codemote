@@ -34,6 +34,7 @@ export class UplinkServer {
 	private eventBus: EventBus;
 	private executors = new Map<RuntimeType, BaseExecutor>();
 	private clients = new Set<WebSocket>();
+	private static readonly LIST_DIRECTORY_STAT_CONCURRENCY = 50;
 
 	constructor(config: Partial<UplinkConfig> = {}) {
 		this.config = { ...DEFAULT_CONFIG, ...config };
@@ -346,8 +347,10 @@ export class UplinkServer {
 			(d) => (d.isDirectory() || d.isSymbolicLink()) && !d.name.startsWith("."),
 		);
 
-		const results = await Promise.all(
-			candidates.map(async (d): Promise<DirectoryEntry | null> => {
+		const results = await this.mapWithConcurrencyLimit(
+			candidates,
+			UplinkServer.LIST_DIRECTORY_STAT_CONCURRENCY,
+			async (d): Promise<DirectoryEntry | null> => {
 				const fullPath = join(dirPath, d.name);
 
 				// For symlinks, verify the target is actually a directory
@@ -368,7 +371,7 @@ export class UplinkServer {
 					// not a git repo
 				}
 				return { name: d.name, isDirectory: true, isGitRepo };
-			}),
+			},
 		);
 
 		const entries = results.filter((e): e is DirectoryEntry => e !== null);
@@ -379,6 +382,38 @@ export class UplinkServer {
 		});
 
 		return entries.slice(0, 200);
+	}
+
+	private async mapWithConcurrencyLimit<T, TResult>(
+		items: T[],
+		limit: number,
+		handler: (item: T, index: number) => Promise<TResult>,
+	): Promise<TResult[]> {
+		if (items.length === 0) {
+			return [];
+		}
+
+		const results = new Array<TResult>(items.length);
+		let nextIndex = 0;
+		const workerCount = Math.max(1, Math.min(limit, items.length));
+
+		const workers = Array.from({ length: workerCount }, async () => {
+			while (true) {
+				const index = nextIndex;
+				nextIndex += 1;
+				if (index >= items.length) {
+					return;
+				}
+				const item = items[index];
+				if (item === undefined) {
+					return;
+				}
+				results[index] = await handler(item, index);
+			}
+		});
+
+		await Promise.all(workers);
+		return results;
 	}
 
 	private broadcast(response: UplinkResponse): void {
