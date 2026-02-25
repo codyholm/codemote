@@ -16,7 +16,7 @@ Important: this is a local server process. If it isn’t running, your phone can
 - **If you close the terminal or stop the process, the session ends.**
 - To keep it running without watching a terminal, run it under `tmux`/`screen`/a process manager (or ship a menubar app/service — roadmap).
 
-For the connection architecture roadmap (LAN → Tailscale → hosted relay), see `docs/connection-architecture.md`.
+For the connection + trust baseline and roadmap (LAN → Tailscale → hosted relay), see `.guild/brain/STACK.md`.
 
 ## Run
 
@@ -48,7 +48,7 @@ Local relay uses **WSS** with a self-signed certificate generated under `~/.code
 
 This allows iOS to pin the relay identity without manual URL entry.
 
-Security reference: `docs/security-architecture.md`.
+Security reference: `.guild/brain/STACK.md` (Security Baseline).
 
 ## Ports
 
@@ -86,4 +86,4 @@ Default: `8080` and `8081`.
 ## Notes
 
 - App-layer E2E encryption is not wired in the `0.7.x` baseline; payloads are plaintext JSON over WSS.
-- Hosted relay mode is planned but not shipped; see `docs/connection-architecture.md`.
+- Hosted relay mode is planned but not shipped; see `.guild/brain/STACK.md` and `.guild/backlog.md`.
