@@ -7,6 +7,7 @@ const createMockWebSocket = (readyState = 1) =>
 	({
 		readyState,
 		send: vi.fn(),
+		close: vi.fn(),
 	}) as unknown as WebSocket;
 
 describe("RoomManager", () => {
@@ -76,6 +77,21 @@ describe("RoomManager", () => {
 			manager.join("room-abc", member);
 
 			expect(manager.getRoomId("pk_test_123")).toBe("room-abc");
+		});
+
+		it("replaces an existing device socket and closes the stale connection", () => {
+			const oldSocket = createMockWebSocket();
+			const newSocket = createMockWebSocket();
+
+			manager.join("room-123", { ws: oldSocket, deviceId: "pk_mobile_1", type: "mobile" });
+			manager.join("room-123", { ws: newSocket, deviceId: "pk_mobile_1", type: "mobile" });
+
+			const members = manager.getMembers("room-123");
+			expect(members).toHaveLength(1);
+			expect(members[0]?.ws).toBe(newSocket);
+			expect(
+				(oldSocket as unknown as { close: ReturnType<typeof vi.fn> }).close,
+			).toHaveBeenCalled();
 		});
 	});
 
@@ -194,6 +210,21 @@ describe("RoomManager", () => {
 			manager.leave("nonexistent");
 			// Should not throw
 			expect(manager.stats().rooms).toBe(0);
+		});
+
+		it("ignores stale leave calls when a newer socket already replaced that device", () => {
+			const uplink = createMockWebSocket();
+			const oldMobileSocket = createMockWebSocket();
+			const newMobileSocket = createMockWebSocket();
+
+			manager.join("room-123", { ws: uplink, deviceId: "pk_uplink", type: "uplink" });
+			manager.join("room-123", { ws: oldMobileSocket, deviceId: "pk_mobile", type: "mobile" });
+			manager.join("room-123", { ws: newMobileSocket, deviceId: "pk_mobile", type: "mobile" });
+
+			manager.leave("pk_mobile", oldMobileSocket);
+
+			expect(manager.getRoomId("pk_mobile")).toBe("room-123");
+			expect(manager.getMembers("room-123")).toHaveLength(2);
 		});
 	});
 

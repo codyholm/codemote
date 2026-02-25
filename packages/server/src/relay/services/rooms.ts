@@ -45,6 +45,16 @@ export class RoomManager {
 			this.rooms.set(roomId, room);
 		}
 
+		const existingMember = room.get(member.deviceId);
+		if (existingMember && existingMember.ws !== member.ws) {
+			// Replace stale sockets on reconnect so one device ID maps to one live channel.
+			try {
+				existingMember.ws.close(1000, "Superseded by newer connection");
+			} catch {
+				// Ignore close failures and continue replacing membership.
+			}
+		}
+
 		room.set(member.deviceId, member);
 		this.deviceToRoom.set(member.deviceId, roomId);
 		logDebug(
@@ -55,12 +65,18 @@ export class RoomManager {
 	/**
 	 * Remove a member from their room and delete the room if it becomes empty.
 	 */
-	leave(deviceId: string): void {
+	leave(deviceId: string, expectedSocket?: WebSocket): void {
 		const roomId = this.deviceToRoom.get(deviceId);
 		if (!roomId) return;
 
 		const room = this.rooms.get(roomId);
 		if (room) {
+			const currentMember = room.get(deviceId);
+			if (expectedSocket && currentMember && currentMember.ws !== expectedSocket) {
+				// A newer socket already replaced this device entry; ignore stale close callbacks.
+				return;
+			}
+
 			room.delete(deviceId);
 			if (room.size === 0) {
 				this.rooms.delete(roomId);

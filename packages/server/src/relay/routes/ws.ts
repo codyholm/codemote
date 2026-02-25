@@ -268,7 +268,7 @@ export function registerWebSocketRoutes(
 
 		socket.on("close", () => {
 			if (clientDeviceId) {
-				rooms.leave(clientDeviceId);
+				rooms.leave(clientDeviceId, socket);
 			}
 		});
 
