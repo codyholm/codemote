@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 
 const DARWIN_LABEL = "app.codemote.service";
 const LINUX_UNIT = "codemote.service";
-const SERVICE_PATH = [
+const SERVICE_PATH_FALLBACK_SEGMENTS = [
 	"/opt/homebrew/bin",
 	"/opt/homebrew/sbin",
 	"/usr/local/bin",
@@ -14,7 +14,7 @@ const SERVICE_PATH = [
 	"/bin",
 	"/usr/sbin",
 	"/sbin",
-].join(":");
+];
 
 export interface ServicePaths {
 	logFile: string;
@@ -199,6 +199,7 @@ async function installLaunchAgent(
 	paths: ServicePaths,
 ): Promise<void> {
 	await mkdir(dirname(paths.launchAgentPlist), { recursive: true });
+	const servicePath = buildServicePath(config.nodePath);
 	const args = [config.nodePath, config.scriptPath, "serve"];
 	if (config.remoteRelayUrl) {
 		args.push("--remote", config.remoteRelayUrl);
@@ -222,12 +223,12 @@ ${argsXml}
 	<key>WorkingDirectory</key>
 	<string>${xmlEscape(config.workingDirectory)}</string>
 	<key>EnvironmentVariables</key>
-	<dict>
-		<key>CODEMOTE_STATUS_FILE</key>
-		<string>${xmlEscape(paths.statusFile)}</string>
-		<key>PATH</key>
-		<string>${xmlEscape(SERVICE_PATH)}</string>
-	</dict>
+		<dict>
+			<key>CODEMOTE_STATUS_FILE</key>
+			<string>${xmlEscape(paths.statusFile)}</string>
+			<key>PATH</key>
+			<string>${xmlEscape(servicePath)}</string>
+		</dict>
 	<key>StandardOutPath</key>
 	<string>${xmlEscape(paths.logFile)}</string>
 	<key>StandardErrorPath</key>
@@ -243,6 +244,7 @@ async function installSystemdUnit(
 	paths: ServicePaths,
 ): Promise<void> {
 	await mkdir(dirname(paths.systemdUnit), { recursive: true });
+	const servicePath = buildServicePath(config.nodePath);
 	const args = [config.nodePath, config.scriptPath, "serve"];
 	if (config.remoteRelayUrl) {
 		args.push("--remote", config.remoteRelayUrl);
@@ -259,7 +261,7 @@ ExecStart=${execStart}
 Restart=always
 RestartSec=3
 Environment=CODEMOTE_STATUS_FILE=${paths.statusFile}
-Environment=PATH=${SERVICE_PATH}
+Environment=PATH=${servicePath}
 StandardOutput=append:${paths.logFile}
 StandardError=append:${paths.logFile}
 
@@ -269,6 +271,21 @@ WantedBy=default.target
 	await writeFile(paths.systemdUnit, unit, "utf8");
 	await runCommand("systemctl", ["--user", "daemon-reload"], { allowFailure: true });
 	await runCommand("systemctl", ["--user", "enable", LINUX_UNIT], { allowFailure: true });
+}
+
+function buildServicePath(nodePath: string): string {
+	const segments = new Set<string>();
+	const nodeDir = dirname(nodePath);
+	if (nodeDir.length > 0) {
+		segments.add(nodeDir);
+	}
+	segments.add(join(homedir(), ".local", "bin"));
+
+	for (const segment of SERVICE_PATH_FALLBACK_SEGMENTS) {
+		segments.add(segment);
+	}
+
+	return Array.from(segments).join(":");
 }
 
 function xmlEscape(value: string): string {

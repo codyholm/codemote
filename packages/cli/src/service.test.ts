@@ -70,12 +70,16 @@ describe("service", () => {
 			expect(plist).toContain(paths.logFile);
 			expect(plist).toContain(paths.statusFile);
 			expect(plist).toContain("<key>PATH</key>");
+			expect(plist).toContain("<string>/usr/bin:/");
+			expect(plist).toContain(`${tempHome}/.local/bin`);
 		} else {
 			const unit = await readFile(paths.systemdUnit, "utf8");
 			expect(unit).toContain("Description=Codemote background service");
 			expect(unit).toContain(" serve --remote wss://relay.example/ws");
 			expect(unit).toContain(`Environment=CODEMOTE_STATUS_FILE=${paths.statusFile}`);
-			expect(unit).toContain("Environment=PATH=/opt/homebrew/bin:/opt/homebrew/sbin");
+			expect(unit).toContain("Environment=PATH=/usr/bin");
+			expect(unit).toContain(`${tempHome}/.local/bin`);
+			expect(unit).toContain("/opt/homebrew/bin");
 			expect(unit).toContain(`StandardOutput=append:${paths.logFile}`);
 		}
 	});
