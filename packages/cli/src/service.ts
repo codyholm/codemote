@@ -5,6 +5,16 @@ import { dirname, join } from "node:path";
 
 const DARWIN_LABEL = "app.codemote.service";
 const LINUX_UNIT = "codemote.service";
+const SERVICE_PATH = [
+	"/opt/homebrew/bin",
+	"/opt/homebrew/sbin",
+	"/usr/local/bin",
+	"/usr/local/sbin",
+	"/usr/bin",
+	"/bin",
+	"/usr/sbin",
+	"/sbin",
+].join(":");
 
 export interface ServicePaths {
 	logFile: string;
@@ -215,6 +225,8 @@ ${argsXml}
 	<dict>
 		<key>CODEMOTE_STATUS_FILE</key>
 		<string>${xmlEscape(paths.statusFile)}</string>
+		<key>PATH</key>
+		<string>${xmlEscape(SERVICE_PATH)}</string>
 	</dict>
 	<key>StandardOutPath</key>
 	<string>${xmlEscape(paths.logFile)}</string>
@@ -247,6 +259,7 @@ ExecStart=${execStart}
 Restart=always
 RestartSec=3
 Environment=CODEMOTE_STATUS_FILE=${paths.statusFile}
+Environment=PATH=${SERVICE_PATH}
 StandardOutput=append:${paths.logFile}
 StandardError=append:${paths.logFile}
 
