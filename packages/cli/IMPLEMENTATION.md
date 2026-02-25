@@ -1,141 +1,59 @@
-# PIN Generation and Rate Limiting Implementation
+# Pairing + Trusted Devices (Implementation Notes)
 
-## Overview
+This document describes the **shipped** pairing and resume path for the local Codemote server (`npx codemote`) in the `0.7.4` baseline.
 
-This file documents the original pairing utilities (`packages/cli/src/pairing.ts`).
+## Where pairing happens
 
-Current status:
+Server-side pairing/trust is implemented in the relay inside `@codemote/server`:
 
-- The shipped local pairing flow uses the relay’s `PairingCodeService` (SQLite) in `packages/relay`.
-- `pairing.ts` (PIN manager + rate limiting) is not the primary code path today.
+- Pairing code issuance + consume: `packages/server/src/relay/services/codes.ts` (`PairingCodeService`)
+- WebSocket protocol + rate limiting: `packages/server/src/relay/routes/ws.ts`
+- Trusted device persistence (resume without PIN): `packages/server/src/relay/services/trusted-pairings.ts`
 
-See:
+The CLI composes the local server and runs the bridge:
 
-- `packages/cli/SERVER.md` for the current local server composition.
-- `docs/connection-architecture.md` for the connection roadmap.
+- Local server composition: `packages/cli/src/server.ts`
+- CLI entry point: `packages/cli/src/cli.ts`
+- Bridge (protocol translation): `packages/cli/src/bridge.ts`
 
-Implemented a complete PIN generation and rate limiting system for device pairing operations in `packages/cli/src/pairing.ts`.
+## High-level flow (local LAN)
 
-## Components
+1. CLI starts relay + uplink and the bridge registers an uplink “device” with the relay.
+2. Relay issues a 6-digit PIN tied to that uplink device (`PairingCodeService.create`).
+3. iOS connects over WSS and pins the relay identity (TLS pin delivered out-of-band via QR deep link).
+4. iOS sends `pair` with `{ pin, deviceId }` (legacy alias: `pairingCode`).
+5. Relay rate-limits pairing attempts, consumes the PIN, joins mobile + uplink into the same room, and records trusted pairing.
+6. On later reconnects, iOS can send `resume` with `{ uplinkDeviceId, deviceId }` without re-entering the PIN.
 
-### 1. PIN Generation (`generatePIN`)
+## Trusted pairings store
 
-- Generates random 6-digit numeric PINs (000000-999999)
-- Uses `Math.random()` for generation
-- Zero-pads to ensure consistent 6-digit format
+Defaults:
 
-### 2. Rate Limiter (`RateLimiter`)
+- Path: `~/.codemote/trusted-pairings.json`
+- Format: `{ version, updatedAt, records: [...] }`
 
-Implements sophisticated rate limiting with:
+Configuration:
 
-- **Exponential Backoff**: Progressively increasing delays between attempts
-  - First attempt: 1s
-  - Second attempt: 2s
-  - Third attempt: 4s
-  - Fourth attempt: 8s
-  - Fifth attempt: 16s
+- Disable persistence: `CODEMOTE_TRUSTED_PAIRINGS=0` (or `false`)
+- Override path: `CODEMOTE_PAIRING_STORE_PATH=/path/to/trusted-pairings.json`
 
-- **Lockout Mechanism**: After max attempts (default 5), client is locked out for 60 seconds
+Behavior:
 
-- **Time Window**: Attempts are tracked within a 60-second window
+- In-memory index for fast resume checks.
+- Atomic write via `*.tmp` + rename.
+- File permissions: `0600` (file) and `0700` (parent directory).
+- Corrupt-file recovery: renamed to `*.corrupt-<timestamp>` and replaced with a fresh store.
 
-- **Per-Client Tracking**: Each client IP is tracked independently
+## Pairing rate limiting
 
-### 3. PIN Manager (`PINManager`)
+Relay rate limiting lives in `packages/server/src/relay/routes/ws.ts`:
 
-Manages PIN lifecycle with:
+- `register`: burst limiter (default 20/min per client IP)
+- `pair`: exponential backoff + lockout (default: 1s/2s/4s/8s backoff, lockout after 5 failed attempts for 60s)
 
-- **Automatic Expiry**: PINs expire after configurable TTL (default 15 minutes)
-- **Auto-Regeneration**: New PIN generated automatically on expiry
-- **Validation**: Check if provided PIN matches current unexpired PIN
-- **Callbacks**: Notify on regeneration for UI updates
-- **Time Tracking**: Query remaining time until expiry
+These limits are enforced server-side so mobile clients stay simple.
 
-## Key Implementation Details
+## Legacy / utility code (not the shipped path)
 
-### Rate Limiter Logic
-
-1. Check if client is locked out (has lockedUntil timestamp)
-2. If lockout expired, clear record and treat as fresh start
-3. If no record or outside time window, allow and record attempt
-4. For failed attempts, check if max attempts exceeded
-5. If max exceeded, set lockout timestamp
-6. Otherwise apply exponential backoff based on attempt count
-7. Successful attempts clear the client's record
-
-### PIN Manager Logic
-
-1. Generate initial PIN on construction
-2. Set expiry timestamp = now + TTL
-3. Schedule automatic regeneration timer
-4. On PIN access, check expiry and regenerate if needed
-5. Validation checks both PIN match and expiry
-6. Regeneration clears old timer, generates new PIN, schedules next regeneration
-
-## Testing
-
-Comprehensive test suite with 34 tests covering:
-
-- PIN generation (format, range, uniqueness)
-- Rate limiter basic functionality
-- Exponential backoff behavior
-- Lockout mechanism (trigger, persistence, expiry)
-- Time window reset
-- Client isolation
-- PIN manager initialization
-- PIN expiry and regeneration
-- Validation
-- Callbacks
-
-### Test Strategy
-
-- Used real timers instead of fake timers for reliability
-- Added generous buffers to timeouts to account for test environment variability
-- Fixed lockout expiry logic to properly clear expired lockouts
-
-## Files Created
-
-- `/packages/cli/package.json` - Package configuration
-- `/packages/cli/tsconfig.json` - TypeScript configuration
-- `/packages/cli/src/pairing.ts` - Main implementation (287 lines)
-- `/packages/cli/src/pairing.test.ts` - Test suite (34 tests, 447 lines)
-- `/packages/cli/src/index.ts` - Public exports
-- `/packages/cli/README.md` - Package documentation
-- `/packages/cli/demo.ts` - Usage demonstration
-
-## Usage Example
-
-```typescript
-import { generatePIN, RateLimiter, PINManager } from "codemote";
-
-// Generate PIN
-const pin = generatePIN(); // "042815"
-
-// Rate limiting
-const limiter = new RateLimiter({
-  maxAttempts: 5,
-  windowMs: 60_000,
-  backoffMs: [1000, 2000, 4000, 8000, 16_000],
-  lockoutMs: 60_000,
-});
-
-const result = await limiter.checkAndRecord("192.168.1.1", false);
-if (!result.allowed) {
-  console.log(result.message); // "Too many attempts. Wait 2s before retrying"
-}
-
-// PIN management
-const manager = new PINManager(15 * 60 * 1000); // 15 min TTL
-console.log(manager.pin); // Current PIN
-manager.validate("123456"); // Check if matches
-manager.setOnRegenerate((newPin) => {
-  // Handle regeneration
-});
-```
-
-## Build Output
-
-- TypeScript compilation successful
-- Generated declaration files (.d.ts)
-- Source maps included
-- All 34 tests passing
+`packages/cli/src/pairing.ts` includes a standalone `PINManager` + `RateLimiter` implementation and tests.
+It’s used for examples and as a library export, but the **active** pairing flow is relay-issued PINs + relay-side rate limiting.

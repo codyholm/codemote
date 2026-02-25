@@ -1,18 +1,29 @@
 # Local Server (CLI)
 
-This package is the composition root for the **local** Codemote experience.
+This package is the composition root for the **local** Codemote experience (`npx codemote`).
 
-It starts (in one process):
+It runs a single Node.js process that starts:
 
-- Relay server (`@codemote/relay`) — pairing + message routing
-- Uplink server (`@codemote/uplink`) — spawns/streams Claude/OpenCode/Codex
-- Bridge (`packages/cli/src/bridge.ts`) — E2E encryption + protocol translation
+- Relay server (`@codemote/server` → `createRelayServer`) — pairing + message routing
+- Uplink server (`@codemote/server` → `UplinkServer`) — sessions/workspaces + runtime executors
+- Bridge (`packages/cli/src/bridge.ts`) — connects an uplink “device” to the relay and translates:
+  - mobile JSON protocol ↔ uplink command/response
+  - uplink `StreamEvent` → mobile payloads
+  - endpoint hints (e.g. Tailscale)
 
-For the connection architecture roadmap (local → tailscale → hosted relay), see `docs/connection-architecture.md`.
+Important: this is a local server process. If it isn’t running, your phone can’t connect.
+
+- **If you close the terminal or stop the process, the session ends.**
+- To keep it running without watching a terminal, run it under `tmux`/`screen`/a process manager (or ship a menubar app/service — roadmap).
+
+For the connection architecture roadmap (LAN → Tailscale → hosted relay), see `docs/connection-architecture.md`.
 
 ## Run
 
 ```bash
+# End-user
+npx codemote
+
 # From repo root
 pnpm -C packages/cli start
 
@@ -53,6 +64,10 @@ Default: `8080` and `8081`.
 | Variable | Purpose |
 |----------|---------|
 | `PORT` | Relay port (default 8080) |
+| `CODEMOTE_START_DIR` | Workspace browsing root (default: cwd) |
+| `CODEMOTE_REPO_PATH` | Alias of `CODEMOTE_START_DIR` (back-compat) |
+| `CODEMOTE_TRUSTED_PAIRINGS` | Set to `0`/`false` to disable trusted pairing persistence |
+| `CODEMOTE_PAIRING_STORE_PATH` | Override trusted pairings JSON path |
 | `GUILD_REMOTE_DEBUG` | Enable verbose bridge logging |
 | `GUILD_REMOTE_DISABLE_TLS` | Dev-only: disable TLS (requires `GUILD_REMOTE_ALLOW_INSECURE=1`) |
 | `GUILD_REMOTE_ALLOW_INSECURE` | Explicit opt-in to allow insecure mode |
@@ -61,18 +76,14 @@ Default: `8080` and `8081`.
 
 | File | Responsibility |
 |------|----------------|
+| `packages/cli/src/cli.ts` | CLI entry point (`npx codemote`) |
 | `packages/cli/src/server.ts` | Starts relay + uplink + bridge |
-| `packages/cli/src/bridge.ts` | Uplink “device” registration + E2E encryption |
+| `packages/cli/src/bridge.ts` | Uplink “device” registration + protocol translation |
 | `packages/cli/src/tls.ts` | Self-signed TLS cert generation |
 | `packages/cli/src/mdns.ts` | Bonjour advertisement (no secrets) |
 | `packages/cli/src/qrcode.ts` | Deep link creation + QR rendering |
 
-## Roadmap Note (server consolidation)
+## Notes
 
-Happy’s repo shape is a single “server” with internal modules.
-We plan to move the local server composition out of `packages/cli` into a dedicated package:
-
-- `packages/server` (new): local server runtime
-- `packages/cli`: thin terminal UI wrapper
-
-This keeps deployable hosted relay (`packages/relay`) separate from the local runtime.
+- App-layer E2E encryption is not wired in the `0.7.x` baseline; payloads are plaintext JSON over WSS.
+- Hosted relay mode is planned but not shipped; see `docs/connection-architecture.md`.

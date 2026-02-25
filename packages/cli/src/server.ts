@@ -1,8 +1,10 @@
 /**
  * Server Integration - Bundles relay + uplink in one process
  *
- * Combines the relay server and uplink service into a single process
- * with PIN-based pairing that integrates rate limiting and validation.
+ * `npx codemote` runs a single Node.js process that starts:
+ * - Relay server (pairing + message routing)
+ * - Uplink server (runtime orchestration + repo operations)
+ * - Bridge (uplink “device” registration + protocol translation)
  *
  * ARCHITECTURE:
  * ┌─────────────────────────────────────────┐
@@ -24,16 +26,10 @@
  *          │
  *     📱 Mobile App
  *
- * CURRENT STATUS:
- * - ✅ Both servers start successfully
- * - ✅ PIN management and rate limiting implemented
- * - ⚠️ PIN validation not yet integrated into relay (needs relay changes)
- * - ⚠️ Uplink doesn't auto-connect to relay (needs connection logic)
- *
- * NEEDED RELAY CHANGES:
- * 1. Accept `pin` field in pair messages (in addition to `pairingCode`)
- * 2. Support custom validation function in RelayServerConfig
- * 3. Expose RoomManager events for connection callbacks
+ * NOTES:
+ * - Pairing PINs are issued and validated by the relay (`PairingCodeService`).
+ * - Trusted devices persist to `~/.codemote/trusted-pairings.json` by default.
+ * - Transport is WSS by default using a self-signed cert under `~/.codemote/tls/`.
  */
 
 import { readFile } from "node:fs/promises";

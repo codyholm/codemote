@@ -8,6 +8,8 @@ Control AI coding agents from your phone. Start Claude Code, Codex, OpenCode, or
 npx codemote
 ```
 
+Leave it running — it starts a local server your phone connects to.
+
 Scan the QR code with your iPhone camera or open the Codemote app and enter the PIN. That's it.
 
 ## How It Works
@@ -18,7 +20,7 @@ Scan the QR code with your iPhone camera or open the Codemote app and enter the 
 4. **Start a session** — choose an AI agent, type a prompt, and watch it work
 5. **Stay in the loop** — stream output in real time, send follow-ups, manage sessions on the go
 
-Everything runs on your machine. Your phone connects directly over your local network — no data leaves your computer.
+Everything runs on your machine. In the default LAN mode, your phone connects directly to your machine (no third-party relay).
 
 ## Requirements
 
