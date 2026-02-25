@@ -50,6 +50,7 @@ npm-debug.log*
 # Guild (generated)
 .guild/exports/
 .guild/.archive/
+.guild/ops/evidence/
 masterreference
 .guild/handoff-workspace-feature.md
 
@@ -64,6 +65,7 @@ conductor/
 *.xcarchive/
 ExportOptions.plist
 packages/mobile-ios/build/
+packages/mobile-ios/build-sim/
 packages/mobile-ios/.build/
 
 # Agent cockpit (local dev)
