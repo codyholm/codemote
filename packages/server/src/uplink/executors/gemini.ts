@@ -261,11 +261,11 @@ export class GeminiExecutor extends BaseExecutor {
 		}
 
 		if (typeof value === "string") {
-			const text = value.trim();
+			const text = this.sanitizeAssistantText(value).trim();
 			if (!text) {
 				return false;
 			}
-			this.emitMessage(sessionId, "assistant", value, parentToolUseId);
+			this.emitMessage(sessionId, "assistant", text, parentToolUseId);
 			return true;
 		}
 
@@ -318,8 +318,11 @@ export class GeminiExecutor extends BaseExecutor {
 			this.asNonEmptyString(record["output_text"]) ??
 			this.asNonEmptyString(record["message"]);
 		if (directText) {
-			this.emitMessage(sessionId, "assistant", directText, resolvedParent);
-			emitted = true;
+			const sanitized = this.sanitizeAssistantText(directText).trim();
+			if (sanitized.length > 0) {
+				this.emitMessage(sessionId, "assistant", sanitized, resolvedParent);
+				emitted = true;
+			}
 		}
 
 		const nestedKeys: Array<keyof typeof record> = [
@@ -424,6 +427,13 @@ export class GeminiExecutor extends BaseExecutor {
 		} catch {
 			return String(value);
 		}
+	}
+
+	private sanitizeAssistantText(text: string): string {
+		return text
+			.replaceAll(/Loaded cached credentials\.\s*/gi, "")
+			.replaceAll(/Loading extension:[^\n]*(\n|$)/gi, "")
+			.replaceAll(/\n{3,}/g, "\n\n");
 	}
 
 	private generateToolCallId(): string {

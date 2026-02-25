@@ -175,6 +175,42 @@ printf '{\\n  "session_id": "mock-session-noisy",\\n  "response": "Noisy hello"\
 		activeSessionId = null;
 	});
 
+	it("strips Gemini startup noise from assistant response text", async () => {
+		const noisyResponsePath = join(testDir, "mock-gemini-noisy-response");
+		const noisyResponseScript = `#!/bin/bash
+set -euo pipefail
+printf '{\\n  "session_id": "mock-session-noise-response",\\n  "response": "GEMINI_SIM_TRYLoaded cached credentials.\\\\nLoading extension: conductor\\\\nLoading extension: nanobanana"\\n}\\n'
+`;
+		await writeFile(noisyResponsePath, noisyResponseScript);
+		await chmod(noisyResponsePath, 0o755);
+
+		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
+			geminiPath: noisyResponsePath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "gemini",
+			workspace: testDir,
+			initialPrompt: "clean-response",
+		});
+		activeSessionId = result.sessionId;
+
+		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
+		expect(messageEvents.length).toBeGreaterThan(0);
+
+		const combined = messageEvents
+			.map((event) => (event as { payload?: { content?: string } }).payload?.content ?? "")
+			.join("\n");
+		expect(combined).toContain("GEMINI_SIM_TRY");
+		expect(combined).not.toContain("Loaded cached credentials.");
+		expect(combined).not.toContain("Loading extension:");
+
+		activeSessionId = null;
+	});
+
 	it("sends follow-up input using captured runtime session id", async () => {
 		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
 			geminiPath: mockGeminiPath,
