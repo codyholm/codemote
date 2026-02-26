@@ -463,7 +463,7 @@ export function registerWebSocketRoutes(
 							mobileDeviceId: msg.deviceId,
 						}),
 					);
-					rooms.leave(msg.deviceId);
+					rooms.leave(msg.deviceId, ws);
 
 					ws.send(
 						JSON.stringify({

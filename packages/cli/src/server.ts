@@ -158,6 +158,18 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	} = config;
 	const remoteRelayTarget = normalizeRelayWsUrl(remoteRelayUrl);
 	const hostedEndpointTarget = normalizeRelayWsUrl(hostedEndpointUrl);
+	const remoteRelayProvided = Boolean(remoteRelayUrl?.trim());
+	const hostedEndpointProvided = Boolean(hostedEndpointUrl?.trim());
+	if (remoteRelayProvided && !remoteRelayTarget) {
+		throw new Error(
+			`[Server] Invalid remote relay URL "${remoteRelayUrl}". Expected ws:// or wss://`,
+		);
+	}
+	if (hostedEndpointProvided && !hostedEndpointTarget) {
+		throw new Error(
+			`[Server] Invalid hosted endpoint URL "${hostedEndpointUrl}". Expected ws:// or wss://`,
+		);
+	}
 	const localRelayEnabled = !remoteRelayTarget;
 
 	const tlsDisableRequested =
@@ -271,6 +283,15 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		await mkdir(dirname(statusFilePath), { recursive: true });
 		await writeFile(statusFilePath, `${JSON.stringify(statusState, null, 2)}\n`, "utf8");
 	};
+	const writeStatusSafely = (patch: Partial<typeof statusState>, context: string): void => {
+		void writeStatus(patch).catch((error) => {
+			console.warn(
+				`[Server] Failed to write status snapshot (${context}): ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		});
+	};
 
 	// Connect an uplink "device" to the relay and bridge messages to the uplink server
 	const bridgeRelayUrl = remoteRelayTarget ?? `${wsScheme}://127.0.0.1:${port}`;
@@ -285,21 +306,27 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		...(process.env["GUILD_REMOTE_DEBUG"] ? { log: (message) => console.log(message) } : {}),
 		onPairingCode: (pin) => {
 			currentPIN = pin;
-			void writeStatus({
-				pin,
-				relayUrl: bridgeRelayUrl,
-				...(relayTlsPin ? { tlsPin: relayTlsPin } : {}),
-			});
+			writeStatusSafely(
+				{
+					pin,
+					relayUrl: bridgeRelayUrl,
+					...(relayTlsPin ? { tlsPin: relayTlsPin } : {}),
+				},
+				"pairing_code",
+			);
 			onPINRegenerate?.(pin);
 		},
 		onMobilePaired: () => {
-			void writeStatus({ mobileConnected: true });
+			writeStatusSafely({ mobileConnected: true }, "mobile_paired");
 			onClientConnected?.();
 		},
 		onSessionStatus: (info) => {
-			void writeStatus({
-				lastSession: { ...info, updatedAt: new Date().toISOString() },
-			});
+			writeStatusSafely(
+				{
+					lastSession: { ...info, updatedAt: new Date().toISOString() },
+				},
+				"session_status",
+			);
 			onSessionStatus?.(info);
 		},
 	});

@@ -338,6 +338,24 @@ describe("Server Integration", () => {
 				await rm(fixtureDir, { recursive: true, force: true });
 			}
 		}, 15_000);
+
+		it("rejects invalid remote relay URLs", async () => {
+			await expect(
+				startServer({
+					port: testPort + 130,
+					remoteRelayUrl: "https://invalid-relay.example.com/ws",
+				}),
+			).rejects.toThrow(/Invalid remote relay URL/);
+		});
+
+		it("rejects invalid hosted endpoint URLs", async () => {
+			await expect(
+				startServer({
+					port: testPort + 131,
+					hostedEndpointUrl: "https://invalid-hosted.example.com/ws",
+				}),
+			).rejects.toThrow(/Invalid hosted endpoint URL/);
+		});
 	});
 });
 
