@@ -76,8 +76,8 @@ export async function startService(): Promise<void> {
 	const paths = resolveServicePaths();
 	switch (process.platform) {
 		case "darwin":
-			await runCommand("launchctl", ["load", "-w", paths.launchAgentPlist], { allowFailure: true });
-			await runCommand("launchctl", ["start", DARWIN_LABEL], { allowFailure: true });
+			await runLaunchctlCommand(["load", "-w", paths.launchAgentPlist], ["already loaded"]);
+			await runLaunchctlCommand(["start", DARWIN_LABEL], ["already running"]);
 			return;
 		case "linux":
 			await runCommand("systemctl", ["--user", "daemon-reload"], { allowFailure: true });
@@ -92,10 +92,19 @@ export async function stopService(): Promise<void> {
 	const paths = resolveServicePaths();
 	switch (process.platform) {
 		case "darwin":
-			await runCommand("launchctl", ["stop", DARWIN_LABEL], { allowFailure: true });
-			await runCommand("launchctl", ["unload", "-w", paths.launchAgentPlist], {
-				allowFailure: true,
-			});
+			await runLaunchctlCommand(
+				["stop", DARWIN_LABEL],
+				["no such process", "could not find service"],
+			);
+			await runLaunchctlCommand(
+				["unload", "-w", paths.launchAgentPlist],
+				[
+					"no such process",
+					"could not find service",
+					"could not find specified service",
+					"no such file",
+				],
+			);
 			return;
 		case "linux":
 			await runCommand("systemctl", ["--user", "stop", LINUX_UNIT], { allowFailure: true });
@@ -354,4 +363,26 @@ async function runCommand(
 			resolve(result);
 		});
 	});
+}
+
+async function runLaunchctlCommand(
+	args: string[],
+	benignFailureSnippets: string[] = [],
+): Promise<void> {
+	const result = await runCommand("launchctl", args, { allowFailure: true });
+	if (result.code === 0) {
+		return;
+	}
+
+	const output = `${result.stdout}\n${result.stderr}`.toLowerCase();
+	const benignFailure = benignFailureSnippets.some((snippet) =>
+		output.includes(snippet.toLowerCase()),
+	);
+	if (benignFailure) {
+		return;
+	}
+
+	throw new Error(
+		`Command failed (launchctl ${args.join(" ")}): ${result.stderr || result.stdout}`,
+	);
 }
