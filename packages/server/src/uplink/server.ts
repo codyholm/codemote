@@ -404,10 +404,10 @@ export class UplinkServer {
 				if (index >= items.length) {
 					return;
 				}
-				const item = items[index];
-				if (item === undefined) {
-					return;
+				if (!(index in items)) {
+					continue;
 				}
+				const item = items[index] as T;
 				results[index] = await handler(item, index);
 			}
 		});

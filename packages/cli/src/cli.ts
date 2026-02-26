@@ -94,9 +94,19 @@ async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 			: "Starting Codemote...",
 	);
 
+	// Keep advertised endpoint transport aligned with server-side TLS mode.
+	const tlsDisableRequested =
+		process.env["GUILD_REMOTE_DISABLE_TLS"] === "1" ||
+		process.env["GUILD_REMOTE_DISABLE_TLS"] === "true";
+	const allowInsecure =
+		process.env["GUILD_REMOTE_ALLOW_INSECURE"] === "1" ||
+		process.env["GUILD_REMOTE_ALLOW_INSECURE"] === "true";
+	const tlsDisabled =
+		tlsDisableRequested && allowInsecure && process.env["NODE_ENV"] !== "production";
+
 	// Start the server (relay + uplink + bridge)
 	const host = getLocalIP();
-	const localRelayUrl = `wss://${host}:${port}/ws`;
+	const localRelayUrl = `${tlsDisabled ? "ws" : "wss"}://${host}:${port}/ws`;
 	const server = await startServer({
 		port,
 		repoPath,
