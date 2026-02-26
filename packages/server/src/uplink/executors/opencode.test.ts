@@ -130,6 +130,15 @@ exit 0
 		);
 		expect(sessionManager.get(result.sessionId)?.runtimeSessionId).toBe("ses_mock_123");
 		expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
+		const statusEvents = events.filter(
+			(event) => (event as { type: string }).type === "session.status",
+		);
+		const statuses = statusEvents.map(
+			(event) => (event as { payload: { status: string } }).payload.status,
+		);
+		expect(statuses[0]).toBe("starting");
+		expect(statuses).toContain("running");
+		expect(statuses).toContain("idle");
 
 		const argsLog = await readFile(argsLogPath, "utf8");
 		expect(argsLog).toContain("run --format json initial-prompt");
@@ -196,6 +205,45 @@ exit 0
 		expect(toolResultPayload.payload.toolName).toBe("apply_patch");
 		expect(toolCallPayload.payload.arguments).toContain("patchText");
 		expect(toolResultPayload.payload.output).toContain("patched");
+	});
+
+	it("preserves parentToolUseId metadata when provided by OpenCode JSON events", async () => {
+		const parentMockPath = join(testDir, "mock-opencode-parent");
+		const parentScript = `#!/bin/bash
+set -euo pipefail
+printf '{"type":"text","sessionID":"ses_parent_123","part":{"type":"text","text":"nested text","parentToolUseId":"parent-opencode-1"}}\\n'
+printf '{"type":"tool_use","sessionID":"ses_parent_123","parent_tool_use_id":"parent-opencode-1","part":{"callID":"call_parent_1","tool":"read_file","state":{"status":"completed","input":{"path":"README.md"},"output":"ok"}}}\\n'
+`;
+		await writeFile(parentMockPath, parentScript);
+		await chmod(parentMockPath, 0o755);
+
+		activeExecutor = new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
+			opencodePath: parentMockPath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "opencode",
+			workspace: testDir,
+			initialPrompt: "parent",
+		});
+		activeSessionId = result.sessionId;
+
+		const message = events.find(
+			(event) => (event as { type: string }).type === "session.message",
+		) as { payload?: { parentToolUseId?: string } } | undefined;
+		const toolCall = events.find(
+			(event) => (event as { type: string }).type === "session.tool_call",
+		) as { payload?: { parentToolUseId?: string } } | undefined;
+		const toolResult = events.find(
+			(event) => (event as { type: string }).type === "session.tool_result",
+		) as { payload?: { parentToolUseId?: string } } | undefined;
+
+		expect(message?.payload?.parentToolUseId).toBe("parent-opencode-1");
+		expect(toolCall?.payload?.parentToolUseId).toBe("parent-opencode-1");
+		expect(toolResult?.payload?.parentToolUseId).toBe("parent-opencode-1");
 	});
 
 	it("forwards stderr as session.output and strips ANSI color codes", async () => {

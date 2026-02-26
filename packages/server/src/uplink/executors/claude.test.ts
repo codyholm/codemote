@@ -127,6 +127,11 @@ exit 0
 		// Should have status events
 		const statusEvents = events.filter((e) => (e as { type: string }).type === "session.status");
 		expect(statusEvents.length).toBeGreaterThan(0);
+		const statuses = statusEvents.map(
+			(event) => (event as { payload: { status: string } }).payload.status,
+		);
+		expect(statuses[0]).toBe("starting");
+		expect(statuses).toContain("running");
 
 		// Mark as cleaned up so afterEach doesn't try to stop again
 		activeSessionId = null;

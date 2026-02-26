@@ -73,9 +73,9 @@ export async function renderUI(state: UIState): Promise<void> {
 	if (status === "error" && errorMessage) {
 		statusText = chalk.red(`   ✗ Error: ${errorMessage}`);
 	} else if (status === "ready") {
-		statusText = chalk.green("   Advertising via Bonjour... Ready for connections");
+		statusText = chalk.green("   Advertising via Bonjour... Waiting for mobile connection...");
 	} else if (status === "connected") {
-		statusText = chalk.green("   ✓ Device connected");
+		statusText = chalk.green("   ✓ Device connected. Waiting for session...");
 	} else {
 		statusText = chalk.yellow("   Starting...");
 	}

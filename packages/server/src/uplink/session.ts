@@ -49,6 +49,12 @@ export class SessionManager {
 
 		if (status === "ended" || status === "error") {
 			session.endedAt = Date.now();
+			return;
+		}
+
+		// Session resumed after a terminal state.
+		if (session.endedAt !== null) {
+			session.endedAt = null;
 		}
 	}
 

@@ -117,6 +117,82 @@ describe("relay ws routes", () => {
 		expect(resumedMsg["uplinkDeviceId"]).toBe("uplink-test-1");
 	});
 
+	it("keeps resumed mobile connected after stale socket closes", async () => {
+		fixtureDir = await mkdtemp(join(tmpdir(), "relay-ws-test-"));
+		const storePath = join(fixtureDir, "trusted-pairings.json");
+		const relayPort = 21500 + Math.floor(Math.random() * 500);
+
+		relayServer = await createRelayServer({
+			port: relayPort,
+			host: "127.0.0.1",
+			pairingStorePath: storePath,
+		});
+		await relayServer.start();
+
+		const uplink = new WebSocket(`ws://127.0.0.1:${relayPort}/ws`);
+		openSockets.push(uplink);
+		await waitForOpen(uplink);
+		const registered = waitForMessageOfType(uplink, "registered");
+		uplink.send(
+			JSON.stringify({
+				type: "register",
+				deviceId: "uplink-test-reconnect",
+				deviceType: "uplink",
+			}),
+		);
+		const registeredMsg = await registered;
+		const pairingCode = registeredMsg["pin"] ?? registeredMsg["pairingCode"];
+		if (typeof pairingCode !== "string") {
+			throw new Error("expected pairing code");
+		}
+
+		const mobileOld = new WebSocket(`ws://127.0.0.1:${relayPort}/ws`);
+		openSockets.push(mobileOld);
+		await waitForOpen(mobileOld);
+		const paired = waitForMessageOfType(mobileOld, "paired");
+		mobileOld.send(
+			JSON.stringify({
+				type: "pair",
+				deviceId: "mobile-test-reconnect",
+				deviceType: "mobile",
+				pin: pairingCode,
+			}),
+		);
+		await paired;
+
+		const mobileNew = new WebSocket(`ws://127.0.0.1:${relayPort}/ws`);
+		openSockets.push(mobileNew);
+		await waitForOpen(mobileNew);
+		const resumed = waitForMessageOfType(mobileNew, "paired");
+		mobileNew.send(
+			JSON.stringify({
+				type: "resume",
+				deviceId: "mobile-test-reconnect",
+				deviceType: "mobile",
+				uplinkDeviceId: "uplink-test-reconnect",
+			}),
+		);
+		await resumed;
+
+		mobileOld.close();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		const forwarded = waitForMessageOfType(uplink, "message");
+		mobileNew.send(
+			JSON.stringify({
+				type: "message",
+				payload: {
+					type: "send_prompt",
+					sessionId: "sess-reconnect",
+					prompt: "still-connected",
+				},
+			}),
+		);
+		const forwardedMsg = await forwarded;
+		expect((forwardedMsg["payload"] as { type?: string }).type).toBe("send_prompt");
+		expect((forwardedMsg["payload"] as { prompt?: string }).prompt).toBe("still-connected");
+	});
+
 	it("unpair removes trust and future resume fails", async () => {
 		fixtureDir = await mkdtemp(join(tmpdir(), "relay-ws-test-"));
 		const storePath = join(fixtureDir, "trusted-pairings.json");
