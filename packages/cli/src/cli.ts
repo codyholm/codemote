@@ -36,7 +36,7 @@ import {
 import { ensureLocalTLS, fetchRelayTlsPin } from "./tls.js";
 import { renderUI, updateStatus } from "./ui.js";
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import readline from "node:readline";
@@ -49,6 +49,15 @@ const pkg = JSON.parse(readFileSync(resolve(__dirname, "../package.json"), "utf-
 const rawArgs = process.argv.slice(2);
 
 type StartupMode = "interactive" | "serve";
+
+function resolveServiceScriptPath(): string {
+	const workspaceScriptPath = resolve(process.cwd(), "packages/cli/dist/cli.js");
+	if (existsSync(workspaceScriptPath)) {
+		return workspaceScriptPath;
+	}
+
+	return fileURLToPath(import.meta.url);
+}
 
 function showHelp(): void {
 	console.log(`codemote v${pkg.version} — Control AI coding agents from your phone
@@ -356,7 +365,7 @@ async function runServiceSubcommand(args: string[]): Promise<void> {
 		throw new Error("Missing service action. Use: install|start|stop|status|uninstall|logs");
 	}
 
-	const scriptPath = resolve(process.argv[1] ?? "packages/cli/dist/cli.js");
+	const scriptPath = resolveServiceScriptPath();
 	const { remoteRelayUrl } = extractRemoteOption(args.slice(1));
 
 	switch (action) {

@@ -174,8 +174,22 @@ describe("relay ws routes", () => {
 		);
 		await resumed;
 
+		let staleDisconnectBroadcast = false;
+		const uplinkListener = (raw: Buffer) => {
+			try {
+				const msg = JSON.parse(raw.toString()) as { type?: string };
+				if (msg.type === "mobile_disconnected") {
+					staleDisconnectBroadcast = true;
+				}
+			} catch {
+				// Ignore malformed messages in this assertion helper.
+			}
+		};
+		uplink.on("message", uplinkListener);
+
 		mobileOld.close();
 		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(staleDisconnectBroadcast).toBe(false);
 
 		const forwarded = waitForMessageOfType(uplink, "message");
 		mobileNew.send(
@@ -191,6 +205,7 @@ describe("relay ws routes", () => {
 		const forwardedMsg = await forwarded;
 		expect((forwardedMsg["payload"] as { type?: string }).type).toBe("send_prompt");
 		expect((forwardedMsg["payload"] as { prompt?: string }).prompt).toBe("still-connected");
+		uplink.off("message", uplinkListener);
 	});
 
 	it("notifies uplink when a mobile socket disconnects", async () => {

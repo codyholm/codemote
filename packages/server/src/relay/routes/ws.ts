@@ -253,6 +253,14 @@ export function registerWebSocketRoutes(
 	// This enables resume-after-relaunch without storing or reusing a PIN.
 	const pairedMobilesByUplink = new Map<string, Set<string>>();
 
+	function isActiveDeviceSocket(deviceId: string, socket: WebSocket): boolean {
+		const roomId = rooms.getRoomId(deviceId);
+		if (!roomId) return false;
+		return rooms
+			.getMembers(roomId)
+			.some((member) => member.deviceId === deviceId && member.ws === socket);
+	}
+
 	function handleConnection(socket: WebSocket, clientIP: string): void {
 		let clientDeviceId: string | null = null;
 		let clientDeviceType: "mobile" | "uplink" | null = null;
@@ -270,7 +278,11 @@ export function registerWebSocketRoutes(
 
 		socket.on("close", () => {
 			if (clientDeviceId) {
-				if (clientDeviceType === "mobile" && connectedUplinkId) {
+				if (
+					clientDeviceType === "mobile" &&
+					connectedUplinkId &&
+					isActiveDeviceSocket(clientDeviceId, socket)
+				) {
 					rooms.broadcast(
 						clientDeviceId,
 						JSON.stringify({
