@@ -1070,7 +1070,8 @@ export async function startRelayUplinkBridge(
 	}
 
 	async function handleUplinkEvent(event: StreamEvent): Promise<void> {
-		if (mobileDeviceIds.size === 0) {
+		const hasConnectedMobiles = mobileDeviceIds.size > 0;
+		if (!hasConnectedMobiles && event.type !== "session.status") {
 			return;
 		}
 

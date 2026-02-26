@@ -1543,6 +1543,101 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
+	it("updates session status metadata even when no mobile is paired", async () => {
+		let statusEventSent = false;
+		const statusUpdates: Array<{
+			sessionId: string;
+			runtime: string;
+			status: string;
+		}> = [];
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] !== "list_sessions") {
+					return;
+				}
+
+				socket.send(
+					JSON.stringify({
+						type: "sessions",
+						payload: [
+							{
+								id: "sess-status-no-mobile",
+								runId: "run-status-no-mobile",
+								runtime: "codex",
+								status: "running",
+								workspace: {
+									id: "ws-status-no-mobile",
+									workingDir: tempRepoDir,
+									createdAt: Date.now(),
+								},
+								startedAt: Date.now(),
+								endedAt: null,
+								lastActivityAt: Date.now(),
+							},
+						],
+					}),
+				);
+				if (!statusEventSent) {
+					statusEventSent = true;
+					setTimeout(() => {
+						socket.send(
+							JSON.stringify({
+								type: "event",
+								payload: {
+									type: "session.status",
+									sessionId: "sess-status-no-mobile",
+									timestamp: Date.now(),
+									payload: {
+										status: "idle",
+									},
+								},
+							}),
+						);
+					}, 20);
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				if (message["type"] === "register") {
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "223344" }));
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+			onSessionStatus: (info) => {
+				statusUpdates.push({
+					sessionId: info.sessionId,
+					runtime: info.runtime,
+					status: info.status,
+				});
+			},
+		});
+
+		try {
+			await waitForCondition(
+				() =>
+					statusUpdates.some(
+						(update) =>
+							update.sessionId === "sess-status-no-mobile" &&
+							update.runtime === "codex" &&
+							update.status === "idle",
+					),
+				8000,
+			);
+		} finally {
+			await bridge.stop();
+		}
+	}, 20_000);
+
 	it("auto-resumes opencode sessions when creating a new session", async () => {
 		let startRunPayload: JsonRecord | null = null;
 
