@@ -255,6 +255,8 @@ export function registerWebSocketRoutes(
 
 	function handleConnection(socket: WebSocket, clientIP: string): void {
 		let clientDeviceId: string | null = null;
+		let clientDeviceType: "mobile" | "uplink" | null = null;
+		let connectedUplinkId: string | null = null;
 
 		socket.on("message", (data) => {
 			try {
@@ -268,6 +270,16 @@ export function registerWebSocketRoutes(
 
 		socket.on("close", () => {
 			if (clientDeviceId) {
+				if (clientDeviceType === "mobile" && connectedUplinkId) {
+					rooms.broadcast(
+						clientDeviceId,
+						JSON.stringify({
+							type: "mobile_disconnected",
+							uplinkDeviceId: connectedUplinkId,
+							mobileDeviceId: clientDeviceId,
+						}),
+					);
+				}
 				rooms.leave(clientDeviceId, socket);
 			}
 		});
@@ -294,6 +306,8 @@ export function registerWebSocketRoutes(
 					}
 
 					clientDeviceId = msg.deviceId;
+					clientDeviceType = "uplink";
+					connectedUplinkId = msg.deviceId;
 					const code = codes.create(msg.deviceId);
 
 					// Uplink room id == uplink device id.
@@ -348,6 +362,8 @@ export function registerWebSocketRoutes(
 					}
 
 					clientDeviceId = msg.deviceId;
+					clientDeviceType = "mobile";
+					connectedUplinkId = uplinkDeviceId;
 					const pairedSet = pairedMobilesByUplink.get(uplinkDeviceId) ?? new Set<string>();
 					pairedSet.add(msg.deviceId);
 					pairedMobilesByUplink.set(uplinkDeviceId, pairedSet);
@@ -414,6 +430,8 @@ export function registerWebSocketRoutes(
 					}
 
 					clientDeviceId = msg.deviceId;
+					clientDeviceType = "mobile";
+					connectedUplinkId = msg.uplinkDeviceId;
 					rooms.join(msg.uplinkDeviceId, {
 						ws,
 						deviceId: msg.deviceId,
@@ -464,6 +482,8 @@ export function registerWebSocketRoutes(
 						}),
 					);
 					rooms.leave(msg.deviceId, ws);
+					clientDeviceType = null;
+					connectedUplinkId = null;
 
 					ws.send(
 						JSON.stringify({

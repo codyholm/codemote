@@ -282,6 +282,71 @@ describe("Server Integration", () => {
 			}
 		});
 
+		it("resets mobileConnected in status snapshots after mobile disconnect", async () => {
+			const prevDisable = process.env["GUILD_REMOTE_DISABLE_TLS"];
+			const prevAllow = process.env["GUILD_REMOTE_ALLOW_INSECURE"];
+			process.env["GUILD_REMOTE_DISABLE_TLS"] = "1";
+			process.env["GUILD_REMOTE_ALLOW_INSECURE"] = "1";
+
+			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-status-disconnect-"));
+			const statusFilePath = join(fixtureDir, "server-status.json");
+			try {
+				server = await startServer({
+					port: testPort + 111,
+					statusFilePath,
+					advertisedRelayUrl: `ws://127.0.0.1:${testPort + 111}/ws`,
+				});
+
+				const mobileWs = new WebSocket(`ws://127.0.0.1:${testPort + 111}/ws`);
+				await waitForOpen(mobileWs);
+				const paired = waitForMessageOfType(mobileWs, "paired");
+				mobileWs.send(
+					JSON.stringify({
+						type: "pair",
+						deviceId: "mobile-status-disconnect",
+						pin: server.pin,
+						deviceType: "mobile",
+					}),
+				);
+				await paired;
+
+				await waitForCondition(async () => {
+					try {
+						const snapshot = JSON.parse(await readFile(statusFilePath, "utf8")) as {
+							mobileConnected?: boolean;
+						};
+						return snapshot.mobileConnected === true;
+					} catch {
+						return false;
+					}
+				}, 8_000);
+
+				mobileWs.close();
+				await waitForCondition(async () => {
+					try {
+						const snapshot = JSON.parse(await readFile(statusFilePath, "utf8")) as {
+							mobileConnected?: boolean;
+						};
+						return snapshot.mobileConnected === false;
+					} catch {
+						return false;
+					}
+				}, 8_000);
+			} finally {
+				await rm(fixtureDir, { recursive: true, force: true });
+				if (prevDisable === undefined) {
+					Reflect.deleteProperty(process.env, "GUILD_REMOTE_DISABLE_TLS");
+				} else {
+					process.env["GUILD_REMOTE_DISABLE_TLS"] = prevDisable;
+				}
+				if (prevAllow === undefined) {
+					Reflect.deleteProperty(process.env, "GUILD_REMOTE_ALLOW_INSECURE");
+				} else {
+					process.env["GUILD_REMOTE_ALLOW_INSECURE"] = prevAllow;
+				}
+			}
+		}, 15_000);
+
 		it("supports remote relay mode with status metadata", async () => {
 			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-remote-status-"));
 			const statusFilePath = join(fixtureDir, "server-status.json");

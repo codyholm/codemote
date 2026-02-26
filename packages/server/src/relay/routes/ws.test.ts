@@ -193,6 +193,57 @@ describe("relay ws routes", () => {
 		expect((forwardedMsg["payload"] as { prompt?: string }).prompt).toBe("still-connected");
 	});
 
+	it("notifies uplink when a mobile socket disconnects", async () => {
+		fixtureDir = await mkdtemp(join(tmpdir(), "relay-ws-test-"));
+		const storePath = join(fixtureDir, "trusted-pairings.json");
+		const relayPort = 20900 + Math.floor(Math.random() * 500);
+
+		relayServer = await createRelayServer({
+			port: relayPort,
+			host: "127.0.0.1",
+			pairingStorePath: storePath,
+		});
+		await relayServer.start();
+
+		const uplink = new WebSocket(`ws://127.0.0.1:${relayPort}/ws`);
+		openSockets.push(uplink);
+		await waitForOpen(uplink);
+		const registered = waitForMessageOfType(uplink, "registered");
+		uplink.send(
+			JSON.stringify({
+				type: "register",
+				deviceId: "uplink-test-disconnect",
+				deviceType: "uplink",
+			}),
+		);
+		const registeredMsg = await registered;
+		const pairingCode = registeredMsg["pin"] ?? registeredMsg["pairingCode"];
+		if (typeof pairingCode !== "string") {
+			throw new Error("expected pairing code");
+		}
+
+		const mobile = new WebSocket(`ws://127.0.0.1:${relayPort}/ws`);
+		openSockets.push(mobile);
+		await waitForOpen(mobile);
+		const paired = waitForMessageOfType(mobile, "paired");
+		mobile.send(
+			JSON.stringify({
+				type: "pair",
+				deviceId: "mobile-test-disconnect",
+				deviceType: "mobile",
+				pin: pairingCode,
+			}),
+		);
+		await paired;
+		await waitForMessageOfType(uplink, "paired");
+
+		const disconnected = waitForMessageOfType(uplink, "mobile_disconnected");
+		mobile.close();
+		const disconnectedMsg = await disconnected;
+		expect(disconnectedMsg["uplinkDeviceId"]).toBe("uplink-test-disconnect");
+		expect(disconnectedMsg["mobileDeviceId"]).toBe("mobile-test-disconnect");
+	});
+
 	it("unpair removes trust and future resume fails", async () => {
 		fixtureDir = await mkdtemp(join(tmpdir(), "relay-ws-test-"));
 		const storePath = join(fixtureDir, "trusted-pairings.json");

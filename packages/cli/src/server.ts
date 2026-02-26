@@ -323,6 +323,9 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 			writeStatusSafely({ mobileConnected: true }, "mobile_paired");
 			onClientConnected?.();
 		},
+		onMobileDisconnected: () => {
+			writeStatusSafely({ mobileConnected: false }, "mobile_disconnected");
+		},
 		onSessionStatus: (info) => {
 			writeStatusSafely(
 				{
@@ -342,6 +345,66 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		...(relayTlsPin ? { tlsPin: relayTlsPin } : {}),
 	});
 
+	const fetchLocalRelayStats = async (): Promise<{
+		rooms: number;
+		connections: number;
+		version: string;
+	}> =>
+		new Promise((resolve, reject) => {
+			const request = (tlsDisabled ? http : https).request(
+				{
+					method: "GET",
+					host: "localhost",
+					port,
+					path: "/health",
+					...(relayCertPem ? { ca: relayCertPem, servername: "localhost" } : {}),
+				},
+				(res) => {
+					if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+						reject(new Error(`Health check failed: ${res.statusCode ?? "unknown"}`));
+						return;
+					}
+
+					let body = "";
+					res.setEncoding("utf8");
+					res.on("data", (chunk) => {
+						body += chunk;
+					});
+					res.on("end", () => {
+						try {
+							const parsed = JSON.parse(body) as {
+								rooms: number;
+								connections: number;
+								version: string;
+							};
+							resolve(parsed);
+						} catch (err) {
+							reject(err instanceof Error ? err : new Error(String(err)));
+						}
+					});
+				},
+			);
+			request.on("error", (err) => reject(err));
+			request.end();
+		});
+
+	const mobileConnectionPoll =
+		localRelayEnabled && statusFilePath
+			? setInterval(() => {
+					void fetchLocalRelayStats()
+						.then((stats) => {
+							const mobileConnected = stats.connections > 1;
+							if (statusState.mobileConnected !== mobileConnected) {
+								writeStatusSafely({ mobileConnected }, "mobile_connection_poll");
+							}
+						})
+						.catch(() => {
+							// Ignore transient local relay health failures.
+						});
+				}, 1000)
+			: null;
+	mobileConnectionPoll?.unref?.();
+
 	console.log("[Server] Pairing PIN ready (redacted)");
 
 	return {
@@ -360,6 +423,9 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 		async stop() {
 			console.log("[Server] Stopping servers...");
+			if (mobileConnectionPoll) {
+				clearInterval(mobileConnectionPoll);
+			}
 			await bridge.stop();
 			await Promise.all([relay?.stop(), uplink.stop()]);
 			await writeStatus({ running: false, stoppedAt: new Date().toISOString() });
@@ -376,47 +442,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 			}
 
 			try {
-				const data = await new Promise<{
-					rooms: number;
-					connections: number;
-					version: string;
-				}>((resolve, reject) => {
-					const request = (tlsDisabled ? http : https).request(
-						{
-							method: "GET",
-							host: "localhost",
-							port,
-							path: "/health",
-							...(relayCertPem ? { ca: relayCertPem, servername: "localhost" } : {}),
-						},
-						(res) => {
-							if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-								reject(new Error(`Health check failed: ${res.statusCode ?? "unknown"}`));
-								return;
-							}
-
-							let body = "";
-							res.setEncoding("utf8");
-							res.on("data", (chunk) => {
-								body += chunk;
-							});
-							res.on("end", () => {
-								try {
-									const parsed = JSON.parse(body) as {
-										rooms: number;
-										connections: number;
-										version: string;
-									};
-									resolve(parsed);
-								} catch (err) {
-									reject(err instanceof Error ? err : new Error(String(err)));
-								}
-							});
-						},
-					);
-					request.on("error", (err) => reject(err));
-					request.end();
-				});
+				const data = await fetchLocalRelayStats();
 				return {
 					rooms: data.rooms,
 					connections: data.connections,
