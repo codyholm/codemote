@@ -441,11 +441,12 @@ export class GeminiExecutor extends BaseExecutor {
 	}
 
 	private emitBufferedOutput(sessionId: string, text: string): void {
-		const trimmed = text.trim();
+		const sanitized = this.sanitizeAssistantText(text);
+		const trimmed = sanitized.trim();
 		if (trimmed.length === 0) {
 			return;
 		}
-		this.emitOutput(sessionId, text.endsWith("\n") ? text : `${text}\n`);
+		this.emitOutput(sessionId, sanitized.endsWith("\n") ? sanitized : `${sanitized}\n`);
 	}
 
 	private buildPromptArgs(

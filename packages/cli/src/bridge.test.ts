@@ -588,10 +588,144 @@ describe("RelayUplinkBridge", () => {
 			const sessions = latestSessionList?.["sessions"];
 			expect(Array.isArray(sessions)).toBe(true);
 			expect(
+				(sessions as Array<JsonRecord>).some((session) => session["id"] === "missing-session-1"),
+			).toBe(false);
+		} finally {
+			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+				mobileSocket.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
+	it("does not synthesize an opencode session when status arrives for an unknown session id", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+		let uplinkSocket: WebSocket | null = null;
+
+		uplinkWss.on("connection", (socket) => {
+			uplinkSocket = socket;
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(
+						JSON.stringify({
+							type: "sessions",
+							payload: [],
+						}),
+					);
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "323232" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					socket.send(
+						JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-test-unknown-status" }),
+					);
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: "mobile-test-unknown-status",
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				} else if (socket === relayUplinkSocket) {
+					relayMobileSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			const payloads: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				payloads.push(payload);
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-test-unknown-status",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(
+				() => payloads.some((payload) => payload["type"] === "session_list"),
+				8000,
+			);
+
+			const connectedUplinkSocket = uplinkSocket as WebSocket | null;
+			if (connectedUplinkSocket === null) {
+				throw new Error("Expected uplink socket for unknown status test");
+			}
+
+			connectedUplinkSocket.send(
+				JSON.stringify({
+					type: "event",
+					payload: {
+						type: "session.status",
+						timestamp: Date.now(),
+						sessionId: "sess-unknown-status-1",
+						payload: {
+							status: "error",
+						},
+					},
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					payloads.some(
+						(payload) =>
+							payload["type"] === "session_status" &&
+							payload["sessionId"] === "sess-unknown-status-1" &&
+							payload["status"] === "error",
+					),
+				8000,
+			);
+
+			const latestSessionList = [...payloads]
+				.reverse()
+				.find((payload) => payload["type"] === "session_list");
+			const sessions = latestSessionList?.["sessions"];
+			expect(Array.isArray(sessions)).toBe(true);
+			expect(
 				(sessions as Array<JsonRecord>).some(
-					(session) => session["id"] === "missing-session-1" && session["status"] === "error",
+					(session) => session["id"] === "sess-unknown-status-1",
 				),
-			).toBe(true);
+			).toBe(false);
 		} finally {
 			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
 				mobileSocket.close();

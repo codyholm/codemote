@@ -784,25 +784,44 @@ export async function startRelayUplinkBridge(
 		return error instanceof Error ? error.message : String(error);
 	}
 
-	function ensureErrorSession(sessionId: string): void {
+	async function hydrateSessionFromUplink(sessionId: string): Promise<SessionInfo | undefined> {
 		const existing = sessions.get(sessionId);
 		if (existing) {
-			existing.status = "error";
-			return;
+			return existing;
 		}
-
-		sessions.set(sessionId, {
-			id: sessionId,
-			runtime: "opencode",
-			status: "error",
-			createdAt: Date.now(),
-		});
+		try {
+			const response = await uplinkClient.listSessions();
+			if (response.type !== "sessions") {
+				return undefined;
+			}
+			const fromUplink = response.payload.find((session) => session.id === sessionId);
+			if (!fromUplink) {
+				return undefined;
+			}
+			const hydrated = toSessionInfo(fromUplink);
+			sessions.set(sessionId, hydrated);
+			return hydrated;
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to hydrate session ${sessionId} metadata: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+			return undefined;
+		}
 	}
 
-	function notifySessionCommandFailure(sessionId: string, action: string, error: unknown): void {
+	async function notifySessionCommandFailure(
+		sessionId: string,
+		action: string,
+		error: unknown,
+	): Promise<void> {
 		const message = errorMessage(error);
 		log?.(`[Bridge] ${action} failed for session ${sessionId}: ${message}`);
-		ensureErrorSession(sessionId);
+		const hydrated = await hydrateSessionFromUplink(sessionId);
+		if (hydrated) {
+			hydrated.status = "error";
+		}
 		sendToMobile({
 			type: "session_status",
 			sessionId,
@@ -813,14 +832,16 @@ export async function startRelayUplinkBridge(
 			sessionId,
 			text: `${action} failed. ${message}`,
 		});
-		sendSessionList();
+		if (hydrated) {
+			sendSessionList();
+		}
 	}
 
 	async function handleSendPrompt(message: SendPromptMessage): Promise<void> {
 		try {
 			await uplinkClient.sendInput(message.sessionId, message.prompt);
 		} catch (error) {
-			notifySessionCommandFailure(message.sessionId, "Send prompt", error);
+			await notifySessionCommandFailure(message.sessionId, "Send prompt", error);
 		}
 	}
 
@@ -828,7 +849,7 @@ export async function startRelayUplinkBridge(
 		try {
 			await uplinkClient.stopSession(message.sessionId);
 		} catch (error) {
-			notifySessionCommandFailure(message.sessionId, "Stop session", error);
+			await notifySessionCommandFailure(message.sessionId, "Stop session", error);
 		}
 	}
 
@@ -999,7 +1020,7 @@ export async function startRelayUplinkBridge(
 				bypassQueue: true,
 			});
 		} catch (error) {
-			notifySessionCommandFailure(pending.sessionId, "Approval response", error);
+			await notifySessionCommandFailure(pending.sessionId, "Approval response", error);
 		}
 	}
 
@@ -1080,16 +1101,14 @@ export async function startRelayUplinkBridge(
 			case "session.status": {
 				const payload = event.payload as { status?: SessionStatus };
 				const status = payload.status ?? "running";
-				const session = sessions.get(event.sessionId);
+				const session =
+					(await hydrateSessionFromUplink(event.sessionId)) ?? sessions.get(event.sessionId);
 				if (session) {
 					session.status = status;
 				} else {
-					sessions.set(event.sessionId, {
-						id: event.sessionId,
-						runtime: "opencode",
-						status,
-						createdAt: Date.now(),
-					});
+					log?.(
+						`[Bridge] Received session.status for unknown session ${event.sessionId}; skipping synthetic session creation`,
+					);
 				}
 
 				sendToMobile({
@@ -1097,14 +1116,16 @@ export async function startRelayUplinkBridge(
 					sessionId: event.sessionId,
 					status,
 				});
-				const runtime = sessions.get(event.sessionId)?.runtime ?? "opencode";
-				onSessionStatus?.({
-					sessionId: event.sessionId,
-					runtime,
-					status,
-				});
-				await syncSessionRuntimeMetadata(event.sessionId);
-				sendSessionList();
+				const runtime = sessions.get(event.sessionId)?.runtime;
+				if (runtime) {
+					onSessionStatus?.({
+						sessionId: event.sessionId,
+						runtime,
+						status,
+					});
+					await syncSessionRuntimeMetadata(event.sessionId);
+					sendSessionList();
+				}
 				return;
 			}
 			case "attention.required": {

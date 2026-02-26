@@ -211,6 +211,45 @@ printf '{\\n  "session_id": "mock-session-noise-response",\\n  "response": "GEMI
 		activeSessionId = null;
 	});
 
+	it("strips Gemini startup noise from fallback session.output text", async () => {
+		const fallbackNoisePath = join(testDir, "mock-gemini-fallback-noise");
+		const fallbackNoiseScript = `#!/bin/bash
+set -euo pipefail
+printf 'Loaded cached credentials.\\n'
+printf 'Loading extension: conductor\\n'
+printf 'Loading extension: nanobanana\\n'
+printf 'GEMINI_FALLBACK_TRY\\n'
+`;
+		await writeFile(fallbackNoisePath, fallbackNoiseScript);
+		await chmod(fallbackNoisePath, 0o755);
+
+		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
+			geminiPath: fallbackNoisePath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "gemini",
+			workspace: testDir,
+			initialPrompt: "fallback-noise",
+		});
+		activeSessionId = result.sessionId;
+
+		const outputEvents = events.filter((e) => (e as { type: string }).type === "session.output");
+		expect(outputEvents.length).toBeGreaterThan(0);
+
+		const combined = outputEvents
+			.map((event) => (event as { payload?: { text?: string } }).payload?.text ?? "")
+			.join("\n");
+		expect(combined).toContain("GEMINI_FALLBACK_TRY");
+		expect(combined).not.toContain("Loaded cached credentials.");
+		expect(combined).not.toContain("Loading extension:");
+
+		activeSessionId = null;
+	});
+
 	it("sends follow-up input using captured runtime session id", async () => {
 		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
 			geminiPath: mockGeminiPath,
