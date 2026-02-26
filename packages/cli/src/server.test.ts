@@ -249,12 +249,15 @@ describe("Server Integration", () => {
 							running?: boolean;
 							mode?: string;
 							pin?: string;
+							tlsPin?: string;
 						};
 						return (
 							parsed.running === true &&
 							parsed.mode === "local" &&
 							typeof parsed.pin === "string" &&
-							parsed.pin.length === 6
+							parsed.pin.length === 6 &&
+							typeof parsed.tlsPin === "string" &&
+							parsed.tlsPin.length === 64
 						);
 					} catch {
 						return false;

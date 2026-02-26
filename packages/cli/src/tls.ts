@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import tls from "node:tls";
 import selfsigned from "selfsigned";
 
 export type LocalTLSInfo = {
@@ -27,9 +28,66 @@ function defaultTLSDir(): string {
 	return path.join(os.homedir(), ".codemote", "tls");
 }
 
+function tlsPinFromDer(derBytes: Buffer): string {
+	return crypto.createHash("sha256").update(derBytes).digest("hex");
+}
+
 function tlsPinFromCertPEM(certPem: string): string {
 	const leaf = new crypto.X509Certificate(certPem);
-	return crypto.createHash("sha256").update(leaf.raw).digest("hex");
+	return tlsPinFromDer(leaf.raw);
+}
+
+/**
+ * Fetch the active leaf certificate pin from a remote WSS relay.
+ *
+ * Intended for embedding a trust pin into QR/deep links when running against
+ * a hosted relay endpoint.
+ */
+export async function fetchRelayTlsPin(relayUrl: string, timeoutMs = 5_000): Promise<string> {
+	const parsed = new URL(relayUrl);
+	if (parsed.protocol.toLowerCase() !== "wss:") {
+		throw new Error("Relay URL must use wss:// to derive a TLS pin");
+	}
+	const port = parsed.port ? Number.parseInt(parsed.port, 10) : 443;
+	if (!Number.isFinite(port) || port < 1 || port > 65_535) {
+		throw new Error(`Invalid relay port in URL: ${relayUrl}`);
+	}
+
+	return await new Promise<string>((resolve, reject) => {
+		let settled = false;
+		const finish = (result: string): void => {
+			if (settled) return;
+			settled = true;
+			socket.end();
+			resolve(result);
+		};
+		const fail = (error: unknown): void => {
+			if (settled) return;
+			settled = true;
+			socket.destroy();
+			reject(error);
+		};
+		const socket = tls.connect(
+			{
+				host: parsed.hostname,
+				port,
+				servername: parsed.hostname,
+				rejectUnauthorized: false,
+			},
+			() => {
+				const cert = socket.getPeerCertificate(true) as { raw?: Buffer };
+				if (!cert.raw) {
+					fail(new Error(`No peer certificate presented by relay ${relayUrl}`));
+					return;
+				}
+				finish(tlsPinFromDer(cert.raw));
+			},
+		);
+		socket.setTimeout(timeoutMs, () => {
+			fail(new Error(`Timed out retrieving relay certificate from ${relayUrl}`));
+		});
+		socket.on("error", fail);
+	});
 }
 
 /**

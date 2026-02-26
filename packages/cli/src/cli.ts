@@ -33,7 +33,7 @@ import {
 	stopService,
 	uninstallService,
 } from "./service.js";
-import { ensureLocalTLS } from "./tls.js";
+import { ensureLocalTLS, fetchRelayTlsPin } from "./tls.js";
 import { renderUI, updateStatus } from "./ui.js";
 
 import { readFileSync } from "node:fs";
@@ -151,13 +151,29 @@ async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 
 	if (mode === "interactive") {
 		let tlsPin: string | undefined;
-		if (localMode && relayScheme === "wss") {
-			tlsPin = (await ensureLocalTLS()).tlsPin;
+		if (relayScheme === "wss") {
+			if (localMode) {
+				tlsPin = (await ensureLocalTLS()).tlsPin;
+			} else {
+				try {
+					tlsPin = await fetchRelayTlsPin(relayUrl);
+				} catch (error) {
+					console.warn(
+						`[CLI] Unable to derive relay TLS pin for QR pairing: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+					);
+				}
+			}
 		}
 
+		const pairingHostPort = resolvePairingHostPort(relayUrl, host, port);
 		const pairingURL = tlsPin
-			? buildPairingURL(host, port, server.pin, { tlsPin, relayUrl })
-			: buildPairingURL(host, port, server.pin);
+			? buildPairingURL(pairingHostPort.host, pairingHostPort.port, server.pin, {
+					tlsPin,
+					relayUrl,
+				})
+			: buildPairingURL(pairingHostPort.host, pairingHostPort.port, server.pin);
 		const qrCode = await generateQRCode(pairingURL);
 
 		await renderUI({
@@ -451,4 +467,31 @@ function formatRuntimeLabel(runtime: RuntimeType): string {
 		case "gemini":
 			return "Gemini";
 	}
+}
+
+function resolvePairingHostPort(
+	relayUrl: string,
+	fallbackHost: string,
+	fallbackPort: number,
+): { host: string; port: number } {
+	try {
+		const parsed = new URL(relayUrl);
+		const parsedPort = Number.parseInt(
+			parsed.port || (parsed.protocol === "wss:" ? "443" : "80"),
+			10,
+		);
+		if (parsed.hostname && Number.isFinite(parsedPort) && parsedPort >= 1 && parsedPort <= 65_535) {
+			return {
+				host: parsed.hostname,
+				port: parsedPort,
+			};
+		}
+	} catch {
+		// Fall back to local host/port when relay URL cannot be parsed.
+	}
+
+	return {
+		host: fallbackHost,
+		port: fallbackPort,
+	};
 }

@@ -46,7 +46,7 @@ import {
 	createRelayServer,
 } from "@codemote/server";
 import { startRelayUplinkBridge } from "./bridge.js";
-import { ensureLocalTLS } from "./tls.js";
+import { ensureLocalTLS, fetchRelayTlsPin } from "./tls.js";
 
 export interface ServerConfig {
 	/** Port for the relay server */
@@ -179,6 +179,18 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	let currentPIN = "";
 	const tlsInfo = localRelayEnabled && !tlsDisabled ? await ensureLocalTLS() : undefined;
 	const relayCertPem = tlsInfo ? await readFile(tlsInfo.certPath) : undefined;
+	let relayTlsPin = tlsInfo?.tlsPin;
+	if (!localRelayEnabled && remoteRelayTarget?.startsWith("wss://")) {
+		try {
+			relayTlsPin = await fetchRelayTlsPin(remoteRelayTarget);
+		} catch (error) {
+			console.warn(
+				`[Server] Unable to derive hosted relay TLS pin: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
 	if (tlsInfo) {
 		const daysRemaining = Math.floor((tlsInfo.certValidToMs - Date.now()) / (24 * 60 * 60 * 1000));
 		if (tlsInfo.status === "regenerated") {
@@ -233,6 +245,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		pin: string;
 		uplinkDeviceId?: string;
 		relayUrl?: string;
+		tlsPin?: string;
 		mobileConnected: boolean;
 		lastSession?: {
 			sessionId: string;
@@ -246,6 +259,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		mode: localRelayEnabled ? "local" : "remote",
 		startedAt: new Date().toISOString(),
 		pin: "",
+		...(relayTlsPin ? { tlsPin: relayTlsPin } : {}),
 		mobileConnected: false,
 	};
 
@@ -274,6 +288,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 			void writeStatus({
 				pin,
 				relayUrl: bridgeRelayUrl,
+				...(relayTlsPin ? { tlsPin: relayTlsPin } : {}),
 			});
 			onPINRegenerate?.(pin);
 		},
@@ -294,6 +309,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		pin: currentPIN,
 		uplinkDeviceId: bridge.uplinkDeviceId,
 		relayUrl: bridgeRelayUrl,
+		...(relayTlsPin ? { tlsPin: relayTlsPin } : {}),
 	});
 
 	console.log("[Server] Pairing PIN ready (redacted)");
