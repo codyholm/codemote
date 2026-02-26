@@ -641,7 +641,7 @@ export async function startRelayUplinkBridge(
 	const sessions = new Map<string, SessionInfo>();
 	const approvalRequests = new Map<string, { sessionId: string }>();
 	const replayGuard = new ReplayGuard();
-	let mobileDeviceId: string | null = null;
+	const mobileDeviceIds = new Set<string>();
 	let pairingCode = "";
 
 	const relayWs = relayWsOptions
@@ -668,11 +668,29 @@ export async function startRelayUplinkBridge(
 		});
 	});
 
-	relayWs.on("close", () => {
-		if (mobileDeviceId) {
-			mobileDeviceId = null;
+	function markMobilePaired(deviceId: string): void {
+		const hadAny = mobileDeviceIds.size > 0;
+		mobileDeviceIds.add(deviceId);
+		if (!hadAny) {
+			onMobilePaired?.();
+		}
+	}
+
+	function markMobileDisconnected(deviceId?: string): void {
+		const hadAny = mobileDeviceIds.size > 0;
+		if (!hadAny) return;
+		if (deviceId) {
+			mobileDeviceIds.delete(deviceId);
+		} else {
+			mobileDeviceIds.clear();
+		}
+		if (hadAny && mobileDeviceIds.size === 0) {
 			onMobileDisconnected?.();
 		}
+	}
+
+	relayWs.on("close", () => {
+		markMobileDisconnected();
 		log?.("[Bridge] Relay WebSocket closed");
 	});
 
@@ -715,8 +733,7 @@ export async function startRelayUplinkBridge(
 
 			case "paired":
 				if (relayMessage.mobileDeviceId) {
-					mobileDeviceId = relayMessage.mobileDeviceId;
-					onMobilePaired?.();
+					markMobilePaired(relayMessage.mobileDeviceId);
 					log?.("[Bridge] Mobile paired");
 					await syncSessionsFromUplink();
 					sendSessionList();
@@ -726,14 +743,7 @@ export async function startRelayUplinkBridge(
 
 			case "unpaired":
 			case "mobile_disconnected":
-				if (relayMessage.mobileDeviceId && relayMessage.mobileDeviceId !== mobileDeviceId) {
-					return;
-				}
-				if (!mobileDeviceId) {
-					return;
-				}
-				mobileDeviceId = null;
-				onMobileDisconnected?.();
+				markMobileDisconnected(relayMessage.mobileDeviceId);
 				log?.(
 					relayMessage.type === "unpaired"
 						? "[Bridge] Mobile unpaired"
@@ -1060,7 +1070,7 @@ export async function startRelayUplinkBridge(
 	}
 
 	async function handleUplinkEvent(event: StreamEvent): Promise<void> {
-		if (!mobileDeviceId) {
+		if (mobileDeviceIds.size === 0) {
 			return;
 		}
 
@@ -1370,14 +1380,14 @@ export async function startRelayUplinkBridge(
 	function sendSessionList(): void {
 		const sessionsList = Array.from(sessions.values()).sort((a, b) => b.createdAt - a.createdAt);
 		log?.(
-			`[Bridge] sendSessionList: ${sessionsList.length} sessions, mobileDeviceId=${mobileDeviceId ? "set" : "null"}`,
+			`[Bridge] sendSessionList: ${sessionsList.length} sessions, mobileCount=${mobileDeviceIds.size}`,
 		);
 		sendToMobile({ type: "session_list", sessions: sessionsList });
 	}
 
 	function sendToMobile(message: MobileOutboundMessage): void {
-		if (!mobileDeviceId) {
-			log?.(`[Bridge] sendToMobile: skipped (no mobileDeviceId), type=${message.type}`);
+		if (mobileDeviceIds.size === 0) {
+			log?.(`[Bridge] sendToMobile: skipped (no paired mobiles), type=${message.type}`);
 			return;
 		}
 

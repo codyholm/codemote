@@ -1368,6 +1368,181 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
+	it("continues forwarding to remaining mobile when one paired mobile disconnects", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		const relayMobileSockets = new Map<string, WebSocket>();
+		const socketToDeviceId = new Map<WebSocket, string>();
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+					return;
+				}
+
+				if (command["type"] === "send_input") {
+					const payload = (command["payload"] as JsonRecord | undefined) ?? {};
+					const sessionId = String(payload["sessionId"] ?? "sess-multi-1");
+					socket.send(
+						JSON.stringify({
+							type: "input_sent",
+							payload: { sessionId },
+						}),
+					);
+					socket.send(
+						JSON.stringify({
+							type: "event",
+							payload: {
+								type: "session.message",
+								sessionId,
+								timestamp: Date.now(),
+								payload: {
+									role: "assistant",
+									content: "still-forwarding",
+								},
+							},
+						}),
+					);
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "112233" }));
+					return;
+				}
+
+				if (type === "pair") {
+					const mobileId = String(message["deviceId"] ?? "");
+					if (!mobileId) return;
+					relayMobileSockets.set(mobileId, socket);
+					socketToDeviceId.set(socket, mobileId);
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-multi-1" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: mobileId,
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayUplinkSocket) {
+					for (const mobileSocket of relayMobileSockets.values()) {
+						if (mobileSocket.readyState === WebSocket.OPEN) {
+							mobileSocket.send(raw.toString());
+						}
+					}
+					return;
+				}
+
+				relayUplinkSocket?.send(raw.toString());
+			});
+
+			socket.on("close", () => {
+				const mobileId = socketToDeviceId.get(socket);
+				if (!mobileId) return;
+				socketToDeviceId.delete(socket);
+				relayMobileSockets.delete(mobileId);
+				relayUplinkSocket?.send(
+					JSON.stringify({
+						type: "mobile_disconnected",
+						uplinkDeviceId: "uplink-multi-1",
+						mobileDeviceId: mobileId,
+					}),
+				);
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+
+		let mobileFirst: WebSocket | null = null;
+		let mobileSecond: WebSocket | null = null;
+		try {
+			const firstPayloads: JsonRecord[] = [];
+			mobileFirst = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileFirst);
+			mobileFirst.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				firstPayloads.push(payload);
+			});
+
+			mobileSecond = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSecond);
+
+			mobileFirst.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-first",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+			mobileSecond.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-second",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(() => relayMobileSockets.size === 2, 8000);
+			await waitForCondition(
+				() => firstPayloads.some((payload) => payload["type"] === "session_list"),
+				8000,
+			);
+
+			mobileSecond.close();
+			await waitForCondition(() => relayMobileSockets.size === 1, 8000);
+
+			mobileFirst.send(
+				JSON.stringify({
+					type: "message",
+					payload: {
+						type: "send_prompt",
+						sessionId: "sess-multi-1",
+						prompt: "ping",
+					},
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					firstPayloads.some(
+						(payload) =>
+							payload["type"] === "session_message" &&
+							payload["sessionId"] === "sess-multi-1" &&
+							payload["content"] === "still-forwarding",
+					),
+				8000,
+			);
+		} finally {
+			if (mobileFirst && mobileFirst.readyState === WebSocket.OPEN) {
+				mobileFirst.close();
+			}
+			if (mobileSecond && mobileSecond.readyState === WebSocket.OPEN) {
+				mobileSecond.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
 	it("auto-resumes opencode sessions when creating a new session", async () => {
 		let startRunPayload: JsonRecord | null = null;
 
