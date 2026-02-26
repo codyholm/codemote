@@ -296,6 +296,9 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	// Connect an uplink "device" to the relay and bridge messages to the uplink server
 	const bridgeRelayUrl = remoteRelayTarget ?? `${wsScheme}://127.0.0.1:${port}`;
 	const bridgeHostedEndpointUrl = remoteRelayTarget ?? hostedEndpointTarget;
+	const statusRelayUrl = localRelayEnabled
+		? (advertisedRelayUrl ?? bridgeRelayUrl)
+		: bridgeRelayUrl;
 	const bridge = await startRelayUplinkBridge({
 		relayUrl: bridgeRelayUrl,
 		...(localRelayEnabled && relayCertPem ? { relayWsOptions: { ca: relayCertPem } } : {}),
@@ -309,7 +312,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 			writeStatusSafely(
 				{
 					pin,
-					relayUrl: bridgeRelayUrl,
+					relayUrl: statusRelayUrl,
 					...(relayTlsPin ? { tlsPin: relayTlsPin } : {}),
 				},
 				"pairing_code",
@@ -335,7 +338,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	await writeStatus({
 		pin: currentPIN,
 		uplinkDeviceId: bridge.uplinkDeviceId,
-		relayUrl: bridgeRelayUrl,
+		relayUrl: statusRelayUrl,
 		...(relayTlsPin ? { tlsPin: relayTlsPin } : {}),
 	});
 

@@ -236,10 +236,12 @@ describe("Server Integration", () => {
 		it("writes machine-readable status snapshots", async () => {
 			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-status-"));
 			const statusFilePath = join(fixtureDir, "server-status.json");
+			const advertisedRelayUrl = "wss://192.0.2.10:8210/ws";
 			try {
 				server = await startServer({
 					port: testPort + 110,
 					statusFilePath,
+					advertisedRelayUrl,
 				});
 
 				await waitForCondition(async () => {
@@ -249,6 +251,7 @@ describe("Server Integration", () => {
 							running?: boolean;
 							mode?: string;
 							pin?: string;
+							relayUrl?: string;
 							tlsPin?: string;
 						};
 						return (
@@ -256,6 +259,7 @@ describe("Server Integration", () => {
 							parsed.mode === "local" &&
 							typeof parsed.pin === "string" &&
 							parsed.pin.length === 6 &&
+							parsed.relayUrl === advertisedRelayUrl &&
 							typeof parsed.tlsPin === "string" &&
 							parsed.tlsPin.length === 64
 						);
