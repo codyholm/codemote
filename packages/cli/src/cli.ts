@@ -185,14 +185,19 @@ async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 				}
 			}
 		}
+		if (!tlsPin) {
+			throw new Error(
+				relayScheme === "wss"
+					? "Unable to derive relay TLS pin for pairing QR. Start aborted to avoid generating an unusable pairing code."
+					: "Pairing QR requires a TLS relay URL (wss://) with a trusted TLS pin.",
+			);
+		}
 
 		const pairingHostPort = resolvePairingHostPort(relayUrl, host, port);
-		const pairingURL = tlsPin
-			? buildPairingURL(pairingHostPort.host, pairingHostPort.port, server.pin, {
-					tlsPin,
-					relayUrl,
-				})
-			: buildPairingURL(pairingHostPort.host, pairingHostPort.port, server.pin);
+		const pairingURL = buildPairingURL(pairingHostPort.host, pairingHostPort.port, server.pin, {
+			tlsPin,
+			relayUrl,
+		});
 		const qrCode = await generateQRCode(pairingURL);
 
 		await renderUI({
@@ -200,7 +205,7 @@ async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 			pin: server.pin,
 			localURL: relayUrl,
 			status: "ready",
-			...(tlsPin ? { tlsPin } : {}),
+			tlsPin,
 		});
 	} else {
 		console.log(`[CLI] Serve mode ready. Relay: ${relayUrl}`);
