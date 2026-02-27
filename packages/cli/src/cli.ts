@@ -36,7 +36,7 @@ import {
 import { ensureLocalTLS, fetchRelayTlsPin } from "./tls.js";
 import { renderUI, updateStatus } from "./ui.js";
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import readline from "node:readline";
@@ -50,13 +50,69 @@ const rawArgs = process.argv.slice(2);
 
 type StartupMode = "interactive" | "serve";
 
+const EPHEMERAL_SCRIPT_PATH_MARKERS = [
+	"/.npm/_npx/",
+	"/npm/_npx/",
+	"/library/caches/pnpm/dlx/",
+	"/.cache/pnpm/dlx/",
+	"/.local/share/pnpm/dlx/",
+	"/pnpm/dlx/",
+	"/yarn/dlx/",
+] as const;
+
 function resolveServiceScriptPath(): string {
 	const workspaceScriptPath = resolve(process.cwd(), "packages/cli/dist/cli.js");
 	if (existsSync(workspaceScriptPath)) {
 		return workspaceScriptPath;
 	}
 
-	return fileURLToPath(import.meta.url);
+	const argvScriptPath = resolveStableServiceScriptPath(process.argv[1]);
+	if (argvScriptPath) {
+		return argvScriptPath;
+	}
+
+	const moduleScriptPath = resolveStableServiceScriptPath(fileURLToPath(import.meta.url));
+	if (moduleScriptPath) {
+		return moduleScriptPath;
+	}
+
+	throw new Error(
+		[
+			"Unable to resolve a stable script path for service installation.",
+			"Re-run with a persistent install (for example `npm install -g codemote`) or from a built repository checkout.",
+		].join(" "),
+	);
+}
+
+function resolveStableServiceScriptPath(pathValue?: string): string | undefined {
+	if (!pathValue || pathValue.trim().length === 0) {
+		return undefined;
+	}
+
+	const absolutePath = resolve(pathValue);
+	if (!existsSync(absolutePath)) {
+		return undefined;
+	}
+
+	const realPath = safeRealpath(absolutePath) ?? absolutePath;
+	if (isEphemeralScriptPath(absolutePath) || isEphemeralScriptPath(realPath)) {
+		return undefined;
+	}
+
+	return realPath;
+}
+
+function safeRealpath(pathValue: string): string | undefined {
+	try {
+		return realpathSync(pathValue);
+	} catch {
+		return undefined;
+	}
+}
+
+function isEphemeralScriptPath(pathValue: string): boolean {
+	const normalizedPath = pathValue.replaceAll("\\", "/").toLowerCase();
+	return EPHEMERAL_SCRIPT_PATH_MARKERS.some((marker) => normalizedPath.includes(marker));
 }
 
 function showHelp(): void {
