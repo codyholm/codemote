@@ -2,11 +2,11 @@
  * Tests for server integration
  */
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import WebSocket from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import { type ServerHandle, startServer } from "./server.js";
 
 describe("Server Integration", () => {
@@ -232,6 +232,199 @@ describe("Server Integration", () => {
 
 			expect(server).toBeDefined();
 		});
+
+		it("writes machine-readable status snapshots", async () => {
+			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-status-"));
+			const statusFilePath = join(fixtureDir, "server-status.json");
+			const advertisedRelayUrl = "wss://192.0.2.10:8210/ws";
+			try {
+				server = await startServer({
+					port: testPort + 110,
+					statusFilePath,
+					advertisedRelayUrl,
+				});
+
+				await waitForCondition(async () => {
+					try {
+						const raw = await readFile(statusFilePath, "utf8");
+						const parsed = JSON.parse(raw) as {
+							running?: boolean;
+							mode?: string;
+							pin?: string;
+							relayUrl?: string;
+							tlsPin?: string;
+						};
+						return (
+							parsed.running === true &&
+							parsed.mode === "local" &&
+							typeof parsed.pin === "string" &&
+							parsed.pin.length === 6 &&
+							parsed.relayUrl === advertisedRelayUrl &&
+							typeof parsed.tlsPin === "string" &&
+							parsed.tlsPin.length === 64
+						);
+					} catch {
+						return false;
+					}
+				}, 8_000);
+
+				await server.stop();
+				server = null;
+
+				const stoppedSnapshot = JSON.parse(await readFile(statusFilePath, "utf8")) as {
+					running?: boolean;
+					stoppedAt?: string;
+				};
+				expect(stoppedSnapshot.running).toBe(false);
+				expect(typeof stoppedSnapshot.stoppedAt).toBe("string");
+			} finally {
+				await rm(fixtureDir, { recursive: true, force: true });
+			}
+		});
+
+		it("resets mobileConnected in status snapshots after mobile disconnect", async () => {
+			const prevDisable = process.env["GUILD_REMOTE_DISABLE_TLS"];
+			const prevAllow = process.env["GUILD_REMOTE_ALLOW_INSECURE"];
+			process.env["GUILD_REMOTE_DISABLE_TLS"] = "1";
+			process.env["GUILD_REMOTE_ALLOW_INSECURE"] = "1";
+
+			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-status-disconnect-"));
+			const statusFilePath = join(fixtureDir, "server-status.json");
+			try {
+				server = await startServer({
+					port: testPort + 111,
+					statusFilePath,
+					advertisedRelayUrl: `ws://127.0.0.1:${testPort + 111}/ws`,
+				});
+
+				const mobileWs = new WebSocket(`ws://127.0.0.1:${testPort + 111}/ws`);
+				await waitForOpen(mobileWs);
+				const paired = waitForMessageOfType(mobileWs, "paired");
+				mobileWs.send(
+					JSON.stringify({
+						type: "pair",
+						deviceId: "mobile-status-disconnect",
+						pin: server.pin,
+						deviceType: "mobile",
+					}),
+				);
+				await paired;
+
+				await waitForCondition(async () => {
+					try {
+						const snapshot = JSON.parse(await readFile(statusFilePath, "utf8")) as {
+							mobileConnected?: boolean;
+						};
+						return snapshot.mobileConnected === true;
+					} catch {
+						return false;
+					}
+				}, 8_000);
+
+				mobileWs.close();
+				await waitForCondition(async () => {
+					try {
+						const snapshot = JSON.parse(await readFile(statusFilePath, "utf8")) as {
+							mobileConnected?: boolean;
+						};
+						return snapshot.mobileConnected === false;
+					} catch {
+						return false;
+					}
+				}, 8_000);
+			} finally {
+				await rm(fixtureDir, { recursive: true, force: true });
+				if (prevDisable === undefined) {
+					Reflect.deleteProperty(process.env, "GUILD_REMOTE_DISABLE_TLS");
+				} else {
+					process.env["GUILD_REMOTE_DISABLE_TLS"] = prevDisable;
+				}
+				if (prevAllow === undefined) {
+					Reflect.deleteProperty(process.env, "GUILD_REMOTE_ALLOW_INSECURE");
+				} else {
+					process.env["GUILD_REMOTE_ALLOW_INSECURE"] = prevAllow;
+				}
+			}
+		}, 15_000);
+
+		it("supports remote relay mode with status metadata", async () => {
+			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-remote-status-"));
+			const statusFilePath = join(fixtureDir, "server-status.json");
+			const remoteRelay = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+			await new Promise<void>((resolve) => remoteRelay.once("listening", () => resolve()));
+			const relayAddress = remoteRelay.address();
+			if (!relayAddress || typeof relayAddress === "string") {
+				throw new Error("Failed to bind remote relay test server");
+			}
+			const remoteRelayUrl = `ws://127.0.0.1:${relayAddress.port}/ws`;
+			let sawRegister = false;
+
+			remoteRelay.on("connection", (socket) => {
+				socket.on("message", (raw) => {
+					const message = JSON.parse(raw.toString()) as { type?: string };
+					if (message.type === "register") {
+						sawRegister = true;
+						socket.send(JSON.stringify({ type: "registered", pairingCode: "919191" }));
+					}
+				});
+			});
+
+			try {
+				server = await startServer({
+					port: testPort + 120,
+					remoteRelayUrl,
+					statusFilePath,
+				});
+
+				expect(server.url).toBe(remoteRelayUrl);
+				await waitForCondition(async () => {
+					if (!sawRegister) return false;
+					try {
+						const snapshot = JSON.parse(await readFile(statusFilePath, "utf8")) as {
+							mode?: string;
+							relayUrl?: string;
+							running?: boolean;
+						};
+						const relayUrl = snapshot.relayUrl ?? "";
+						return (
+							snapshot.mode === "remote" &&
+							relayUrl.includes(`127.0.0.1:${relayAddress.port}`) &&
+							snapshot.running === true
+						);
+					} catch {
+						return false;
+					}
+				}, 8_000);
+			} finally {
+				if (server) {
+					await server.stop();
+					server = null;
+				}
+				for (const client of remoteRelay.clients) {
+					client.terminate();
+				}
+				await new Promise<void>((resolve) => remoteRelay.close(() => resolve()));
+				await rm(fixtureDir, { recursive: true, force: true });
+			}
+		}, 15_000);
+
+		it("rejects invalid remote relay URLs", async () => {
+			await expect(
+				startServer({
+					port: testPort + 130,
+					remoteRelayUrl: "https://invalid-relay.example.com/ws",
+				}),
+			).rejects.toThrow(/Invalid remote relay URL/);
+		});
+
+		it("rejects invalid hosted endpoint URLs", async () => {
+			await expect(
+				startServer({
+					port: testPort + 131,
+					hostedEndpointUrl: "https://invalid-hosted.example.com/ws",
+				}),
+			).rejects.toThrow(/Invalid hosted endpoint URL/);
+		});
 	});
 });
 
@@ -262,4 +455,20 @@ function waitForMessageOfType(ws: WebSocket, type: string): Promise<Record<strin
 			reject(new Error(`WebSocket message timeout waiting for type: ${type}`));
 		}, 5000);
 	});
+}
+
+async function waitForCondition(
+	predicate: () => Promise<boolean> | boolean,
+	timeoutMs: number,
+	intervalMs = 25,
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const result = await predicate();
+		if (result) {
+			return;
+		}
+		await new Promise((resolve) => setTimeout(resolve, intervalMs));
+	}
+	throw new Error("Timed out waiting for condition");
 }

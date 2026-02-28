@@ -58,6 +58,8 @@ interface CodexEvent {
 	type: string;
 	thread_id?: string;
 	session_id?: string;
+	parent_tool_use_id?: string;
+	parentToolUseId?: string;
 	content?: unknown;
 	command?: string;
 	output?: string;
@@ -77,6 +79,8 @@ interface CodexEvent {
 		path?: string;
 		action?: string;
 		description?: string;
+		parent_tool_use_id?: string;
+		parentToolUseId?: string;
 		[key: string]: unknown;
 	};
 }
@@ -391,6 +395,7 @@ export class CodexExecutor extends BaseExecutor {
 	 */
 	private handleCodexEvent(sessionId: string, event: CodexEvent): void {
 		const codexSession = this.codexSessions.get(sessionId);
+		const parentToolUseId = this.parentToolUseIdForEvent(event);
 
 		switch (event.type) {
 			case "thread.started":
@@ -417,13 +422,13 @@ export class CodexExecutor extends BaseExecutor {
 
 			case "item.started":
 				if (event.item) {
-					this.handleItemStarted(sessionId, event.item);
+					this.handleItemStarted(sessionId, event.item, parentToolUseId);
 				}
 				break;
 
 			case "item.completed":
 				if (event.item) {
-					this.handleItemCompleted(sessionId, event.item);
+					this.handleItemCompleted(sessionId, event.item, parentToolUseId);
 				}
 				break;
 
@@ -431,13 +436,13 @@ export class CodexExecutor extends BaseExecutor {
 				if (event.content) {
 					const content = this.extractMessageText(event.content);
 					if (content) {
-						this.emitMessage(sessionId, "assistant", content);
+						this.emitMessage(sessionId, "assistant", content, parentToolUseId);
 					}
 				}
 				break;
 
 			case "item.command_execution":
-				this.emitLegacyCommandEvent(sessionId, event);
+				this.emitLegacyCommandEvent(sessionId, event, parentToolUseId);
 				break;
 
 			case "item.file_change":
@@ -464,28 +469,38 @@ export class CodexExecutor extends BaseExecutor {
 		}
 	}
 
-	private handleItemStarted(sessionId: string, item: NonNullable<CodexEvent["item"]>): void {
+	private handleItemStarted(
+		sessionId: string,
+		item: NonNullable<CodexEvent["item"]>,
+		parentToolUseId?: string,
+	): void {
 		if (item.type !== "command_execution") {
 			return;
 		}
 
 		const command = this.asString(item.command);
 		const { toolCallId, toolName } = this.registerToolCall(sessionId, item.id, "shell");
-		this.emitToolCall(sessionId, toolCallId, toolName, command);
+		const parentFromItem = parentToolUseId ?? this.parentToolUseIdForItem(item);
+		this.emitToolCall(sessionId, toolCallId, toolName, command, parentFromItem);
 	}
 
-	private handleItemCompleted(sessionId: string, item: NonNullable<CodexEvent["item"]>): void {
+	private handleItemCompleted(
+		sessionId: string,
+		item: NonNullable<CodexEvent["item"]>,
+		parentToolUseId?: string,
+	): void {
+		const parentFromItem = parentToolUseId ?? this.parentToolUseIdForItem(item);
 		switch (item.type) {
 			case "agent_message": {
 				const text = this.extractMessageText(item.text ?? item.content);
 				if (text) {
-					this.emitMessage(sessionId, "assistant", text);
+					this.emitMessage(sessionId, "assistant", text, parentFromItem);
 				}
 				break;
 			}
 
 			case "command_execution":
-				this.emitCommandExecutionResult(sessionId, item);
+				this.emitCommandExecutionResult(sessionId, item, parentFromItem);
 				break;
 
 			case "file_change":
@@ -507,6 +522,7 @@ export class CodexExecutor extends BaseExecutor {
 	private emitCommandExecutionResult(
 		sessionId: string,
 		item: NonNullable<CodexEvent["item"]>,
+		parentToolUseId?: string,
 	): void {
 		const toolName = "shell";
 		let toolCallId: string;
@@ -517,24 +533,28 @@ export class CodexExecutor extends BaseExecutor {
 			toolCallId = pending.toolCallId;
 		} else {
 			toolCallId = this.generateToolCallId();
-			this.emitToolCall(sessionId, toolCallId, toolName, command);
+			this.emitToolCall(sessionId, toolCallId, toolName, command, parentToolUseId);
 		}
 
 		const output = this.asString(item.aggregated_output);
 		const exitCode = this.asNumber(item.exit_code);
 		const error =
 			exitCode !== null && exitCode !== 0 ? `Command exited with code ${exitCode}` : undefined;
-		this.emitToolResult(sessionId, toolCallId, toolName, output, error);
+		this.emitToolResult(sessionId, toolCallId, toolName, output, error, parentToolUseId);
 		this.emitDiffUpdated(sessionId);
 	}
 
-	private emitLegacyCommandEvent(sessionId: string, event: CodexEvent): void {
+	private emitLegacyCommandEvent(
+		sessionId: string,
+		event: CodexEvent,
+		parentToolUseId?: string,
+	): void {
 		const toolCallId = this.generateToolCallId();
 		const toolName = "shell";
 		const command = this.asString(event.command);
 		const output = this.asString(event.output);
-		this.emitToolCall(sessionId, toolCallId, toolName, command);
-		this.emitToolResult(sessionId, toolCallId, toolName, output);
+		this.emitToolCall(sessionId, toolCallId, toolName, command, parentToolUseId);
+		this.emitToolResult(sessionId, toolCallId, toolName, output, undefined, parentToolUseId);
 	}
 
 	private registerToolCall(
@@ -632,6 +652,32 @@ export class CodexExecutor extends BaseExecutor {
 
 	private asNumber(value: unknown): number | null {
 		return typeof value === "number" && Number.isFinite(value) ? value : null;
+	}
+
+	private parentToolUseIdForEvent(event: CodexEvent): string | undefined {
+		return this.asParentToolUseId(
+			event.parent_tool_use_id,
+			event.parentToolUseId,
+			event.item?.parent_tool_use_id,
+			event.item?.parentToolUseId,
+		);
+	}
+
+	private parentToolUseIdForItem(item: NonNullable<CodexEvent["item"]>): string | undefined {
+		return this.asParentToolUseId(item.parent_tool_use_id, item.parentToolUseId);
+	}
+
+	private asParentToolUseId(...values: unknown[]): string | undefined {
+		for (const value of values) {
+			if (typeof value !== "string") {
+				continue;
+			}
+			const trimmed = value.trim();
+			if (trimmed.length > 0) {
+				return trimmed;
+			}
+		}
+		return undefined;
 	}
 
 	private generateToolCallId(): string {

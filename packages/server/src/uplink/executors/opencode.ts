@@ -41,6 +41,8 @@ interface OpenCodeJsonEvent {
 	type?: unknown;
 	sessionID?: unknown;
 	part?: unknown;
+	parentToolUseId?: unknown;
+	parent_tool_use_id?: unknown;
 	[key: string]: unknown;
 }
 
@@ -234,7 +236,8 @@ export class OpenCodeExecutor extends BaseExecutor {
 			if (text.trim().length === 0) {
 				return;
 			}
-			this.emitMessage(sessionId, "assistant", text);
+			const parentToolUseId = this.extractParentToolUseId(parsed, part);
+			this.emitMessage(sessionId, "assistant", text, parentToolUseId);
 			return;
 		}
 
@@ -270,10 +273,17 @@ export class OpenCodeExecutor extends BaseExecutor {
 				: "tool";
 		const toolState = this.asRecord(part["state"]);
 		const serializedInput = this.stringifyValue(toolState?.["input"]);
-		this.emitToolCall(sessionId, toolCallId, toolName, serializedInput ?? undefined);
+		const parentToolUseId = this.extractParentToolUseId(event, part, toolState);
+		this.emitToolCall(
+			sessionId,
+			toolCallId,
+			toolName,
+			serializedInput ?? undefined,
+			parentToolUseId,
+		);
 
 		const { output, error } = this.extractToolResult(toolName, toolState);
-		this.emitToolResult(sessionId, toolCallId, toolName, output, error);
+		this.emitToolResult(sessionId, toolCallId, toolName, output, error, parentToolUseId);
 
 		if (this.toolStateHasDiff(toolState)) {
 			this.emitDiffUpdated(sessionId);
@@ -409,6 +419,25 @@ export class OpenCodeExecutor extends BaseExecutor {
 			return null;
 		}
 		return value as Record<string, unknown>;
+	}
+
+	private extractParentToolUseId(
+		...values: Array<Record<string, unknown> | OpenCodeJsonEvent | null>
+	): string | undefined {
+		for (const value of values) {
+			if (!value) {
+				continue;
+			}
+			const candidateA = value["parentToolUseId"];
+			if (typeof candidateA === "string" && candidateA.trim().length > 0) {
+				return candidateA.trim();
+			}
+			const candidateB = value["parent_tool_use_id"];
+			if (typeof candidateB === "string" && candidateB.trim().length > 0) {
+				return candidateB.trim();
+			}
+		}
+		return undefined;
 	}
 
 	private stringifyValue(value: unknown): string | null {

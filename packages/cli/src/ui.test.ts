@@ -69,7 +69,7 @@ describe("renderUI", () => {
 		expect(allCalls).toContain("Starting...");
 	});
 
-	it("should display status as Ready for connections for ready state", async () => {
+	it("should display status as waiting for mobile connection for ready state", async () => {
 		const state: UIState = {
 			qrCode: "█▀▀▀▀▀█",
 			pin: "123456",
@@ -80,7 +80,7 @@ describe("renderUI", () => {
 		await renderUI(state);
 
 		const allCalls = consoleLogSpy.mock.calls.map((call) => call[0]).join("\n");
-		expect(allCalls).toContain("Ready for connections");
+		expect(allCalls).toContain("Waiting for mobile connection");
 	});
 
 	it("should display status as Device connected for connected state", async () => {

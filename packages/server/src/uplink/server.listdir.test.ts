@@ -109,6 +109,44 @@ describe("UplinkServer list_directory", () => {
 		}
 	});
 
+	it("caps entries after sorting so git repositories are prioritized", async () => {
+		const bigDir = join(tempDir, "many-projects");
+		mkdirSync(bigDir, { recursive: true });
+
+		for (let i = 0; i < 240; i += 1) {
+			mkdirSync(join(bigDir, `project-${i.toString().padStart(3, "0")}`));
+		}
+
+		for (let i = 0; i < 5; i += 1) {
+			const repoPath = join(bigDir, `z-git-${i.toString().padStart(2, "0")}`);
+			mkdirSync(repoPath, { recursive: true });
+			execSync("git init", { cwd: repoPath, stdio: "ignore" });
+		}
+
+		const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+		await waitForOpen(ws);
+		try {
+			const msgPromise = waitForMessage(ws);
+			ws.send(JSON.stringify({ type: "list_directory", payload: { path: bigDir } }));
+			const msg = await msgPromise;
+			expect(msg.type).toBe("directory_listing");
+
+			const payload = msg.payload as {
+				path: string;
+				entries: Array<{ name: string; isDirectory: boolean; isGitRepo: boolean }>;
+			};
+
+			expect(payload.entries.length).toBe(200);
+			expect(payload.entries.slice(0, 5).every((entry) => entry.isGitRepo)).toBe(true);
+
+			const names = payload.entries.map((entry) => entry.name);
+			expect(names).toContain("z-git-00");
+			expect(names).toContain("z-git-04");
+		} finally {
+			ws.close();
+		}
+	});
+
 	it("returns error for nonexistent path", async () => {
 		const ws = new WebSocket(`ws://127.0.0.1:${port}`);
 		await waitForOpen(ws);

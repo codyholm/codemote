@@ -588,10 +588,144 @@ describe("RelayUplinkBridge", () => {
 			const sessions = latestSessionList?.["sessions"];
 			expect(Array.isArray(sessions)).toBe(true);
 			expect(
+				(sessions as Array<JsonRecord>).some((session) => session["id"] === "missing-session-1"),
+			).toBe(false);
+		} finally {
+			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+				mobileSocket.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
+	it("does not synthesize an opencode session when status arrives for an unknown session id", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+		let uplinkSocket: WebSocket | null = null;
+
+		uplinkWss.on("connection", (socket) => {
+			uplinkSocket = socket;
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(
+						JSON.stringify({
+							type: "sessions",
+							payload: [],
+						}),
+					);
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "323232" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					socket.send(
+						JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-test-unknown-status" }),
+					);
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: "mobile-test-unknown-status",
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				} else if (socket === relayUplinkSocket) {
+					relayMobileSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			const payloads: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				payloads.push(payload);
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-test-unknown-status",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(
+				() => payloads.some((payload) => payload["type"] === "session_list"),
+				8000,
+			);
+
+			const connectedUplinkSocket = uplinkSocket as WebSocket | null;
+			if (connectedUplinkSocket === null) {
+				throw new Error("Expected uplink socket for unknown status test");
+			}
+
+			connectedUplinkSocket.send(
+				JSON.stringify({
+					type: "event",
+					payload: {
+						type: "session.status",
+						timestamp: Date.now(),
+						sessionId: "sess-unknown-status-1",
+						payload: {
+							status: "error",
+						},
+					},
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					payloads.some(
+						(payload) =>
+							payload["type"] === "session_status" &&
+							payload["sessionId"] === "sess-unknown-status-1" &&
+							payload["status"] === "error",
+					),
+				8000,
+			);
+
+			const latestSessionList = [...payloads]
+				.reverse()
+				.find((payload) => payload["type"] === "session_list");
+			const sessions = latestSessionList?.["sessions"];
+			expect(Array.isArray(sessions)).toBe(true);
+			expect(
 				(sessions as Array<JsonRecord>).some(
-					(session) => session["id"] === "missing-session-1" && session["status"] === "error",
+					(session) => session["id"] === "sess-unknown-status-1",
 				),
-			).toBe(true);
+			).toBe(false);
 		} finally {
 			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
 				mobileSocket.close();
@@ -773,6 +907,737 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
+	it("returns explicit directory_listing error payload when list_directory fails", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				const type = command["type"];
+
+				if (type === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+					return;
+				}
+
+				if (type === "list_directory") {
+					socket.send(
+						JSON.stringify({
+							type: "error",
+							payload: { message: "EACCES: permission denied, scandir '/root'" },
+						}),
+					);
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "112233" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-test-listdir" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: "mobile-test-listdir",
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				} else if (socket === relayUplinkSocket) {
+					relayMobileSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			const payloads: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				payloads.push(payload);
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-test-listdir",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(
+				() => payloads.some((payload) => payload["type"] === "session_list"),
+				8000,
+			);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "list_directory", path: "/root" },
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					payloads.some(
+						(payload) =>
+							payload["type"] === "directory_listing" &&
+							payload["path"] === "/root" &&
+							payload["error"] === "EACCES: permission denied, scandir '/root'",
+					),
+				8000,
+			);
+		} finally {
+			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+				mobileSocket.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
+	it("suppresses sub-agent events that include parentToolUseId", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+		let uplinkSocket: WebSocket | null = null;
+
+		uplinkWss.on("connection", (socket) => {
+			uplinkSocket = socket;
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "778899" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-filter-1" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: "mobile-filter-1",
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				} else if (socket === relayUplinkSocket) {
+					relayMobileSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			const payloads: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				payloads.push(payload);
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-filter-1",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(
+				() => payloads.some((payload) => payload["type"] === "session_list"),
+				8000,
+			);
+			expect(uplinkSocket).toBeTruthy();
+			const connectedUplinkSocket = uplinkSocket as WebSocket | null;
+			if (connectedUplinkSocket === null) {
+				throw new Error("Expected uplink connection for parent tool suppression test");
+			}
+
+			connectedUplinkSocket.send(
+				JSON.stringify({
+					type: "event",
+					payload: {
+						type: "session.message",
+						timestamp: Date.now(),
+						sessionId: "sess-parent-filter",
+						payload: {
+							role: "assistant",
+							content: "internal sub-agent detail",
+							parentToolUseId: "parent_42",
+						},
+					},
+				}),
+			);
+			connectedUplinkSocket.send(
+				JSON.stringify({
+					type: "event",
+					payload: {
+						type: "session.message",
+						timestamp: Date.now(),
+						sessionId: "sess-parent-filter",
+						payload: {
+							role: "assistant",
+							content: "top-level assistant reply",
+						},
+					},
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					payloads.some(
+						(payload) =>
+							payload["type"] === "session_message" &&
+							payload["sessionId"] === "sess-parent-filter" &&
+							payload["content"] === "top-level assistant reply",
+					),
+				8000,
+			);
+
+			expect(
+				payloads.some(
+					(payload) =>
+						payload["type"] === "session_message" &&
+						payload["sessionId"] === "sess-parent-filter" &&
+						payload["content"] === "internal sub-agent detail",
+				),
+			).toBe(false);
+		} finally {
+			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+				mobileSocket.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
+	it("advertises local and hosted endpoint candidates through device_info", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "445566" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-endpoint-1" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: "mobile-endpoint-1",
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				} else if (socket === relayUplinkSocket) {
+					relayMobileSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+			localEndpointUrl: "wss://192.168.1.55:8080/ws",
+			hostedEndpointUrl: "wss://relay.codemote.app/ws",
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			const payloads: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				payloads.push(payload);
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-endpoint-1",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					payloads.some(
+						(payload) =>
+							payload["type"] === "device_info" &&
+							Array.isArray(payload["endpoints"]) &&
+							(payload["endpoints"] as Array<JsonRecord>).some(
+								(endpoint) =>
+									endpoint["kind"] === "local" && endpoint["url"] === "wss://192.168.1.55:8080/ws",
+							) &&
+							(payload["endpoints"] as Array<JsonRecord>).some(
+								(endpoint) =>
+									endpoint["kind"] === "hosted" &&
+									endpoint["url"] === "wss://relay.codemote.app/ws",
+							),
+					),
+				8000,
+			);
+		} finally {
+			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+				mobileSocket.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
+	it("does not advertise tailscale candidate when local endpoint is unavailable", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "778899" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-endpoint-2" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: "mobile-endpoint-2",
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				} else if (socket === relayUplinkSocket) {
+					relayMobileSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+			hostedEndpointUrl: "wss://relay.codemote.app/ws",
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			const payloads: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				payloads.push(payload);
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-endpoint-2",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					payloads.some((payload) => {
+						if (payload["type"] !== "device_info" || !Array.isArray(payload["endpoints"])) {
+							return false;
+						}
+						const endpoints = payload["endpoints"] as Array<JsonRecord>;
+						return (
+							endpoints.some(
+								(endpoint) =>
+									endpoint["kind"] === "hosted" &&
+									endpoint["url"] === "wss://relay.codemote.app/ws",
+							) && !endpoints.some((endpoint) => endpoint["kind"] === "tailscale")
+						);
+					}),
+				8000,
+			);
+		} finally {
+			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+				mobileSocket.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
+	it("continues forwarding to remaining mobile when one paired mobile disconnects", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		const relayMobileSockets = new Map<string, WebSocket>();
+		const socketToDeviceId = new Map<WebSocket, string>();
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+					return;
+				}
+
+				if (command["type"] === "send_input") {
+					const payload = (command["payload"] as JsonRecord | undefined) ?? {};
+					const sessionId = String(payload["sessionId"] ?? "sess-multi-1");
+					socket.send(
+						JSON.stringify({
+							type: "input_sent",
+							payload: { sessionId },
+						}),
+					);
+					socket.send(
+						JSON.stringify({
+							type: "event",
+							payload: {
+								type: "session.message",
+								sessionId,
+								timestamp: Date.now(),
+								payload: {
+									role: "assistant",
+									content: "still-forwarding",
+								},
+							},
+						}),
+					);
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "112233" }));
+					return;
+				}
+
+				if (type === "pair") {
+					const mobileId = String(message["deviceId"] ?? "");
+					if (!mobileId) return;
+					relayMobileSockets.set(mobileId, socket);
+					socketToDeviceId.set(socket, mobileId);
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-multi-1" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: mobileId,
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayUplinkSocket) {
+					for (const mobileSocket of relayMobileSockets.values()) {
+						if (mobileSocket.readyState === WebSocket.OPEN) {
+							mobileSocket.send(raw.toString());
+						}
+					}
+					return;
+				}
+
+				relayUplinkSocket?.send(raw.toString());
+			});
+
+			socket.on("close", () => {
+				const mobileId = socketToDeviceId.get(socket);
+				if (!mobileId) return;
+				socketToDeviceId.delete(socket);
+				relayMobileSockets.delete(mobileId);
+				relayUplinkSocket?.send(
+					JSON.stringify({
+						type: "mobile_disconnected",
+						uplinkDeviceId: "uplink-multi-1",
+						mobileDeviceId: mobileId,
+					}),
+				);
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+
+		let mobileFirst: WebSocket | null = null;
+		let mobileSecond: WebSocket | null = null;
+		try {
+			const firstPayloads: JsonRecord[] = [];
+			mobileFirst = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileFirst);
+			mobileFirst.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				firstPayloads.push(payload);
+			});
+
+			mobileSecond = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSecond);
+
+			mobileFirst.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-first",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+			mobileSecond.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-second",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(() => relayMobileSockets.size === 2, 8000);
+			await waitForCondition(
+				() => firstPayloads.some((payload) => payload["type"] === "session_list"),
+				8000,
+			);
+
+			mobileSecond.close();
+			await waitForCondition(() => relayMobileSockets.size === 1, 8000);
+
+			mobileFirst.send(
+				JSON.stringify({
+					type: "message",
+					payload: {
+						type: "send_prompt",
+						sessionId: "sess-multi-1",
+						prompt: "ping",
+					},
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					firstPayloads.some(
+						(payload) =>
+							payload["type"] === "session_message" &&
+							payload["sessionId"] === "sess-multi-1" &&
+							payload["content"] === "still-forwarding",
+					),
+				8000,
+			);
+		} finally {
+			if (mobileFirst && mobileFirst.readyState === WebSocket.OPEN) {
+				mobileFirst.close();
+			}
+			if (mobileSecond && mobileSecond.readyState === WebSocket.OPEN) {
+				mobileSecond.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
+	it("updates session status metadata even when no mobile is paired", async () => {
+		let statusEventSent = false;
+		const statusUpdates: Array<{
+			sessionId: string;
+			runtime: string;
+			status: string;
+		}> = [];
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] !== "list_sessions") {
+					return;
+				}
+
+				socket.send(
+					JSON.stringify({
+						type: "sessions",
+						payload: [
+							{
+								id: "sess-status-no-mobile",
+								runId: "run-status-no-mobile",
+								runtime: "codex",
+								status: "running",
+								workspace: {
+									id: "ws-status-no-mobile",
+									workingDir: tempRepoDir,
+									createdAt: Date.now(),
+								},
+								startedAt: Date.now(),
+								endedAt: null,
+								lastActivityAt: Date.now(),
+							},
+						],
+					}),
+				);
+				if (!statusEventSent) {
+					statusEventSent = true;
+					setTimeout(() => {
+						socket.send(
+							JSON.stringify({
+								type: "event",
+								payload: {
+									type: "session.status",
+									sessionId: "sess-status-no-mobile",
+									timestamp: Date.now(),
+									payload: {
+										status: "idle",
+									},
+								},
+							}),
+						);
+					}, 20);
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				if (message["type"] === "register") {
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "223344" }));
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+			onSessionStatus: (info) => {
+				statusUpdates.push({
+					sessionId: info.sessionId,
+					runtime: info.runtime,
+					status: info.status,
+				});
+			},
+		});
+
+		try {
+			await waitForCondition(
+				() =>
+					statusUpdates.some(
+						(update) =>
+							update.sessionId === "sess-status-no-mobile" &&
+							update.runtime === "codex" &&
+							update.status === "idle",
+					),
+				8000,
+			);
+		} finally {
+			await bridge.stop();
+		}
+	}, 20_000);
+
 	it("auto-resumes opencode sessions when creating a new session", async () => {
 		let startRunPayload: JsonRecord | null = null;
 
@@ -935,6 +1800,370 @@ describe("RelayUplinkBridge", () => {
 			await bridge.stop();
 		}
 	}, 20_000);
+
+	const runtimeContinuityMatrix = ["claude", "opencode", "codex", "gemini"] as const;
+
+	for (const runtime of runtimeContinuityMatrix) {
+		it(`maintains three-turn continuity across reconnect for ${runtime}`, async () => {
+			interface MockSessionState {
+				id: string;
+				runtime: (typeof runtimeContinuityMatrix)[number];
+				status: string;
+				runtimeSessionId: string;
+				originalPrompt: string;
+			}
+
+			let relayUplinkSocket: WebSocket | null = null;
+			let relayMobileSocket: WebSocket | null = null;
+			const sessionsById = new Map<string, MockSessionState>();
+			let sessionCounter = 0;
+
+			const emitEvent = (socket: WebSocket, payload: JsonRecord): void => {
+				socket.send(
+					JSON.stringify({
+						type: "event",
+						payload: {
+							...payload,
+							timestamp: Date.now(),
+						},
+					}),
+				);
+			};
+
+			const emitStatus = (socket: WebSocket, sessionId: string, status: string): void => {
+				const session = sessionsById.get(sessionId);
+				if (session) {
+					session.status = status;
+				}
+				emitEvent(socket, {
+					type: "session.status",
+					sessionId,
+					payload: { status },
+				});
+			};
+
+			const emitAssistantMessage = (
+				socket: WebSocket,
+				sessionId: string,
+				content: string,
+			): void => {
+				emitEvent(socket, {
+					type: "session.message",
+					sessionId,
+					payload: {
+						role: "assistant",
+						content,
+					},
+				});
+			};
+
+			uplinkWss.on("connection", (socket) => {
+				socket.on("message", (raw) => {
+					const command = JSON.parse(raw.toString()) as JsonRecord;
+					const type = command["type"];
+
+					if (type === "list_sessions") {
+						socket.send(
+							JSON.stringify({
+								type: "sessions",
+								payload: Array.from(sessionsById.values()).map((session) => ({
+									id: session.id,
+									runId: `run-${session.id}`,
+									runtime: session.runtime,
+									status: session.status,
+									runtimeSessionId: session.runtimeSessionId,
+									workspace: {
+										id: `ws-${session.id}`,
+										workingDir: tempRepoDir,
+										createdAt: Date.now(),
+									},
+									startedAt: Date.now() - 3_000,
+									endedAt: null,
+									lastActivityAt: Date.now(),
+								})),
+							}),
+						);
+						return;
+					}
+
+					if (type === "start_run") {
+						const payload = (command["payload"] as JsonRecord | undefined) ?? {};
+						const initialPrompt = String(payload["initialPrompt"] ?? "");
+						sessionCounter += 1;
+						const sessionId = `sess-${runtime}-matrix-${sessionCounter}`;
+						const runtimeSessionId = `runtime-${runtime}-matrix-${sessionCounter}`;
+						sessionsById.set(sessionId, {
+							id: sessionId,
+							runtime,
+							status: "starting",
+							runtimeSessionId,
+							originalPrompt: initialPrompt,
+						});
+
+						socket.send(
+							JSON.stringify({
+								type: "run_started",
+								payload: {
+									sessionId,
+									runId: `run-${runtime}-${sessionCounter}`,
+								},
+							}),
+						);
+						emitStatus(socket, sessionId, "running");
+						emitAssistantMessage(socket, sessionId, "4");
+						emitStatus(socket, sessionId, "idle");
+						return;
+					}
+
+					if (type === "send_input") {
+						const payload = (command["payload"] as JsonRecord | undefined) ?? {};
+						const sessionId = String(payload["sessionId"] ?? "");
+						const input = String(payload["input"] ?? "");
+						const session = sessionsById.get(sessionId);
+						if (!session) {
+							socket.send(
+								JSON.stringify({
+									type: "error",
+									payload: { message: `Unknown session: ${sessionId}` },
+								}),
+							);
+							return;
+						}
+
+						socket.send(
+							JSON.stringify({
+								type: "input_sent",
+								payload: { sessionId },
+							}),
+						);
+						emitStatus(socket, sessionId, "running");
+						if (input.includes("Multiply that by 4")) {
+							emitAssistantMessage(socket, sessionId, "16");
+						} else if (input.includes("What was my original question")) {
+							emitAssistantMessage(
+								socket,
+								sessionId,
+								`Your original question was: ${session.originalPrompt}`,
+							);
+						} else {
+							emitAssistantMessage(socket, sessionId, `echo:${input}`);
+						}
+						emitStatus(socket, sessionId, "idle");
+					}
+				});
+			});
+
+			relayWss.on("connection", (socket) => {
+				socket.on("message", (raw) => {
+					const message = JSON.parse(raw.toString()) as JsonRecord;
+					const type = message["type"];
+
+					if (type === "register") {
+						relayUplinkSocket = socket;
+						socket.send(JSON.stringify({ type: "registered", pairingCode: "121212" }));
+						return;
+					}
+
+					if (type === "pair" || type === "resume") {
+						relayMobileSocket = socket;
+						socket.send(
+							JSON.stringify({
+								type: "paired",
+								uplinkDeviceId: "uplink-runtime-matrix-1",
+							}),
+						);
+						relayUplinkSocket?.send(
+							JSON.stringify({
+								type: "paired",
+								mobileDeviceId: String(message["deviceId"] ?? "mobile-runtime-matrix-1"),
+							}),
+						);
+						return;
+					}
+
+					if (type !== "message") return;
+					if (socket === relayMobileSocket) {
+						relayUplinkSocket?.send(raw.toString());
+					} else if (socket === relayUplinkSocket) {
+						relayMobileSocket?.send(raw.toString());
+					}
+				});
+			});
+
+			const bridge = await startRelayUplinkBridge({
+				relayUrl: `ws://127.0.0.1:${relayPort}`,
+				uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+				repoPath: tempRepoDir,
+			});
+
+			let mobileSocket: WebSocket | null = null;
+			try {
+				const mobilePayloads: JsonRecord[] = [];
+				const attachPayloadListener = (socket: WebSocket): void => {
+					socket.on("message", (raw) => {
+						const envelope = JSON.parse(raw.toString()) as JsonRecord;
+						if (envelope["type"] !== "message") return;
+						const payload = envelope["payload"] as JsonRecord | undefined;
+						if (!payload) return;
+						mobilePayloads.push(payload);
+					});
+				};
+
+				mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+				await waitForOpen(mobileSocket);
+				attachPayloadListener(mobileSocket);
+
+				mobileSocket.send(
+					JSON.stringify({
+						type: "pair",
+						deviceId: `mobile-runtime-matrix-${runtime}`,
+						pin: bridge.pairingCode,
+						deviceType: "mobile",
+					}),
+				);
+
+				await waitForCondition(
+					() => mobilePayloads.some((payload) => payload["type"] === "session_list"),
+					8000,
+				);
+
+				mobileSocket.send(
+					JSON.stringify({
+						type: "message",
+						payload: {
+							type: "new_session",
+							runtime,
+							prompt: "What is 2+2?",
+						},
+					}),
+				);
+
+				await waitForCondition(
+					() =>
+						mobilePayloads.some(
+							(payload) => payload["type"] === "session_message" && payload["content"] === "4",
+						),
+					8000,
+				);
+
+				let sessionId = "";
+				await waitForCondition(() => {
+					const listPayload = [...mobilePayloads]
+						.reverse()
+						.find((payload) => payload["type"] === "session_list");
+					const sessions = listPayload?.["sessions"];
+					if (!Array.isArray(sessions)) {
+						return false;
+					}
+
+					const matching = sessions.find((session) => {
+						const record = session as JsonRecord;
+						return record["runtime"] === runtime && typeof record["id"] === "string";
+					});
+					if (!matching) {
+						return false;
+					}
+					sessionId = String((matching as JsonRecord)["id"] ?? "");
+					return sessionId.length > 0;
+				}, 8000);
+
+				mobileSocket.send(
+					JSON.stringify({
+						type: "message",
+						payload: {
+							type: "send_prompt",
+							sessionId,
+							prompt: "Multiply that by 4",
+						},
+					}),
+				);
+
+				await waitForCondition(
+					() =>
+						mobilePayloads.some(
+							(payload) =>
+								payload["type"] === "session_message" &&
+								payload["sessionId"] === sessionId &&
+								payload["content"] === "16",
+						),
+					8000,
+				);
+
+				mobileSocket.close();
+				await new Promise((resolve) => setTimeout(resolve, 50));
+
+				mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+				await waitForOpen(mobileSocket);
+				attachPayloadListener(mobileSocket);
+				mobileSocket.send(
+					JSON.stringify({
+						type: "resume",
+						deviceId: `mobile-runtime-matrix-${runtime}`,
+						uplinkDeviceId: "uplink-runtime-matrix-1",
+						deviceType: "mobile",
+					}),
+				);
+
+				await waitForCondition(
+					() =>
+						mobilePayloads.some(
+							(payload) =>
+								payload["type"] === "session_list" &&
+								Array.isArray(payload["sessions"]) &&
+								(payload["sessions"] as JsonRecord[]).some(
+									(session) => session["id"] === sessionId,
+								),
+						),
+					8000,
+				);
+
+				mobileSocket.send(
+					JSON.stringify({
+						type: "message",
+						payload: {
+							type: "send_prompt",
+							sessionId,
+							prompt: "What was my original question?",
+						},
+					}),
+				);
+
+				await waitForCondition(
+					() =>
+						mobilePayloads.some(
+							(payload) =>
+								payload["type"] === "session_message" &&
+								payload["sessionId"] === sessionId &&
+								String(payload["content"]).includes("What is 2+2?"),
+						),
+					8000,
+				);
+
+				const statusEvents = mobilePayloads.filter(
+					(payload) => payload["type"] === "session_status" && payload["sessionId"] === sessionId,
+				);
+				const statusValues = statusEvents
+					.map((payload) => payload["status"])
+					.filter((status): status is string => typeof status === "string");
+
+				expect(statusValues).toContain("running");
+				expect(statusValues).toContain("idle");
+				expect(
+					mobilePayloads.some(
+						(payload) =>
+							payload["type"] === "session_status" &&
+							payload["sessionId"] === sessionId &&
+							payload["status"] === "error",
+					),
+				).toBe(false);
+			} finally {
+				if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+					mobileSocket.close();
+				}
+				await bridge.stop();
+			}
+		}, 30_000);
+	}
 });
 
 async function createWsServer(): Promise<WebSocketServer> {

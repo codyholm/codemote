@@ -5,7 +5,10 @@ import { dirname, join } from "node:path";
 import { WebSocket } from "ws";
 
 import { WS_MAX_PAYLOAD_BYTES } from "./messageLimits.js";
+import type { EncryptedPayload } from "./protocol.js";
+import { ReplayGuard } from "./replayProtection.js";
 import { detectTailscaleEndpoint } from "./tailscale.js";
+import { validateEncryptedPayload } from "./validateEncryptedPayload.js";
 
 import type {
 	RuntimeType,
@@ -27,6 +30,18 @@ interface RelayPairedMessage {
 	mobileDeviceId?: string;
 }
 
+interface RelayUnpairedMessage {
+	type: "unpaired";
+	uplinkDeviceId?: string;
+	mobileDeviceId?: string;
+}
+
+interface RelayMobileDisconnectedMessage {
+	type: "mobile_disconnected";
+	uplinkDeviceId?: string;
+	mobileDeviceId?: string;
+}
+
 interface RelayMessageMessage {
 	type: "message";
 	payload?: unknown;
@@ -40,6 +55,8 @@ interface RelayErrorMessage {
 type RelayInboundMessage =
 	| RelayRegisteredMessage
 	| RelayPairedMessage
+	| RelayUnpairedMessage
+	| RelayMobileDisconnectedMessage
 	| RelayMessageMessage
 	| RelayErrorMessage;
 
@@ -113,7 +130,7 @@ interface DiffMessage {
 }
 
 interface DeviceEndpointMessage {
-	kind: "tailscale";
+	kind: "local" | "tailscale" | "hosted";
 	url: string;
 }
 
@@ -166,6 +183,7 @@ interface DirectoryListingMessage {
 	type: "directory_listing";
 	path: string;
 	entries: Array<{ name: string; isDirectory: boolean; isGitRepo: boolean }>;
+	error?: string;
 }
 
 interface GitStatusMessage {
@@ -271,8 +289,28 @@ export interface RelayUplinkBridgeConfig {
 	relayWsOptions?: WebSocket.ClientOptions;
 	uplinkUrl: string;
 	repoPath: string;
+	/**
+	 * Preferred local endpoint URL that should be advertised back to mobile clients.
+	 * Example: wss://192.168.1.25:8080/ws
+	 */
+	localEndpointUrl?: string;
+	/**
+	 * Hosted endpoint URL that should be advertised when remote relay mode is enabled.
+	 */
+	hostedEndpointUrl?: string;
+	/**
+	 * Optional decoder for end-to-end encrypted relay payloads.
+	 * When omitted, encrypted payloads are rejected after validation + replay checks.
+	 */
+	decryptEncryptedPayload?: (payload: EncryptedPayload) => unknown;
 	onPairingCode?: (code: string) => void;
 	onMobilePaired?: () => void;
+	onMobileDisconnected?: () => void;
+	onSessionStatus?: (info: {
+		sessionId: string;
+		runtime: RuntimeType;
+		status: SessionStatus;
+	}) => void;
 	log?: (message: string) => void;
 }
 
@@ -583,16 +621,27 @@ function parseTimeoutOverride(raw: string | undefined): number | undefined {
 export async function startRelayUplinkBridge(
 	config: RelayUplinkBridgeConfig,
 ): Promise<RelayUplinkBridgeHandle> {
-	const { relayUrl, relayWsOptions, uplinkUrl, repoPath, onPairingCode, onMobilePaired, log } =
-		config;
+	const {
+		relayUrl,
+		relayWsOptions,
+		uplinkUrl,
+		repoPath,
+		localEndpointUrl,
+		hostedEndpointUrl,
+		decryptEncryptedPayload,
+		onPairingCode,
+		onMobilePaired,
+		onMobileDisconnected,
+		onSessionStatus,
+		log,
+	} = config;
 
 	const uplinkDeviceId = await getOrCreateUplinkDeviceId();
-	const relayPort = relayPortFromURL(relayUrl);
-	const relaySecure = relayUrl.startsWith("wss://");
 
 	const sessions = new Map<string, SessionInfo>();
 	const approvalRequests = new Map<string, { sessionId: string }>();
-	let mobileDeviceId: string | null = null;
+	const replayGuard = new ReplayGuard();
+	const mobileDeviceIds = new Set<string>();
 	let pairingCode = "";
 
 	const relayWs = relayWsOptions
@@ -619,7 +668,29 @@ export async function startRelayUplinkBridge(
 		});
 	});
 
+	function markMobilePaired(deviceId: string): void {
+		const hadAny = mobileDeviceIds.size > 0;
+		mobileDeviceIds.add(deviceId);
+		if (!hadAny) {
+			onMobilePaired?.();
+		}
+	}
+
+	function markMobileDisconnected(deviceId?: string): void {
+		const hadAny = mobileDeviceIds.size > 0;
+		if (!hadAny) return;
+		if (deviceId) {
+			mobileDeviceIds.delete(deviceId);
+		} else {
+			mobileDeviceIds.clear();
+		}
+		if (hadAny && mobileDeviceIds.size === 0) {
+			onMobileDisconnected?.();
+		}
+	}
+
 	relayWs.on("close", () => {
+		markMobileDisconnected();
 		log?.("[Bridge] Relay WebSocket closed");
 	});
 
@@ -662,8 +733,7 @@ export async function startRelayUplinkBridge(
 
 			case "paired":
 				if (relayMessage.mobileDeviceId) {
-					mobileDeviceId = relayMessage.mobileDeviceId;
-					onMobilePaired?.();
+					markMobilePaired(relayMessage.mobileDeviceId);
 					log?.("[Bridge] Mobile paired");
 					await syncSessionsFromUplink();
 					sendSessionList();
@@ -671,8 +741,38 @@ export async function startRelayUplinkBridge(
 				}
 				return;
 
+			case "unpaired":
+			case "mobile_disconnected":
+				markMobileDisconnected(relayMessage.mobileDeviceId);
+				log?.(
+					relayMessage.type === "unpaired"
+						? "[Bridge] Mobile unpaired"
+						: "[Bridge] Mobile disconnected",
+				);
+				return;
+
 			case "message": {
-				const decoded = decodeMobileInbound(relayMessage.payload);
+				let inboundPayload: unknown = relayMessage.payload;
+				const encrypted = validateEncryptedPayload(relayMessage.payload);
+				if (encrypted.ok) {
+					const replayCheck = replayGuard.check(encrypted.value);
+					if (!replayCheck.ok) {
+						dropMessage(`encrypted_payload_rejected_${replayCheck.reason}`);
+						return;
+					}
+					if (!decryptEncryptedPayload) {
+						dropMessage("encrypted_payload_no_decoder");
+						return;
+					}
+					try {
+						inboundPayload = decryptEncryptedPayload(encrypted.value);
+					} catch {
+						dropMessage("encrypted_payload_decode_failed");
+						return;
+					}
+				}
+
+				const decoded = decodeMobileInbound(inboundPayload);
 				if (!decoded) {
 					dropMessage("invalid_mobile_message");
 					return;
@@ -729,25 +829,44 @@ export async function startRelayUplinkBridge(
 		return error instanceof Error ? error.message : String(error);
 	}
 
-	function ensureErrorSession(sessionId: string): void {
+	async function hydrateSessionFromUplink(sessionId: string): Promise<SessionInfo | undefined> {
 		const existing = sessions.get(sessionId);
 		if (existing) {
-			existing.status = "error";
-			return;
+			return existing;
 		}
-
-		sessions.set(sessionId, {
-			id: sessionId,
-			runtime: "opencode",
-			status: "error",
-			createdAt: Date.now(),
-		});
+		try {
+			const response = await uplinkClient.listSessions();
+			if (response.type !== "sessions") {
+				return undefined;
+			}
+			const fromUplink = response.payload.find((session) => session.id === sessionId);
+			if (!fromUplink) {
+				return undefined;
+			}
+			const hydrated = toSessionInfo(fromUplink);
+			sessions.set(sessionId, hydrated);
+			return hydrated;
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to hydrate session ${sessionId} metadata: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+			return undefined;
+		}
 	}
 
-	function notifySessionCommandFailure(sessionId: string, action: string, error: unknown): void {
+	async function notifySessionCommandFailure(
+		sessionId: string,
+		action: string,
+		error: unknown,
+	): Promise<void> {
 		const message = errorMessage(error);
 		log?.(`[Bridge] ${action} failed for session ${sessionId}: ${message}`);
-		ensureErrorSession(sessionId);
+		const hydrated = await hydrateSessionFromUplink(sessionId);
+		if (hydrated) {
+			hydrated.status = "error";
+		}
 		sendToMobile({
 			type: "session_status",
 			sessionId,
@@ -758,14 +877,16 @@ export async function startRelayUplinkBridge(
 			sessionId,
 			text: `${action} failed. ${message}`,
 		});
-		sendSessionList();
+		if (hydrated) {
+			sendSessionList();
+		}
 	}
 
 	async function handleSendPrompt(message: SendPromptMessage): Promise<void> {
 		try {
 			await uplinkClient.sendInput(message.sessionId, message.prompt);
 		} catch (error) {
-			notifySessionCommandFailure(message.sessionId, "Send prompt", error);
+			await notifySessionCommandFailure(message.sessionId, "Send prompt", error);
 		}
 	}
 
@@ -773,7 +894,7 @@ export async function startRelayUplinkBridge(
 		try {
 			await uplinkClient.stopSession(message.sessionId);
 		} catch (error) {
-			notifySessionCommandFailure(message.sessionId, "Stop session", error);
+			await notifySessionCommandFailure(message.sessionId, "Stop session", error);
 		}
 	}
 
@@ -944,12 +1065,13 @@ export async function startRelayUplinkBridge(
 				bypassQueue: true,
 			});
 		} catch (error) {
-			notifySessionCommandFailure(pending.sessionId, "Approval response", error);
+			await notifySessionCommandFailure(pending.sessionId, "Approval response", error);
 		}
 	}
 
 	async function handleUplinkEvent(event: StreamEvent): Promise<void> {
-		if (!mobileDeviceId) {
+		const hasConnectedMobiles = mobileDeviceIds.size > 0;
+		if (!hasConnectedMobiles && event.type !== "session.status") {
 			return;
 		}
 
@@ -1025,16 +1147,14 @@ export async function startRelayUplinkBridge(
 			case "session.status": {
 				const payload = event.payload as { status?: SessionStatus };
 				const status = payload.status ?? "running";
-				const session = sessions.get(event.sessionId);
+				const session =
+					(await hydrateSessionFromUplink(event.sessionId)) ?? sessions.get(event.sessionId);
 				if (session) {
 					session.status = status;
 				} else {
-					sessions.set(event.sessionId, {
-						id: event.sessionId,
-						runtime: "opencode",
-						status,
-						createdAt: Date.now(),
-					});
+					log?.(
+						`[Bridge] Received session.status for unknown session ${event.sessionId}; skipping synthetic session creation`,
+					);
 				}
 
 				sendToMobile({
@@ -1042,8 +1162,16 @@ export async function startRelayUplinkBridge(
 					sessionId: event.sessionId,
 					status,
 				});
-				await syncSessionRuntimeMetadata(event.sessionId);
-				sendSessionList();
+				const runtime = sessions.get(event.sessionId)?.runtime;
+				if (runtime) {
+					onSessionStatus?.({
+						sessionId: event.sessionId,
+						runtime,
+						status,
+					});
+					await syncSessionRuntimeMetadata(event.sessionId);
+					sendSessionList();
+				}
 				return;
 			}
 			case "attention.required": {
@@ -1111,13 +1239,13 @@ export async function startRelayUplinkBridge(
 				entries: response.payload.entries,
 			});
 		} catch (error) {
-			log?.(
-				`[Bridge] Failed to list directory: ${error instanceof Error ? error.message : String(error)}`,
-			);
+			const reason = error instanceof Error ? error.message : String(error);
+			log?.(`[Bridge] Failed to list directory: ${reason}`);
 			sendToMobile({
 				type: "directory_listing",
 				path: message.path ?? "",
 				entries: [],
+				error: reason,
 			});
 		}
 	}
@@ -1253,14 +1381,14 @@ export async function startRelayUplinkBridge(
 	function sendSessionList(): void {
 		const sessionsList = Array.from(sessions.values()).sort((a, b) => b.createdAt - a.createdAt);
 		log?.(
-			`[Bridge] sendSessionList: ${sessionsList.length} sessions, mobileDeviceId=${mobileDeviceId ? "set" : "null"}`,
+			`[Bridge] sendSessionList: ${sessionsList.length} sessions, mobileCount=${mobileDeviceIds.size}`,
 		);
 		sendToMobile({ type: "session_list", sessions: sessionsList });
 	}
 
 	function sendToMobile(message: MobileOutboundMessage): void {
-		if (!mobileDeviceId) {
-			log?.(`[Bridge] sendToMobile: skipped (no mobileDeviceId), type=${message.type}`);
+		if (mobileDeviceIds.size === 0) {
+			log?.(`[Bridge] sendToMobile: skipped (no paired mobiles), type=${message.type}`);
 			return;
 		}
 
@@ -1348,18 +1476,36 @@ export async function startRelayUplinkBridge(
 	}
 
 	async function sendDeviceInfoToMobile(): Promise<void> {
-		const tailscaleEndpoint = await detectTailscaleEndpoint({
-			port: relayPort,
-			secure: relaySecure,
-		});
-		if (!tailscaleEndpoint) {
+		const endpoints: DeviceEndpointMessage[] = [];
+
+		const normalizedLocal = normalizeEndpointUrl(localEndpointUrl);
+		if (normalizedLocal) {
+			endpoints.push({ kind: "local", url: normalizedLocal });
+		}
+
+		if (normalizedLocal) {
+			const tailscaleEndpoint = await detectTailscaleEndpoint({
+				port: relayPortFromURL(normalizedLocal),
+				secure: normalizedLocal.startsWith("wss://"),
+			});
+			if (tailscaleEndpoint) {
+				endpoints.push({ kind: "tailscale", url: tailscaleEndpoint.url });
+			}
+		}
+
+		const normalizedHosted = normalizeEndpointUrl(hostedEndpointUrl);
+		if (normalizedHosted) {
+			endpoints.push({ kind: "hosted", url: normalizedHosted });
+		}
+
+		if (endpoints.length === 0) {
 			return;
 		}
 
 		sendToMobile({
 			type: "device_info",
 			uplinkDeviceId,
-			endpoints: [{ kind: "tailscale", url: tailscaleEndpoint.url }],
+			endpoints,
 		});
 	}
 
@@ -1383,6 +1529,23 @@ export async function startRelayUplinkBridge(
 			}
 		},
 	};
+}
+
+function normalizeEndpointUrl(value: string | undefined): string | null {
+	if (!value) {
+		return null;
+	}
+
+	const trimmed = value.trim();
+	if (trimmed.length === 0) {
+		return null;
+	}
+
+	try {
+		return new URL(trimmed).toString();
+	} catch {
+		return null;
+	}
 }
 
 async function getOrCreateUplinkDeviceId(): Promise<string> {
@@ -1476,6 +1639,15 @@ function decodeRelayInbound(raw: unknown): RelayInboundMessage | null {
 		const mobileDeviceId = (raw as { mobileDeviceId?: unknown }).mobileDeviceId;
 		return {
 			type: "paired",
+			...(typeof uplinkDeviceId === "string" ? { uplinkDeviceId } : {}),
+			...(typeof mobileDeviceId === "string" ? { mobileDeviceId } : {}),
+		};
+	}
+	if (type === "unpaired" || type === "mobile_disconnected") {
+		const uplinkDeviceId = (raw as { uplinkDeviceId?: unknown }).uplinkDeviceId;
+		const mobileDeviceId = (raw as { mobileDeviceId?: unknown }).mobileDeviceId;
+		return {
+			type,
 			...(typeof uplinkDeviceId === "string" ? { uplinkDeviceId } : {}),
 			...(typeof mobileDeviceId === "string" ? { mobileDeviceId } : {}),
 		};

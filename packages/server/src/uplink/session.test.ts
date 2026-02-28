@@ -58,6 +58,20 @@ describe("SessionManager", () => {
 		expect(updated?.status).toBe("error");
 	});
 
+	it("clears endedAt when session resumes from terminal state", () => {
+		const manager = new SessionManager();
+		const session = manager.create("claude", mockWorkspace);
+
+		manager.updateStatus(session.id, "ended");
+		const endedAt = manager.get(session.id)?.endedAt;
+		expect(endedAt).not.toBeNull();
+
+		manager.updateStatus(session.id, "running");
+		const resumed = manager.get(session.id);
+		expect(resumed?.status).toBe("running");
+		expect(resumed?.endedAt).toBeNull();
+	});
+
 	it("lists active sessions", () => {
 		const manager = new SessionManager();
 		const s1 = manager.create("opencode", mockWorkspace);

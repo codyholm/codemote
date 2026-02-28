@@ -114,6 +114,12 @@ exit 0
 		// Should have status events
 		const statusEvents = events.filter((e) => (e as { type: string }).type === "session.status");
 		expect(statusEvents.length).toBeGreaterThan(0);
+		const statuses = statusEvents.map(
+			(event) => (event as { payload: { status: string } }).payload.status,
+		);
+		expect(statuses[0]).toBe("starting");
+		expect(statuses).toContain("running");
+		expect(statuses).toContain("idle");
 
 		// Should map agent messages into structured session messages
 		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
@@ -266,6 +272,58 @@ exit 2
 				(e as { payload: { status?: string } }).payload.status === "starting",
 		);
 		expect(startingEvents.length).toBeGreaterThan(1);
+
+		activeSessionId = null;
+	});
+
+	it("preserves parentToolUseId metadata on structured events", async () => {
+		const parentMockPath = join(testDir, "mock-codex-parent");
+		const parentScript = `#!/bin/sh
+echo '{"type":"thread.started","thread_id":"parent-thread"}'
+sleep 0.1
+echo '{"type":"turn.started"}'
+sleep 0.1
+echo '{"type":"item.message","parent_tool_use_id":"parent_123","content":[{"type":"output_text","text":"Nested assistant output"}]}'
+sleep 0.1
+echo '{"type":"item.started","item":{"id":"item_9","type":"command_execution","command":"echo nested","parent_tool_use_id":"parent_123"}}'
+sleep 0.1
+echo '{"type":"item.completed","item":{"id":"item_9","type":"command_execution","command":"echo nested","aggregated_output":"nested","exit_code":0,"status":"completed","parent_tool_use_id":"parent_123"}}'
+sleep 0.1
+echo '{"type":"turn.completed"}'
+exit 0
+`;
+		await writeFile(parentMockPath, parentScript);
+		await chmod(parentMockPath, 0o755);
+
+		activeExecutor = new CodexExecutor(workspaceManager, sessionManager, eventBus, {
+			codexPath: parentMockPath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "codex",
+			workspace: testDir,
+			initialPrompt: "parent metadata",
+		});
+		activeSessionId = result.sessionId;
+
+		await new Promise((r) => setTimeout(r, 1200));
+
+		const messageEvent = events.find(
+			(event) => (event as { type: string }).type === "session.message",
+		) as { payload?: { parentToolUseId?: string } } | undefined;
+		const toolCallEvent = events.find(
+			(event) => (event as { type: string }).type === "session.tool_call",
+		) as { payload?: { parentToolUseId?: string } } | undefined;
+		const toolResultEvent = events.find(
+			(event) => (event as { type: string }).type === "session.tool_result",
+		) as { payload?: { parentToolUseId?: string } } | undefined;
+
+		expect(messageEvent?.payload?.parentToolUseId).toBe("parent_123");
+		expect(toolCallEvent?.payload?.parentToolUseId).toBe("parent_123");
+		expect(toolResultEvent?.payload?.parentToolUseId).toBe("parent_123");
 
 		activeSessionId = null;
 	});
