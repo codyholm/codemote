@@ -8,6 +8,16 @@ import { SessionManager } from "../session.js";
 import { WorkspaceManager } from "../workspace.js";
 import { CodexExecutor } from "./codex.js";
 
+async function waitFor(condition: () => boolean, timeoutMs = 5000, intervalMs = 50): Promise<void> {
+	const start = Date.now();
+	while (!condition()) {
+		if (Date.now() - start > timeoutMs) {
+			throw new Error("Condition not met within timeout");
+		}
+		await new Promise((r) => setTimeout(r, intervalMs));
+	}
+}
+
 describe("CodexExecutor", () => {
 	let testDir: string;
 	let mockCodexPath: string;
@@ -105,8 +115,7 @@ exit 0
 		expect(result.sessionId).toBeDefined();
 		expect(result.runId).toBeDefined();
 
-		// Wait for mock script to complete and events to propagate
-		await new Promise((r) => setTimeout(r, 1500));
+		await waitFor(() => sessionManager.get(result.sessionId)?.status === "ended");
 
 		// Should have received events
 		expect(events.length).toBeGreaterThan(0);
@@ -185,7 +194,9 @@ exit 0
 		});
 		activeSessionId = result.sessionId;
 
-		await new Promise((r) => setTimeout(r, 800));
+		await waitFor(() =>
+			events.some((event) => (event as { type: string }).type === "session.message"),
+		);
 
 		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
 		expect(messageEvents.length).toBeGreaterThan(0);
@@ -250,12 +261,20 @@ exit 2
 		});
 		activeSessionId = result.sessionId;
 
-		await new Promise((r) => setTimeout(r, 900));
+		await waitFor(() => sessionManager.get(result.sessionId)?.status === "ended");
 		expect(sessionManager.get(result.sessionId)?.status).toBe("ended");
 		expect(sessionManager.get(result.sessionId)?.runtimeSessionId).toBe("resume-thread");
 
 		await activeExecutor.sendInput(result.sessionId, "What question did I ask you?");
-		await new Promise((r) => setTimeout(r, 900));
+		await waitFor(() =>
+			events.some((event) => {
+				if ((event as { type: string }).type !== "session.message") {
+					return false;
+				}
+				const content = ((event as { payload: { content?: string } }).payload.content ?? "").trim();
+				return content.includes('You asked: "What is 8 + 9?"');
+			}),
+		);
 
 		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
 		const messageContents = messageEvents.map((e) =>
@@ -309,7 +328,9 @@ exit 0
 		});
 		activeSessionId = result.sessionId;
 
-		await new Promise((r) => setTimeout(r, 1200));
+		await waitFor(() =>
+			events.some((event) => (event as { type: string }).type === "session.tool_result"),
+		);
 
 		const messageEvent = events.find(
 			(event) => (event as { type: string }).type === "session.message",
