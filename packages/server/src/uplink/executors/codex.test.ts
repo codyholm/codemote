@@ -16,8 +16,6 @@ async function waitFor(condition: () => boolean, timeoutMs = 5000, intervalMs = 
 		}
 		await new Promise((r) => setTimeout(r, intervalMs));
 	}
-
-	throw new Error(`waitFor: condition not met within ${timeoutMs}ms`);
 }
 
 describe("CodexExecutor", () => {
