@@ -1,8 +1,9 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	buildServicePath,
 	installService,
 	readServiceLogs,
 	readServiceStatus,
@@ -13,11 +14,14 @@ import {
 describe("service", () => {
 	let tempHome = "";
 	let originalHome: string | undefined;
+	let originalUserProfile: string | undefined;
 
 	beforeEach(async () => {
 		originalHome = process.env["HOME"];
+		originalUserProfile = process.env["USERPROFILE"];
 		tempHome = await mkdtemp(join(tmpdir(), "codemote-service-test-"));
 		process.env["HOME"] = tempHome;
+		process.env["USERPROFILE"] = tempHome;
 	});
 
 	afterEach(async () => {
@@ -32,6 +36,11 @@ describe("service", () => {
 		} else {
 			process.env["HOME"] = originalHome;
 		}
+		if (originalUserProfile === undefined) {
+			Reflect.deleteProperty(process.env, "USERPROFILE");
+		} else {
+			process.env["USERPROFILE"] = originalUserProfile;
+		}
 	});
 
 	it("resolves service paths under HOME", () => {
@@ -40,6 +49,11 @@ describe("service", () => {
 		expect(paths.statusFile.startsWith(tempHome)).toBe(true);
 		expect(paths.launchAgentPlist.startsWith(tempHome)).toBe(true);
 		expect(paths.systemdUnit.startsWith(tempHome)).toBe(true);
+	});
+
+	it("builds service PATH using platform delimiter", () => {
+		const servicePath = buildServicePath(process.execPath);
+		expect(servicePath.split(delimiter).length).toBeGreaterThan(1);
 	});
 
 	it("writes platform service definition for serve mode", async () => {

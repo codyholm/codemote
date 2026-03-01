@@ -103,6 +103,108 @@ describe("getLocalIP", () => {
 		expect(ip).toBe("10.0.0.5");
 	});
 
+	it("should prefer Ethernet interface on Windows", () => {
+		vi.spyOn(os, "networkInterfaces").mockReturnValue({
+			"vEthernet (Default Switch)": [
+				{
+					address: "172.16.0.1",
+					netmask: "255.255.255.0",
+					family: "IPv4",
+					mac: "aa:bb:cc:dd:ee:00",
+					internal: false,
+					cidr: "172.16.0.1/24",
+				},
+			],
+			Ethernet: [
+				{
+					address: "192.168.0.10",
+					netmask: "255.255.255.0",
+					family: "IPv4",
+					mac: "aa:bb:cc:dd:ee:ff",
+					internal: false,
+					cidr: "192.168.0.10/24",
+				},
+			],
+		});
+
+		const ip = getLocalIP();
+		expect(ip).toBe("192.168.0.10");
+	});
+
+	it("should prefer Wi-Fi interface on Windows", () => {
+		vi.spyOn(os, "networkInterfaces").mockReturnValue({
+			"Wi-Fi": [
+				{
+					address: "192.168.0.20",
+					netmask: "255.255.255.0",
+					family: "IPv4",
+					mac: "aa:bb:cc:dd:ee:11",
+					internal: false,
+					cidr: "192.168.0.20/24",
+				},
+			],
+		});
+
+		const ip = getLocalIP();
+		expect(ip).toBe("192.168.0.20");
+	});
+
+	it("should skip Windows virtual adapters (vEthernet)", () => {
+		vi.spyOn(os, "networkInterfaces").mockReturnValue({
+			"vEthernet (WSL)": [
+				{
+					address: "172.16.1.1",
+					netmask: "255.255.255.0",
+					family: "IPv4",
+					mac: "aa:bb:cc:dd:ee:22",
+					internal: false,
+					cidr: "172.16.1.1/24",
+				},
+			],
+			"Some Adapter": [
+				{
+					address: "10.0.0.9",
+					netmask: "255.255.255.0",
+					family: "IPv4",
+					mac: "aa:bb:cc:dd:ee:33",
+					internal: false,
+					cidr: "10.0.0.9/24",
+				},
+			],
+		});
+
+		const ip = getLocalIP();
+		expect(ip).toBe("10.0.0.9");
+	});
+
+	it("should skip Loopback Pseudo-Interface 1", () => {
+		vi.spyOn(os, "networkInterfaces").mockReturnValue({
+			"Loopback Pseudo-Interface 1": [
+				{
+					address: "192.168.55.5",
+					netmask: "255.255.255.0",
+					family: "IPv4",
+					mac: "00:00:00:00:00:00",
+					internal: false,
+					cidr: "192.168.55.5/24",
+				},
+			],
+			"Some Adapter": [
+				{
+					address: "10.0.0.10",
+					netmask: "255.255.255.0",
+					family: "IPv4",
+					mac: "aa:bb:cc:dd:ee:44",
+					internal: false,
+					cidr: "10.0.0.10/24",
+				},
+			],
+		});
+
+		const ip = getLocalIP();
+		expect(ip).toBe("10.0.0.10");
+	});
+
 	it("should skip docker interfaces", () => {
 		vi.spyOn(os, "networkInterfaces").mockReturnValue({
 			docker0: [

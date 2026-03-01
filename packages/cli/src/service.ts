@@ -1,20 +1,32 @@
 import { spawn } from "node:child_process";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 
 const DARWIN_LABEL = "app.codemote.service";
 const LINUX_UNIT = "codemote.service";
-const SERVICE_PATH_FALLBACK_SEGMENTS = [
-	"/opt/homebrew/bin",
-	"/opt/homebrew/sbin",
-	"/usr/local/bin",
-	"/usr/local/sbin",
-	"/usr/bin",
-	"/bin",
-	"/usr/sbin",
-	"/sbin",
-];
+
+function getServicePathFallbackSegments(): string[] {
+	const home = homedir();
+	return process.platform === "win32"
+		? [
+				join(home, "AppData", "Roaming", "npm"),
+				join(home, ".volta", "bin"),
+				join(home, "scoop", "shims"),
+			]
+		: [
+				"/opt/homebrew/bin",
+				"/opt/homebrew/sbin",
+				"/usr/local/bin",
+				"/usr/local/sbin",
+				"/usr/bin",
+				"/bin",
+				"/usr/sbin",
+				"/sbin",
+				join(home, ".local", "bin"),
+				join(home, ".volta", "bin"),
+			];
+}
 
 export interface ServicePaths {
 	logFile: string;
@@ -282,19 +294,18 @@ WantedBy=default.target
 	await runCommand("systemctl", ["--user", "enable", LINUX_UNIT], { allowFailure: true });
 }
 
-function buildServicePath(nodePath: string): string {
+export function buildServicePath(nodePath: string): string {
 	const segments = new Set<string>();
 	const nodeDir = dirname(nodePath);
 	if (nodeDir.length > 0) {
 		segments.add(nodeDir);
 	}
-	segments.add(join(homedir(), ".local", "bin"));
 
-	for (const segment of SERVICE_PATH_FALLBACK_SEGMENTS) {
+	for (const segment of getServicePathFallbackSegments()) {
 		segments.add(segment);
 	}
 
-	return Array.from(segments).join(":");
+	return Array.from(segments).join(delimiter);
 }
 
 function xmlEscape(value: string): string {

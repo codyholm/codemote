@@ -1,6 +1,7 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { RunOptions, RuntimeType } from "@codemote/common";
+import spawn from "cross-spawn";
 import { BaseExecutor } from "../executor.js";
 import type { Session } from "../types.js";
 
@@ -132,6 +133,15 @@ export class OpenCodeExecutor extends BaseExecutor {
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		openCodeSession.process = proc;
+
+		if (!proc.stdout || !proc.stderr) {
+			proc.kill("SIGTERM");
+			openCodeSession.running = false;
+			openCodeSession.process = null;
+			this.emitOutput(session.id, "Error: OpenCode stdout/stderr streams not available\n");
+			this.emitStatus(session.id, "error");
+			throw new Error("OpenCode stdout/stderr streams not available");
+		}
 
 		const stdoutLines = createInterface({ input: proc.stdout });
 		const stderrLines = createInterface({ input: proc.stderr });

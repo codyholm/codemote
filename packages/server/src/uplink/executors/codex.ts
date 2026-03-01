@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import {
 	type RunOptions,
@@ -6,6 +6,7 @@ import {
 	SessionNotActiveError,
 	SessionNotFoundError,
 } from "@codemote/common";
+import spawn from "cross-spawn";
 import { BaseExecutor } from "../executor.js";
 import type { Session } from "../types.js";
 

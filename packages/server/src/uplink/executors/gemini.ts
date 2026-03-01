@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { RunOptions, RuntimeType } from "@codemote/common";
+import spawn from "cross-spawn";
 import { BaseExecutor } from "../executor.js";
 import type { Session } from "../types.js";
 
@@ -129,7 +129,17 @@ export class GeminiExecutor extends BaseExecutor {
 				TERM: "dumb",
 			},
 			stdio: "pipe",
-		});
+		}) as ChildProcessWithoutNullStreams;
+
+		if (!proc.stdout || !proc.stderr) {
+			proc.kill("SIGTERM");
+			geminiSession.running = false;
+			this.geminiSessions.delete(session.id);
+			this.emitOutput(session.id, "Error: Gemini stdio streams not available\n");
+			this.emitStatus(session.id, "error");
+			throw new Error("Gemini stdio streams not available");
+		}
+
 		geminiSession.process = proc;
 
 		let stdoutBuffer = "";

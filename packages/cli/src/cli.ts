@@ -405,12 +405,37 @@ async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 	}
 
 	// Handle shutdown
-	const cleanup = async () => {
-		console.log("\n[CLI] Shutting down...");
-		mdns.destroy();
-		await server.stop();
-		console.log("[CLI] Goodbye!");
-		process.exit(0);
+	let cleanupDone = false;
+	let cleanupInFlight: Promise<void> | null = null;
+	const cleanup = () => {
+		if (cleanupDone) return;
+		if (cleanupInFlight) return;
+		cleanupInFlight = (async () => {
+			console.log("\n[CLI] Shutting down...");
+
+			try {
+				mdns.destroy();
+			} catch (err) {
+				console.error(
+					`[CLI] Failed to stop mDNS: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+
+			try {
+				await server.stop();
+			} catch (err) {
+				console.error(
+					`[CLI] Failed to stop server: ${err instanceof Error ? err.message : String(err)}`,
+				);
+				process.exitCode = 1;
+			}
+
+			cleanupDone = true;
+			console.log("[CLI] Goodbye!");
+			process.exit(process.exitCode ?? 0);
+		})().finally(() => {
+			cleanupInFlight = null;
+		});
 	};
 
 	process.on("SIGINT", cleanup);

@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { RunOptions, RuntimeType } from "@codemote/common";
+import spawn from "cross-spawn";
 import { BaseExecutor } from "../executor.js";
 import type { Session } from "../types.js";
 
@@ -146,7 +146,16 @@ export class ClaudeExecutor extends BaseExecutor {
 				TERM: "dumb",
 			},
 			stdio: "pipe",
-		});
+		}) as ChildProcessWithoutNullStreams;
+
+		if (!proc.stdout || !proc.stderr || !proc.stdin) {
+			proc.kill("SIGTERM");
+			claudeSession.running = false;
+			this.claudeSessions.delete(session.id);
+			this.emitOutput(session.id, "Error: Claude stdio streams not available\n");
+			this.emitStatus(session.id, "error");
+			throw new Error("Claude stdio streams not available");
+		}
 
 		claudeSession.process = proc;
 

@@ -271,8 +271,8 @@ exit 2
 				if ((event as { type: string }).type !== "session.message") {
 					return false;
 				}
-				const content = ((event as { payload: { content?: string } }).payload.content ?? "").trim();
-				return content.includes('You asked: "What is 8 + 9?"');
+				const content = (event as { payload?: { content?: string } }).payload?.content;
+				return typeof content === "string" && content.includes('You asked: "What is 8 + 9?"');
 			}),
 		);
 
@@ -328,9 +328,30 @@ exit 0
 		});
 		activeSessionId = result.sessionId;
 
-		await waitFor(() =>
-			events.some((event) => (event as { type: string }).type === "session.tool_result"),
-		);
+		await waitFor(() => {
+			const hasMessage = events.some((event) => {
+				if ((event as { type: string }).type !== "session.message") return false;
+				return (
+					(event as { payload?: { parentToolUseId?: string } }).payload?.parentToolUseId ===
+					"parent_123"
+				);
+			});
+			const hasToolCall = events.some((event) => {
+				if ((event as { type: string }).type !== "session.tool_call") return false;
+				return (
+					(event as { payload?: { parentToolUseId?: string } }).payload?.parentToolUseId ===
+					"parent_123"
+				);
+			});
+			const hasToolResult = events.some((event) => {
+				if ((event as { type: string }).type !== "session.tool_result") return false;
+				return (
+					(event as { payload?: { parentToolUseId?: string } }).payload?.parentToolUseId ===
+					"parent_123"
+				);
+			});
+			return hasMessage && hasToolCall && hasToolResult;
+		});
 
 		const messageEvent = events.find(
 			(event) => (event as { type: string }).type === "session.message",

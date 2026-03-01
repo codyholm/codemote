@@ -14,12 +14,14 @@
 		"@codemote/common": "workspace:*",
 		"@fastify/cors": "^11.2.0",
 		"@fastify/websocket": "^11.2.0",
+		"cross-spawn": "7.0.6",
 		"fastify": "^5.6.2",
 		"nanoid": "^5.1.6",
 		"simple-git": "^3.30.0",
 		"ws": "^8.19.0"
 	},
 	"devDependencies": {
+		"@types/cross-spawn": "6.0.6",
 		"@types/node": "^22.19.6",
 		"@types/ws": "^8.18.1",
 		"typescript": "^5.6.0"

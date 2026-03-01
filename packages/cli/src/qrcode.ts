@@ -56,15 +56,16 @@ export function buildPairingURL(
 }
 
 /**
- * Get local IP address from network interfaces
- * Prefers en0 (macOS) or eth0 (Linux), excludes loopback and docker interfaces
+ * Get local IP address from network interfaces.
+ * Prefers common primary adapters on macOS/Linux (en0/eth0/en1/wlan0) and Windows (Ethernet/Wi-Fi),
+ * excluding loopback, docker, and virtual interfaces.
  * @returns Local IP address or fallback to 127.0.0.1
  */
 export function getLocalIP(): string {
 	const interfaces = os.networkInterfaces();
 
 	// Priority order for interface names
-	const preferredInterfaces = ["en0", "eth0", "en1", "wlan0"];
+	const preferredInterfaces = ["en0", "eth0", "en1", "wlan0", "Ethernet", "Wi-Fi"];
 
 	// First pass: try preferred interfaces
 	for (const ifaceName of preferredInterfaces) {
@@ -86,6 +87,8 @@ export function getLocalIP(): string {
 			ifaceName.startsWith("docker") ||
 			ifaceName.startsWith("veth") ||
 			ifaceName.startsWith("br-") ||
+			ifaceName.startsWith("vEthernet") ||
+			ifaceName === "Loopback Pseudo-Interface 1" ||
 			ifaceName === "lo"
 		) {
 			continue;

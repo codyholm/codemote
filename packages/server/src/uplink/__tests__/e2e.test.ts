@@ -66,7 +66,7 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 		const uplinkWs = new WebSocket(`ws://127.0.0.1:${relayPort}/ws`);
 		await waitForOpen(uplinkWs);
 
-		const pairingCodePromise = waitForMessage(uplinkWs);
+		const pairingCodePromise = waitForMessageOfType(uplinkWs, "registered");
 		uplinkWs.send(
 			JSON.stringify({
 				type: "register",
@@ -88,9 +88,9 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 		await waitForOpen(mobileWs);
 
 		// Set up listener for uplink to receive "paired" notification
-		const uplinkPairedPromise = waitForMessage(uplinkWs);
+		const uplinkPairedPromise = waitForMessageOfType(uplinkWs, "paired");
 
-		const pairPromise = waitForMessage(mobileWs);
+		const pairPromise = waitForMessageOfType(mobileWs, "paired");
 		mobileWs.send(
 			JSON.stringify({
 				type: "pair",
@@ -110,7 +110,7 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 		expect(uplinkPaired["mobileDeviceId"]).toBe("mobile-test-device-456");
 
 		// 3. Test message routing (simulated encrypted blob)
-		const messagePromise = waitForMessage(uplinkWs);
+		const messagePromise = waitForMessageOfType(uplinkWs, "message");
 		mobileWs.send(
 			JSON.stringify({
 				type: "message",
@@ -128,8 +128,8 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 		const mobileWs2 = new WebSocket(`ws://127.0.0.1:${relayPort}/ws`);
 		await waitForOpen(mobileWs2);
 
-		const uplinkPairedAgainPromise = waitForMessage(uplinkWs);
-		const resumePromise = waitForMessage(mobileWs2);
+		const uplinkPairedAgainPromise = waitForMessageOfType(uplinkWs, "paired");
+		const resumePromise = waitForMessageOfType(mobileWs2, "paired");
 		mobileWs2.send(
 			JSON.stringify({
 				type: "resume",
@@ -147,7 +147,7 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 		expect(uplinkPairedAgain["type"]).toBe("paired");
 		expect(uplinkPairedAgain["mobileDeviceId"]).toBe("mobile-test-device-456");
 
-		const messageAfterResumePromise = waitForMessage(uplinkWs);
+		const messageAfterResumePromise = waitForMessageOfType(uplinkWs, "message");
 		mobileWs2.send(
 			JSON.stringify({
 				type: "message",
