@@ -294,6 +294,30 @@ printf 'GEMINI_FALLBACK_TRY\\n'
 		activeSessionId = null;
 	});
 
+	it("passes --model when model is provided and preserves it across turns", async () => {
+		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
+			geminiPath: mockGeminiPath,
+		});
+
+		const result = await activeExecutor.startRun({
+			profile: "gemini",
+			workspace: testDir,
+			initialPrompt: "Initial prompt",
+			model: "gemini-2.5-pro",
+		});
+		activeSessionId = result.sessionId;
+
+		await activeExecutor.sendInput(result.sessionId, "Follow-up prompt");
+
+		const argsLog = await readFile(argsLogPath, "utf8");
+		const modelArgsCount = argsLog
+			.split("\n")
+			.filter((line) => line.includes("--model gemini-2.5-pro")).length;
+		expect(modelArgsCount).toBeGreaterThanOrEqual(2);
+
+		activeSessionId = null;
+	});
+
 	it("maps Gemini tool blocks to session.tool_call and session.tool_result events", async () => {
 		const toolMockPath = join(testDir, "mock-gemini-tool");
 		const toolMockScript = `#!/bin/bash

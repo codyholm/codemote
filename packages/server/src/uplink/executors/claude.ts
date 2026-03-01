@@ -40,6 +40,8 @@ function logClaudeDebug(message: string): void {
 interface ClaudeSession {
 	/** Claude's session ID (for resume) */
 	claudeSessionId: string | null;
+	/** Selected model override (optional) */
+	model: string | null;
 	/** Child process (stdio pipes) */
 	process: ChildProcessWithoutNullStreams | null;
 	/** Data buffer for incomplete JSON lines */
@@ -125,10 +127,12 @@ export class ClaudeExecutor extends BaseExecutor {
 	 * Parses streaming JSON events and maps them to our unified event types.
 	 */
 	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
-		const args = this.buildArgs(options.resumeSessionId);
+		const model = options.model?.trim() ? options.model.trim() : null;
+		const args = this.buildArgs(options.resumeSessionId, model);
 
 		const claudeSession: ClaudeSession = {
 			claudeSessionId: null,
+			model,
 			process: null,
 			buffer: "",
 			running: true,
@@ -282,7 +286,7 @@ export class ClaudeExecutor extends BaseExecutor {
 	 * The session stays alive as long as stdin remains open. If a resume ID
 	 * is provided, Claude resumes that persisted conversation thread.
 	 */
-	private buildArgs(resumeSessionId?: string): string[] {
+	private buildArgs(resumeSessionId?: string, model?: string | null): string[] {
 		const args: string[] = [
 			"-p", // Print mode (required for programmatic control)
 			"--verbose", // Include detailed events
@@ -299,13 +303,18 @@ export class ClaudeExecutor extends BaseExecutor {
 			args.push("--dangerously-skip-permissions");
 		}
 
-		// Add any extra configured args
-		args.push(...this.config.extraArgs);
+		const selectedModel = model?.trim();
+		if (selectedModel && selectedModel.length > 0) {
+			args.push("--model", selectedModel);
+		}
 
 		const resumeId = resumeSessionId?.trim();
 		if (resumeId && resumeId.length > 0) {
 			args.push("--resume", resumeId);
 		}
+
+		// Add any extra configured args last so config can override defaults
+		args.push(...this.config.extraArgs);
 
 		return args;
 	}

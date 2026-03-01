@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { simpleGit } from "simple-git";
@@ -16,6 +16,8 @@ async function waitFor(condition: () => boolean, timeoutMs = 5000, intervalMs = 
 		}
 		await new Promise((r) => setTimeout(r, intervalMs));
 	}
+
+	throw new Error(`waitFor: condition not met within ${timeoutMs}ms`);
 }
 
 describe("CodexExecutor", () => {
@@ -291,6 +293,64 @@ exit 2
 				(e as { payload: { status?: string } }).payload.status === "starting",
 		);
 		expect(startingEvents.length).toBeGreaterThan(1);
+
+		activeSessionId = null;
+	});
+
+	it("passes --model when model is provided and preserves it when resuming", async () => {
+		const argsLogPath = join(testDir, "codex-args.log");
+		const modelMockPath = join(testDir, "mock-codex-model");
+		const modelScript = `#!/bin/sh
+echo "$@" >> "${argsLogPath}"
+
+thread_id="mock-thread"
+previous=""
+for arg in "$@"; do
+	if [ "$previous" = "resume" ]; then
+		thread_id="$arg"
+		break
+	fi
+	previous="$arg"
+done
+
+echo '{"type":"thread.started","thread_id":"'"$thread_id"'"}'
+sleep 0.1
+echo '{"type":"session.id","session_id":"'"$thread_id"'"}'
+sleep 0.1
+echo '{"type":"turn.started"}'
+sleep 0.1
+echo '{"type":"turn.completed"}'
+exit 0
+`;
+		await writeFile(modelMockPath, modelScript);
+		await chmod(modelMockPath, 0o755);
+
+		activeExecutor = new CodexExecutor(workspaceManager, sessionManager, eventBus, {
+			codexPath: modelMockPath,
+		});
+
+		const result = await activeExecutor.startRun({
+			profile: "codex",
+			workspace: testDir,
+			initialPrompt: "Hello",
+			model: "o4-mini",
+		});
+		activeSessionId = result.sessionId;
+
+		await waitFor(() => sessionManager.get(result.sessionId)?.runtimeSessionId === "mock-thread");
+		await waitFor(() => sessionManager.get(result.sessionId)?.status === "ended");
+		expect(sessionManager.get(result.sessionId)?.status).toBe("ended");
+
+		await activeExecutor.sendInput(result.sessionId, "Follow-up");
+		await waitFor(() => sessionManager.get(result.sessionId)?.status === "ended");
+
+		const argsLog = await readFile(argsLogPath, "utf8");
+		const lines = argsLog.split("\n").filter(Boolean);
+		expect(lines.length).toBeGreaterThanOrEqual(2);
+		expect(lines.filter((line) => line.includes("--model o4-mini")).length).toBeGreaterThanOrEqual(
+			2,
+		);
+		expect(argsLog).toContain("exec resume mock-thread --json");
 
 		activeSessionId = null;
 	});

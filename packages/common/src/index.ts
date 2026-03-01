@@ -64,6 +64,7 @@ export interface RunOptions {
 	workspace: string;
 	initialPrompt: string;
 	resumeSessionId?: string;
+	model?: string;
 }
 
 export interface RunResult {

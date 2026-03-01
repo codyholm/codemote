@@ -24,6 +24,7 @@ interface GeminiSession {
 	running: boolean;
 	hasHistory: boolean;
 	runtimeSessionId: string | null;
+	model: string | null;
 }
 
 interface GeminiHeadlessResponse {
@@ -65,11 +66,13 @@ export class GeminiExecutor extends BaseExecutor {
 
 	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
 		const resumeSessionId = options.resumeSessionId?.trim();
+		const model = options.model?.trim() ? options.model.trim() : null;
 		const geminiSession: GeminiSession = {
 			process: null,
 			running: false,
 			hasHistory: !!resumeSessionId,
 			runtimeSessionId: resumeSessionId && resumeSessionId.length > 0 ? resumeSessionId : null,
+			model,
 		};
 		if (geminiSession.runtimeSessionId) {
 			this.sessionManager.setRuntimeSessionId(session.id, geminiSession.runtimeSessionId);
@@ -120,6 +123,7 @@ export class GeminiExecutor extends BaseExecutor {
 			prompt,
 			geminiSession.runtimeSessionId,
 			geminiSession.hasHistory,
+			geminiSession.model,
 		);
 		const proc = spawn(this.config.geminiPath, args, {
 			cwd: session.workspace.workingDir,
@@ -463,6 +467,7 @@ export class GeminiExecutor extends BaseExecutor {
 		prompt: string,
 		runtimeSessionId: string | null,
 		hasHistory: boolean,
+		model: string | null,
 	): string[] {
 		const args: string[] = [];
 		const resumeId = runtimeSessionId?.trim();
@@ -472,6 +477,10 @@ export class GeminiExecutor extends BaseExecutor {
 			args.push("--resume", "latest");
 		}
 		args.push("--prompt", prompt, "--output-format", "json");
+		const selectedModel = model?.trim();
+		if (selectedModel && selectedModel.length > 0) {
+			args.push("--model", selectedModel);
+		}
 		args.push(...this.config.extraArgs);
 		return args;
 	}

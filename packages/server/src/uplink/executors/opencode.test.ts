@@ -163,6 +163,28 @@ exit 0
 		expect(argsLog).toContain("run --format json --session ses_mock_123 follow-up-prompt");
 	});
 
+	it("passes --model when model is provided and preserves it across turns", async () => {
+		activeExecutor = new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
+			opencodePath: mockOpenCodePath,
+		});
+
+		const result = await activeExecutor.startRun({
+			profile: "opencode",
+			workspace: testDir,
+			initialPrompt: "initial-prompt",
+			model: "claude-sonnet-4-20250514",
+		});
+		activeSessionId = result.sessionId;
+
+		await activeExecutor.sendInput(result.sessionId, "follow-up-prompt");
+
+		const argsLog = await readFile(argsLogPath, "utf8");
+		expect(argsLog).toContain("run --format json --model claude-sonnet-4-20250514 initial-prompt");
+		expect(argsLog).toContain(
+			"run --format json --session ses_mock_123 --model claude-sonnet-4-20250514 follow-up-prompt",
+		);
+	});
+
 	it("emits tool_call + tool_result and git.diff_updated for tool_use events", async () => {
 		activeExecutor = new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
 			opencodePath: mockOpenCodePath,

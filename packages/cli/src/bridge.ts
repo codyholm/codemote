@@ -164,6 +164,7 @@ interface NewSessionMessage {
 	prompt: string;
 	resumeSessionId?: string;
 	workspace?: string;
+	model?: string;
 }
 
 type DiffScope = "staged" | "unstaged" | "all";
@@ -366,12 +367,15 @@ class UplinkWsClient {
 		workspace: string,
 		initialPrompt: string,
 		resumeSessionId?: string,
+		model?: string,
 	) {
+		const normalizedModel = typeof model === "string" ? model.trim() : "";
 		const payload = {
 			profile,
 			workspace,
 			initialPrompt,
 			...(resumeSessionId ? { resumeSessionId } : {}),
+			...(normalizedModel ? { model: normalizedModel } : {}),
 		};
 		return this.sendAndWait({
 			type: "start_run",
@@ -906,6 +910,7 @@ export async function startRelayUplinkBridge(
 				message.prompt,
 				resumeSessionId,
 				message.workspace,
+				message.model,
 			);
 		} catch (error) {
 			let sessionStartError: unknown = error;
@@ -916,7 +921,13 @@ export async function startRelayUplinkBridge(
 					}; retrying with a fresh session`,
 				);
 				try {
-					await startAndTrackSession(message.runtime, message.prompt, undefined, message.workspace);
+					await startAndTrackSession(
+						message.runtime,
+						message.prompt,
+						undefined,
+						message.workspace,
+						message.model,
+					);
 					return;
 				} catch (fallbackError) {
 					sessionStartError = fallbackError;
@@ -1000,12 +1011,14 @@ export async function startRelayUplinkBridge(
 		prompt: string,
 		resumeSessionId?: string,
 		workspace?: string,
+		model?: string,
 	): Promise<{ sessionId: string }> {
 		const started = await uplinkClient.startRun(
 			runtime,
 			workspace || repoPath,
 			prompt,
 			resumeSessionId,
+			model,
 		);
 		if (started.type !== "run_started") {
 			throw new Error("Unexpected start_run response");
@@ -1679,6 +1692,7 @@ function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 		const prompt = (payload as { prompt?: unknown }).prompt;
 		const resumeSessionId = (payload as { resumeSessionId?: unknown }).resumeSessionId;
 		const workspace = (payload as { workspace?: unknown }).workspace;
+		const model = (payload as { model?: unknown }).model;
 		if (
 			(runtime === "opencode" ||
 				runtime === "claude" ||
@@ -1692,6 +1706,9 @@ function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 			}
 			if (typeof workspace === "string" && workspace.trim().length > 0) {
 				msg.workspace = workspace.trim();
+			}
+			if (typeof model === "string" && model.trim().length > 0) {
+				msg.model = model.trim();
 			}
 			return msg;
 		}

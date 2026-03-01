@@ -32,6 +32,8 @@ interface OpenCodeSession {
 	running: boolean;
 	/** OpenCode session id used for resume */
 	runtimeSessionId: string | null;
+	/** Selected model override (optional) */
+	model: string | null;
 	/** Tool calls we have already emitted for this session */
 	seenToolCallIds: Set<string>;
 	/** Recent stderr for diagnostics */
@@ -69,10 +71,12 @@ export class OpenCodeExecutor extends BaseExecutor {
 
 	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
 		const resumeSessionId = options.resumeSessionId?.trim();
+		const model = options.model?.trim() ? options.model.trim() : null;
 		const openCodeSession: OpenCodeSession = {
 			process: null,
 			running: false,
 			runtimeSessionId: resumeSessionId && resumeSessionId.length > 0 ? resumeSessionId : null,
+			model,
 			seenToolCallIds: new Set(),
 			stderrBuffer: "",
 		};
@@ -201,6 +205,10 @@ export class OpenCodeExecutor extends BaseExecutor {
 		const resumeSessionId = openCodeSession.runtimeSessionId?.trim();
 		if (resumeSessionId && resumeSessionId.length > 0) {
 			args.push("--session", resumeSessionId);
+		}
+		const selectedModel = openCodeSession.model?.trim();
+		if (selectedModel && selectedModel.length > 0) {
+			args.push("--model", selectedModel);
 		}
 		args.push(prompt);
 		args.push(...this.config.extraArgs);

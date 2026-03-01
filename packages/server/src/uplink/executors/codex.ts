@@ -41,6 +41,8 @@ interface CodexSession {
 	codexSessionId: string | null;
 	/** Last thread ID */
 	threadId: string | null;
+	/** Selected model override (optional) */
+	model: string | null;
 	/** Whether process is running */
 	running: boolean;
 	/** Non-JSON stderr output for troubleshooting process failures */
@@ -131,8 +133,9 @@ export class CodexExecutor extends BaseExecutor {
 	 * from stdout using readline and maps them to our unified event types.
 	 */
 	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
-		const args = this.buildExecArgs(options.initialPrompt);
-		const codexSession = this.createCodexSession();
+		const model = options.model?.trim() ? options.model.trim() : null;
+		const args = this.buildExecArgs(options.initialPrompt, model);
+		const codexSession = this.createCodexSession(null, model);
 
 		this.codexSessions.set(session.id, codexSession);
 
@@ -233,8 +236,9 @@ export class CodexExecutor extends BaseExecutor {
 		const session = this.sessionManager.get(sessionId);
 		if (!session) throw new Error("Session not found");
 
-		const args = this.buildResumeArgs(codexSessionId, followUp);
-		const codexSession = this.createCodexSession(codexSessionId);
+		const preservedModel = this.codexSessions.get(sessionId)?.model ?? null;
+		const args = this.buildResumeArgs(codexSessionId, followUp, preservedModel);
+		const codexSession = this.createCodexSession(codexSessionId, preservedModel);
 
 		this.codexSessions.set(session.id, codexSession);
 
@@ -251,11 +255,15 @@ export class CodexExecutor extends BaseExecutor {
 	// Private helper methods
 	// ========================================
 
-	private createCodexSession(initialSessionId: string | null = null): CodexSession {
+	private createCodexSession(
+		initialSessionId: string | null = null,
+		model: string | null = null,
+	): CodexSession {
 		return {
 			process: null,
 			codexSessionId: initialSessionId,
 			threadId: null,
+			model,
 			running: true,
 			stderr: "",
 			pendingToolCalls: new Map(),
@@ -268,12 +276,13 @@ export class CodexExecutor extends BaseExecutor {
 	 * `--ask-for-approval` and `--sandbox` are top-level Codex flags, so they
 	 * must appear before the `exec` subcommand.
 	 */
-	private buildExecArgs(task: string): string[] {
+	private buildExecArgs(task: string, model: string | null): string[] {
 		const args: string[] = [
 			"--ask-for-approval",
 			this.config.approvalPolicy,
 			"--sandbox",
 			this.config.sandbox,
+			...(model ? ["--model", model] : []),
 			"exec",
 			"--json",
 		];
@@ -291,12 +300,17 @@ export class CodexExecutor extends BaseExecutor {
 	 *
 	 * Use top-level flags before `exec` so the command works with current Codex CLI.
 	 */
-	private buildResumeArgs(codexSessionId: string, followUp?: string): string[] {
+	private buildResumeArgs(
+		codexSessionId: string,
+		followUp: string | undefined,
+		model: string | null,
+	): string[] {
 		const args: string[] = [
 			"--ask-for-approval",
 			this.config.approvalPolicy,
 			"--sandbox",
 			this.config.sandbox,
+			...(model ? ["--model", model] : []),
 			"exec",
 			"resume",
 			codexSessionId,

@@ -360,6 +360,125 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
+	it("forwards model from new_session into uplink start_run payload", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+		let startRunPayload: JsonRecord | null = null;
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				const type = command["type"];
+
+				if (type === "list_sessions") {
+					socket.send(
+						JSON.stringify({
+							type: "sessions",
+							payload: [],
+						}),
+					);
+					return;
+				}
+
+				if (type === "start_run") {
+					startRunPayload = (command["payload"] as JsonRecord | undefined) ?? null;
+					socket.send(
+						JSON.stringify({
+							type: "run_started",
+							payload: { sessionId: "sess-model-1", runId: "run-model-1" },
+						}),
+					);
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "333333" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-test-model" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: "mobile-test-model",
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				} else if (socket === relayUplinkSocket) {
+					relayMobileSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			const mobilePayloads: JsonRecord[] = [];
+
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+			mobileSocket.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				mobilePayloads.push(payload);
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-test-model",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+			await waitForCondition(
+				() => mobilePayloads.some((payload) => payload["type"] === "session_list"),
+				8000,
+			);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: {
+						type: "new_session",
+						runtime: "claude",
+						prompt: "test",
+						model: "claude-sonnet-4-20250514",
+					},
+				}),
+			);
+
+			await waitForCondition(() => startRunPayload !== null, 8000);
+			expect(startRunPayload?.["model"]).toBe("claude-sonnet-4-20250514");
+		} finally {
+			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+				mobileSocket.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
 	it("drops timed-out start_run waiters so late responses do not satisfy the next start_run", async () => {
 		const previousTimeout = process.env["CODEMOTE_UPLINK_COMMAND_TIMEOUT_MS"];
 		const previousLongTimeout = process.env["CODEMOTE_UPLINK_LONG_COMMAND_TIMEOUT_MS"];
