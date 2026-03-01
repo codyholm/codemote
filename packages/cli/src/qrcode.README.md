@@ -66,4 +66,4 @@ console.log(qr);
 - Do not include the PIN in mDNS TXT records.
 - Prefer showing the QR in the UI and redacting the PIN in logs.
 
-See `.guild/brain/SECURITY_ARCHITECTURE.md`.
+See `.guild/ops/docs/SECURITY.md`.

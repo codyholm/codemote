@@ -49,7 +49,7 @@ npm-debug.log*
 
 # Guild (generated)
 .guild/exports/
-.guild/.archive/
+.guild/.archive/**
 .guild/ops/evidence/
 masterreference
 .guild/handoff-workspace-feature.md
