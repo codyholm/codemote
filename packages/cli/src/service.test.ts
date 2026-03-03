@@ -1,7 +1,8 @@
+import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	buildServicePath,
 	installService,
@@ -25,10 +26,12 @@ describe("service", () => {
 	});
 
 	afterEach(async () => {
-		try {
-			await uninstallService();
-		} catch {
-			// Best-effort cleanup: service managers may not be available in CI.
+		if (process.platform !== "win32") {
+			try {
+				await uninstallService();
+			} catch {
+				// Best-effort cleanup: service managers may not be available in CI.
+			}
 		}
 		await rm(tempHome, { recursive: true, force: true });
 		if (originalHome === undefined) {
@@ -49,6 +52,7 @@ describe("service", () => {
 		expect(paths.statusFile.startsWith(tempHome)).toBe(true);
 		expect(paths.launchAgentPlist.startsWith(tempHome)).toBe(true);
 		expect(paths.systemdUnit.startsWith(tempHome)).toBe(true);
+		expect(paths.windowsTaskXml.startsWith(tempHome)).toBe(true);
 	});
 
 	it("builds service PATH using platform delimiter", () => {
@@ -58,6 +62,10 @@ describe("service", () => {
 
 	it("writes platform service definition for serve mode", async () => {
 		const paths = resolveServicePaths();
+		if (process.platform === "win32") {
+			return;
+		}
+
 		if (process.platform !== "darwin" && process.platform !== "linux") {
 			await expect(
 				installService({
@@ -95,6 +103,145 @@ describe("service", () => {
 			expect(unit).toContain(`${tempHome}/.local/bin`);
 			expect(unit).toContain("/opt/homebrew/bin");
 			expect(unit).toContain(`StandardOutput=append:${paths.logFile}`);
+		}
+	});
+
+	it("writes Task Scheduler XML on Windows", async () => {
+		const originalPlatform = process.platform;
+		const originalUsername = process.env["USERNAME"];
+		const originalUserDomain = process.env["USERDOMAIN"];
+		Object.defineProperty(process, "platform", { value: "win32" });
+		process.env["USERNAME"] = "TestUser";
+		process.env["USERDOMAIN"] = "TESTDOMAIN";
+
+		const spawnMock = vi.fn().mockImplementation(() => {
+			const child = new EventEmitter() as unknown as EventEmitter & {
+				stdout: EventEmitter;
+				stderr: EventEmitter;
+			};
+			child.stdout = new EventEmitter();
+			child.stderr = new EventEmitter();
+			queueMicrotask(() => {
+				child.emit("close", 0);
+			});
+			return child;
+		});
+
+		vi.resetModules();
+		vi.doMock("node:child_process", async () => {
+			const actual =
+				await vi.importActual<typeof import("node:child_process")>("node:child_process");
+			return { ...actual, spawn: spawnMock };
+		});
+
+		try {
+			const { installService: installServiceWin, resolveServicePaths: resolveServicePathsWin } =
+				await import("./service.js");
+			const winPaths = resolveServicePathsWin();
+
+			await installServiceWin({
+				nodePath: "C:\\Program Files\\nodejs\\node.exe",
+				scriptPath: "C:\\codemote\\cli.js",
+				workingDirectory: "C:\\codemote",
+				remoteRelayUrl: "wss://relay.example/ws",
+			});
+
+			expect(spawnMock).toHaveBeenCalledWith(
+				"schtasks",
+				["/Create", "/TN", "Codemote", "/XML", winPaths.windowsTaskXml, "/F"],
+				expect.anything(),
+			);
+
+			const xml = await readFile(winPaths.windowsTaskXml, "utf16le");
+			expect(xml).toContain("<LogonTrigger>");
+			expect(xml).toContain("<Principals>");
+			expect(xml).toContain("<Interval>PT1M</Interval>");
+			expect(xml).toContain("<Count>999</Count>");
+			expect(xml).toContain("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>");
+			expect(xml).toContain("CODEMOTE_STATUS_FILE=");
+			expect(xml).toContain(" serve ");
+			expect(xml).toContain("wss://relay.example/ws");
+			expect(xml).toContain("<UserId>TESTDOMAIN\\TestUser</UserId>");
+		} finally {
+			Object.defineProperty(process, "platform", { value: originalPlatform });
+			if (originalUsername === undefined) {
+				Reflect.deleteProperty(process.env, "USERNAME");
+			} else {
+				process.env["USERNAME"] = originalUsername;
+			}
+			if (originalUserDomain === undefined) {
+				Reflect.deleteProperty(process.env, "USERDOMAIN");
+			} else {
+				process.env["USERDOMAIN"] = originalUserDomain;
+			}
+			vi.resetModules();
+			vi.doUnmock("node:child_process");
+		}
+	});
+
+	it("uses bare username when USERDOMAIN matches COMPUTERNAME", async () => {
+		const originalPlatform = process.platform;
+		const originalUsername = process.env["USERNAME"];
+		const originalUserDomain = process.env["USERDOMAIN"];
+		const originalComputerName = process.env["COMPUTERNAME"];
+		Object.defineProperty(process, "platform", { value: "win32" });
+		process.env["USERNAME"] = "TestUser";
+		process.env["USERDOMAIN"] = "MYPC";
+		process.env["COMPUTERNAME"] = "MYPC";
+
+		const spawnMock = vi.fn().mockImplementation(() => {
+			const child = new EventEmitter() as unknown as EventEmitter & {
+				stdout: EventEmitter;
+				stderr: EventEmitter;
+			};
+			child.stdout = new EventEmitter();
+			child.stderr = new EventEmitter();
+			queueMicrotask(() => {
+				child.emit("close", 0);
+			});
+			return child;
+		});
+
+		vi.resetModules();
+		vi.doMock("node:child_process", async () => {
+			const actual =
+				await vi.importActual<typeof import("node:child_process")>("node:child_process");
+			return { ...actual, spawn: spawnMock };
+		});
+
+		try {
+			const { installService: installServiceWin, resolveServicePaths: resolveServicePathsWin } =
+				await import("./service.js");
+			const winPaths = resolveServicePathsWin();
+
+			await installServiceWin({
+				nodePath: "C:\\Program Files\\nodejs\\node.exe",
+				scriptPath: "C:\\codemote\\cli.js",
+				workingDirectory: "C:\\codemote",
+			});
+
+			const xml = await readFile(winPaths.windowsTaskXml, "utf16le");
+			expect(xml).toContain("<UserId>TestUser</UserId>");
+			expect(xml).not.toContain("MYPC\\TestUser");
+		} finally {
+			Object.defineProperty(process, "platform", { value: originalPlatform });
+			if (originalUsername === undefined) {
+				Reflect.deleteProperty(process.env, "USERNAME");
+			} else {
+				process.env["USERNAME"] = originalUsername;
+			}
+			if (originalUserDomain === undefined) {
+				Reflect.deleteProperty(process.env, "USERDOMAIN");
+			} else {
+				process.env["USERDOMAIN"] = originalUserDomain;
+			}
+			if (originalComputerName === undefined) {
+				Reflect.deleteProperty(process.env, "COMPUTERNAME");
+			} else {
+				process.env["COMPUTERNAME"] = originalComputerName;
+			}
+			vi.resetModules();
+			vi.doUnmock("node:child_process");
 		}
 	});
 

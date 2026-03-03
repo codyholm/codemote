@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import selfsigned from "selfsigned";
+import { restrictDirPermissions, restrictFilePermissions } from "./win-permissions.js";
 
 export type LocalTLSInfo = {
 	certPath: string;
@@ -173,6 +174,15 @@ export async function ensureLocalTLS(options: EnsureLocalTLSOptions = {}): Promi
 	const keyPath = path.join(tlsDir, "key.pem");
 
 	await fs.mkdir(tlsDir, { recursive: true, mode: 0o700 });
+	try {
+		await restrictDirPermissions(tlsDir);
+	} catch (error) {
+		console.warn(
+			`[tls] warning: failed to restrict directory permissions for ${tlsDir}: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		);
+	}
 
 	const existingCertPem = await readFileIfExists(certPath);
 	const existingKeyPem = await readFileIfExists(keyPath);
@@ -197,6 +207,15 @@ export async function ensureLocalTLS(options: EnsureLocalTLSOptions = {}): Promi
 				err instanceof Error && err.message === "expired" ? "expired" : "invalid";
 			const { certPem, keyPem } = generateSelfSigned();
 			await fs.writeFile(keyPath, keyPem, { encoding: "utf8", mode: 0o600 });
+			try {
+				await restrictFilePermissions(keyPath);
+			} catch (error) {
+				console.warn(
+					`[tls] warning: failed to restrict file permissions for ${keyPath}: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+			}
 			await fs.writeFile(certPath, certPem, { encoding: "utf8", mode: 0o644 });
 			return {
 				certPath,
@@ -211,6 +230,15 @@ export async function ensureLocalTLS(options: EnsureLocalTLSOptions = {}): Promi
 
 	const { certPem, keyPem } = generateSelfSigned();
 	await fs.writeFile(keyPath, keyPem, { encoding: "utf8", mode: 0o600 });
+	try {
+		await restrictFilePermissions(keyPath);
+	} catch (error) {
+		console.warn(
+			`[tls] warning: failed to restrict file permissions for ${keyPath}: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		);
+	}
 	await fs.writeFile(certPath, certPem, { encoding: "utf8", mode: 0o644 });
 	return {
 		certPath,

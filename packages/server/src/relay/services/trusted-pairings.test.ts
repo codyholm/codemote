@@ -83,7 +83,10 @@ describe("TrustedPairingsStore", () => {
 		expect(files.includes("trusted-pairings.json.tmp")).toBe(false);
 
 		const fileStat = await stat(storePath);
-		expect(fileStat.mode & 0o777).toBe(0o600);
+		if (process.platform !== "win32") {
+			expect(fileStat.mode & 0o777).toBe(0o600);
+		}
+		// On Windows, icacls verification would need a separate test
 
 		const raw = await readFile(storePath, "utf8");
 		expect(raw).toContain('"version": 1');

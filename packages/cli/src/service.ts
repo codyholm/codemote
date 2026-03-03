@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 
 const DARWIN_LABEL = "app.codemote.service";
 const LINUX_UNIT = "codemote.service";
+const WINDOWS_TASK_NAME = "Codemote";
 
 function getServicePathFallbackSegments(): string[] {
 	const home = homedir();
@@ -33,6 +34,7 @@ export interface ServicePaths {
 	statusFile: string;
 	launchAgentPlist: string;
 	systemdUnit: string;
+	windowsTaskXml: string;
 }
 
 export interface ServiceInstallConfig {
@@ -64,6 +66,7 @@ export function resolveServicePaths(): ServicePaths {
 		statusFile: join(home, ".codemote", "status", "server-status.json"),
 		launchAgentPlist: join(home, "Library", "LaunchAgents", `${DARWIN_LABEL}.plist`),
 		systemdUnit: join(home, ".config", "systemd", "user", LINUX_UNIT),
+		windowsTaskXml: join(home, ".codemote", "service", "codemote-task.xml"),
 	};
 }
 
@@ -78,6 +81,9 @@ export async function installService(config: ServiceInstallConfig): Promise<void
 			return;
 		case "linux":
 			await installSystemdUnit(config, paths);
+			return;
+		case "win32":
+			await installWindowsTask(config, paths);
 			return;
 		default:
 			throw new Error(`Service install is not supported on platform: ${process.platform}`);
@@ -94,6 +100,9 @@ export async function startService(): Promise<void> {
 		case "linux":
 			await runCommand("systemctl", ["--user", "daemon-reload"], { allowFailure: true });
 			await runCommand("systemctl", ["--user", "start", LINUX_UNIT]);
+			return;
+		case "win32":
+			await runCommand("schtasks", ["/Run", "/TN", WINDOWS_TASK_NAME]);
 			return;
 		default:
 			throw new Error(`Service start is not supported on platform: ${process.platform}`);
@@ -121,6 +130,9 @@ export async function stopService(): Promise<void> {
 		case "linux":
 			await runCommand("systemctl", ["--user", "stop", LINUX_UNIT], { allowFailure: true });
 			return;
+		case "win32":
+			await runCommand("schtasks", ["/End", "/TN", WINDOWS_TASK_NAME], { allowFailure: true });
+			return;
 		default:
 			throw new Error(`Service stop is not supported on platform: ${process.platform}`);
 	}
@@ -138,6 +150,13 @@ export async function uninstallService(): Promise<void> {
 			await runCommand("systemctl", ["--user", "disable", LINUX_UNIT], { allowFailure: true });
 			await rm(paths.systemdUnit, { force: true });
 			await runCommand("systemctl", ["--user", "daemon-reload"], { allowFailure: true });
+			return;
+		case "win32":
+			await stopService();
+			await runCommand("schtasks", ["/Delete", "/TN", WINDOWS_TASK_NAME, "/F"], {
+				allowFailure: true,
+			});
+			await rm(paths.windowsTaskXml, { force: true });
 			return;
 		default:
 			throw new Error(`Service uninstall is not supported on platform: ${process.platform}`);
@@ -182,6 +201,29 @@ export async function readServiceStatus(): Promise<ServiceStatus> {
 				...(details ? { details } : {}),
 			};
 		}
+		case "win32": {
+			const queryResult = await runCommand(
+				"schtasks",
+				["/Query", "/TN", WINDOWS_TASK_NAME, "/FO", "CSV", "/V", "/NH"],
+				{ allowFailure: true },
+			);
+			const installed = queryResult.code === 0;
+			const details = queryResult.stdout || queryResult.stderr;
+			// CSV /V columns are locale-independent by position.
+			// Column 3 = Status, Column 11 = Scheduled Task State.
+			const csvFields = installed ? parseCsvLine(details.trim()) : undefined;
+			const statusValue = csvFields?.[3];
+			const taskStateValue = csvFields?.[11];
+			return {
+				platform: process.platform,
+				installed,
+				running:
+					statusValue?.toLowerCase() === "running" && taskStateValue?.toLowerCase() === "enabled",
+				logFile: paths.logFile,
+				statusFile: paths.statusFile,
+				...(details ? { details } : {}),
+			};
+		}
 		default:
 			return {
 				platform: process.platform,
@@ -213,6 +255,25 @@ export async function readServiceLogs(lines = 200): Promise<string> {
 function tailLines(text: string, lines: number): string {
 	const all = text.split(/\r?\n/);
 	return all.slice(Math.max(0, all.length - lines)).join("\n");
+}
+
+function parseCsvLine(line: string): string[] | undefined {
+	if (!line) return undefined;
+	const fields: string[] = [];
+	let current = "";
+	let inQuotes = false;
+	for (const char of line) {
+		if (char === '"') {
+			inQuotes = !inQuotes;
+		} else if (char === "," && !inQuotes) {
+			fields.push(current);
+			current = "";
+		} else {
+			current += char;
+		}
+	}
+	fields.push(current);
+	return fields.length > 0 ? fields : undefined;
 }
 
 async function installLaunchAgent(
@@ -292,6 +353,100 @@ WantedBy=default.target
 	await writeFile(paths.systemdUnit, unit, "utf8");
 	await runCommand("systemctl", ["--user", "daemon-reload"], { allowFailure: true });
 	await runCommand("systemctl", ["--user", "enable", LINUX_UNIT], { allowFailure: true });
+}
+
+function quoteCmdArg(value: string): string {
+	// Escape percent signs by doubling them (%% becomes literal % in cmd.exe)
+	// Escape embedded double quotes by prefixing with backslash
+	const escaped = value.replaceAll("%", "%%").replaceAll('"', '\\"');
+	return `"${escaped}"`;
+}
+
+function resolveWindowsTaskUserId(): string {
+	const username = process.env["USERNAME"]?.trim();
+	const userDomain = process.env["USERDOMAIN"]?.trim();
+	const computerName = process.env["COMPUTERNAME"]?.trim();
+	if (username && userDomain && userDomain !== computerName) {
+		return `${userDomain}\\${username}`;
+	}
+	if (username) return username;
+	return userInfo().username;
+}
+
+async function installWindowsTask(
+	config: ServiceInstallConfig,
+	paths: ServicePaths,
+): Promise<void> {
+	await mkdir(dirname(paths.windowsTaskXml), { recursive: true });
+	const taskUserId = resolveWindowsTaskUserId();
+	const cliArgs = [quoteCmdArg(config.nodePath), quoteCmdArg(config.scriptPath), "serve"];
+	if (config.remoteRelayUrl) {
+		cliArgs.push("--remote", quoteCmdArg(config.remoteRelayUrl));
+	}
+	const escapedStatusFile = paths.statusFile.replaceAll("%", "%%").replaceAll('"', '"');
+	const cmd = [
+		"/c",
+		`set "CODEMOTE_STATUS_FILE=${escapedStatusFile}" && ${cliArgs.join(" ")} >> ${quoteCmdArg(
+			paths.logFile,
+		)} 2>&1`,
+	].join(" ");
+
+	const task = `<?xml version="1.0" encoding="UTF-16"?>
+	<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+		<RegistrationInfo>
+			<Author>${xmlEscape(taskUserId)}</Author>
+			<Description>Codemote background service</Description>
+		</RegistrationInfo>
+		<Triggers>
+			<LogonTrigger>
+				<UserId>${xmlEscape(taskUserId)}</UserId>
+				<Enabled>true</Enabled>
+			</LogonTrigger>
+		</Triggers>
+		<Principals>
+			<Principal id="Author">
+				<UserId>${xmlEscape(taskUserId)}</UserId>
+				<LogonType>InteractiveToken</LogonType>
+				<RunLevel>LeastPrivilege</RunLevel>
+			</Principal>
+		</Principals>
+		<Settings>
+			<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+			<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+			<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+			<AllowHardTerminate>true</AllowHardTerminate>
+			<StartWhenAvailable>true</StartWhenAvailable>
+			<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+			<AllowStartOnDemand>true</AllowStartOnDemand>
+			<Enabled>true</Enabled>
+			<Hidden>false</Hidden>
+			<RunOnlyIfIdle>false</RunOnlyIfIdle>
+			<WakeToRun>false</WakeToRun>
+			<RestartOnFailure>
+				<Interval>PT1M</Interval>
+				<Count>999</Count>
+			</RestartOnFailure>
+			<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+		</Settings>
+		<Actions Context="Author">
+			<Exec>
+				<Command>cmd.exe</Command>
+				<Arguments>${xmlEscape(cmd)}</Arguments>
+				<WorkingDirectory>${xmlEscape(config.workingDirectory)}</WorkingDirectory>
+			</Exec>
+		</Actions>
+	</Task>
+		`;
+
+	await writeFile(paths.windowsTaskXml, `\ufeff${task}`, "utf16le");
+	await runCommand("schtasks", [
+		"/Create",
+		"/TN",
+		WINDOWS_TASK_NAME,
+		"/XML",
+		paths.windowsTaskXml,
+		"/F",
+	]);
 }
 
 export function buildServicePath(nodePath: string): string {

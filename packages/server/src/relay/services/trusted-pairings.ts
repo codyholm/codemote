@@ -1,5 +1,14 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
+import { restrictDirPermissions, restrictFilePermissions } from "./win-permissions.js";
 
 const TRUSTED_PAIRINGS_FILE_VERSION = 1;
 
@@ -209,7 +218,18 @@ export class TrustedPairingsStore {
 				encoding: "utf8",
 				mode: 0o600,
 			});
+			// On Windows, renameSync does not overwrite existing files; unlink first.
+			// This creates a brief window where the target file does not exist.
+			// The .tmp file is preserved on rename failure as a recovery copy.
+			if (process.platform === "win32") {
+				try {
+					unlinkSync(this.filePath);
+				} catch {
+					// File may not exist; ignore
+				}
+			}
 			renameSync(tmpPath, this.filePath);
+			this.hardenFilePermissions(this.filePath);
 			chmodSync(this.filePath, 0o600);
 			this.persistHealthy = true;
 		} catch (error) {
@@ -237,10 +257,33 @@ export class TrustedPairingsStore {
 		return records;
 	}
 
+	private hardenFilePermissions(filePath: string): void {
+		try {
+			restrictFilePermissions(filePath);
+		} catch (error) {
+			this.log(
+				`[relay] warning: failed to harden file permissions for ${filePath}: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+
+	private hardenDirPermissions(dirPath: string): void {
+		try {
+			restrictDirPermissions(dirPath);
+		} catch (error) {
+			this.log(
+				`[relay] warning: failed to harden directory permissions for ${dirPath}: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+
 	private ensureParentDirectory(): void {
-		mkdirSync(dirname(this.filePath), {
-			recursive: true,
-			mode: 0o700,
-		});
+		const dir = dirname(this.filePath);
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		this.hardenDirPermissions(dir);
 	}
 }
