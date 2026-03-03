@@ -28,7 +28,7 @@
 		"simple-git-hooks": "^2.11.0"
 	},
 	"simple-git-hooks": {
-		"pre-commit": "pnpm format:exports && pnpm lint && pnpm typecheck"
+		"pre-commit": "./scripts/pre-commit.sh"
 	},
 	"engines": {
 		"node": ">=22.0.0",
