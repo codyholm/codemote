@@ -140,6 +140,10 @@ interface DeviceInfoMessage {
 	endpoints: DeviceEndpointMessage[];
 }
 
+interface RequestDeviceInfoMessage {
+	type: "request_device_info";
+}
+
 interface ApprovalResponseMessage {
 	type: "approval_response";
 	sessionId: string;
@@ -259,6 +263,7 @@ type MobileInboundMessage =
 	| StopMessage
 	| NewSessionMessage
 	| GetDiffMessage
+	| RequestDeviceInfoMessage
 	| ListDirectoryMessage
 	| GitStatusMessage
 	| GitPullMessage
@@ -804,6 +809,9 @@ export async function startRelayUplinkBridge(
 				return;
 			case "get_diff":
 				await handleGetDiff(message);
+				return;
+			case "request_device_info":
+				void sendDeviceInfoToMobile();
 				return;
 			case "git_status":
 				await handleGitStatus(message);
@@ -1489,37 +1497,44 @@ export async function startRelayUplinkBridge(
 	}
 
 	async function sendDeviceInfoToMobile(): Promise<void> {
-		const endpoints: DeviceEndpointMessage[] = [];
+		try {
+			const endpoints: DeviceEndpointMessage[] = [];
 
-		const normalizedLocal = normalizeEndpointUrl(localEndpointUrl);
-		if (normalizedLocal) {
-			endpoints.push({ kind: "local", url: normalizedLocal });
-		}
-
-		if (normalizedLocal) {
-			const tailscaleEndpoint = await detectTailscaleEndpoint({
-				port: relayPortFromURL(normalizedLocal),
-				secure: normalizedLocal.startsWith("wss://"),
-			});
-			if (tailscaleEndpoint) {
-				endpoints.push({ kind: "tailscale", url: tailscaleEndpoint.url });
+			const normalizedLocal = normalizeEndpointUrl(localEndpointUrl);
+			if (normalizedLocal) {
+				endpoints.push({ kind: "local", url: normalizedLocal });
 			}
-		}
 
-		const normalizedHosted = normalizeEndpointUrl(hostedEndpointUrl);
-		if (normalizedHosted) {
-			endpoints.push({ kind: "hosted", url: normalizedHosted });
-		}
+			if (normalizedLocal) {
+				const tailscaleEndpoint = await detectTailscaleEndpoint({
+					port: relayPortFromURL(normalizedLocal),
+					secure: normalizedLocal.startsWith("wss://"),
+				});
+				if (tailscaleEndpoint) {
+					endpoints.push({ kind: "tailscale", url: tailscaleEndpoint.url });
+				}
+			}
 
-		if (endpoints.length === 0) {
-			return;
-		}
+			const normalizedHosted = normalizeEndpointUrl(hostedEndpointUrl);
+			if (normalizedHosted) {
+				endpoints.push({ kind: "hosted", url: normalizedHosted });
+			}
 
-		sendToMobile({
-			type: "device_info",
-			uplinkDeviceId,
-			endpoints,
-		});
+			if (endpoints.length === 0) {
+				return;
+			}
+
+			// Outgoing endpoints replace all previously-known endpoints on the mobile side.
+			sendToMobile({
+				type: "device_info",
+				uplinkDeviceId,
+				endpoints,
+			});
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to send device info: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	}
 
 	async function refreshPairingCode(): Promise<string> {
@@ -1742,6 +1757,10 @@ function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 			return { type: "get_diff", sessionId, scope };
 		}
 		return null;
+	}
+
+	if (type === "request_device_info") {
+		return { type: "request_device_info" };
 	}
 
 	if (type === "approval_response") {

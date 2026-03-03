@@ -1387,6 +1387,143 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
+	it("refreshes device_info when mobile requests it", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "556677" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					socket.send(
+						JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-endpoint-refresh-1" }),
+					);
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: "mobile-endpoint-refresh-1",
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				} else if (socket === relayUplinkSocket) {
+					relayMobileSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+			localEndpointUrl: "wss://192.168.1.55:8080/ws",
+			hostedEndpointUrl: "wss://relay.codemote.app/ws",
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			const payloads: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				payloads.push(payload);
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-endpoint-refresh-1",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					payloads.some(
+						(payload) =>
+							payload["type"] === "device_info" &&
+							Array.isArray(payload["endpoints"]) &&
+							(payload["endpoints"] as Array<JsonRecord>).some(
+								(endpoint) =>
+									endpoint["kind"] === "local" && endpoint["url"] === "wss://192.168.1.55:8080/ws",
+							) &&
+							(payload["endpoints"] as Array<JsonRecord>).some(
+								(endpoint) =>
+									endpoint["kind"] === "hosted" &&
+									endpoint["url"] === "wss://relay.codemote.app/ws",
+							),
+					),
+				8000,
+			);
+
+			const deviceInfoCount = payloads.filter(
+				(payload) => payload["type"] === "device_info",
+			).length;
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "request_device_info" },
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					payloads.filter((payload) => payload["type"] === "device_info").length > deviceInfoCount,
+				8000,
+			);
+
+			const latest = [...payloads].reverse().find((payload) => payload["type"] === "device_info");
+			const endpoints = latest?.["endpoints"];
+			expect(Array.isArray(endpoints)).toBe(true);
+			expect(
+				(endpoints as Array<JsonRecord>).some(
+					(endpoint) =>
+						endpoint["kind"] === "local" && endpoint["url"] === "wss://192.168.1.55:8080/ws",
+				),
+			).toBe(true);
+			expect(
+				(endpoints as Array<JsonRecord>).some(
+					(endpoint) =>
+						endpoint["kind"] === "hosted" && endpoint["url"] === "wss://relay.codemote.app/ws",
+				),
+			).toBe(true);
+		} finally {
+			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+				mobileSocket.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
 	it("does not advertise tailscale candidate when local endpoint is unavailable", async () => {
 		let relayUplinkSocket: WebSocket | null = null;
 		let relayMobileSocket: WebSocket | null = null;
