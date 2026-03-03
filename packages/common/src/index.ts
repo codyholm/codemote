@@ -7,11 +7,7 @@ export {
 	GuildRemoteError,
 	SessionNotFoundError,
 	SessionNotActiveError,
-	ExecutorError,
-	ExecutorNotFoundError,
 	WorkspaceNotFoundError,
-	PairingCodeInvalidError,
-	NotConnectedError,
 } from "./errors.js";
 
 // Runtime types

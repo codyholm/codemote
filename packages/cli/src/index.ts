@@ -5,10 +5,8 @@
 export {
 	generatePIN,
 	RateLimiter,
-	PINManager,
 	type RateLimiterConfig,
 	type RateLimitResult,
-	type OnRegenerateCallback,
 } from "./pairing.js";
 
 export {

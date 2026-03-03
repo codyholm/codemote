@@ -2,7 +2,7 @@
  * Demo script showing PIN generation and rate limiting
  */
 
-import { PINManager, RateLimiter, generatePIN } from "./src/index.js";
+import { RateLimiter, generatePIN } from "./src/index.js";
 
 console.log("=== PIN Generation Demo ===\n");
 
@@ -35,26 +35,5 @@ async function attemptPairing(clientIP: string, success: boolean) {
 await attemptPairing("192.168.1.1", false);
 await attemptPairing("192.168.1.1", false); // Should be blocked immediately
 console.log("");
-
-console.log("=== PIN Manager Demo ===\n");
-
-// Create PIN manager with 10 second TTL
-const manager = new PINManager(10_000);
-
-console.log(`Initial PIN: ${manager.pin}`);
-console.log(`Time remaining: ${manager.getRemainingTime()}ms`);
-console.log(`Is expired: ${manager.isExpired()}`);
-
-// Set callback for regeneration
-manager.setOnRegenerate((newPin) => {
-	console.log(`\nPIN regenerated: ${newPin}`);
-});
-
-// Validate PIN
-console.log(`\nValidating correct PIN: ${manager.validate(manager.pin)}`);
-console.log(`Validating wrong PIN: ${manager.validate("000000")}`);
-
-// Clean up
-manager.dispose();
 
 console.log("\n=== Demo Complete ===");

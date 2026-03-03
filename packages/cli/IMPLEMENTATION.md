@@ -55,5 +55,5 @@ These limits are enforced server-side so mobile clients stay simple.
 
 ## Legacy / utility code (not the shipped path)
 
-`packages/cli/src/pairing.ts` includes a standalone `PINManager` + `RateLimiter` implementation and tests.
+`packages/cli/src/pairing.ts` includes standalone PIN generation (`generatePIN`) + `RateLimiter` utilities and tests.
 It’s used for examples and as a library export, but the **active** pairing flow is relay-issued PINs + relay-side rate limiting.

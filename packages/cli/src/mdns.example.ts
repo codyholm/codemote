@@ -71,38 +71,36 @@ function advancedExample() {
 	}, 6000);
 }
 
-// Example 3: Integration with PINManager for automatic rotation
-async function pinRotationExample() {
+// Example 3: Automatic PIN rotation
+function pinRotationExample() {
 	console.log("Example 3: Automatic PIN Rotation");
 	console.log("==================================\n");
 
-	const { PINManager } = await import("./pairing.js");
-
 	const advertiser = new MDNSAdvertiser();
-	const pinManager = new PINManager(10_000); // 10 second TTL for demo
-
-	// Set up callback to update mDNS when PIN regenerates
-	pinManager.setOnRegenerate((newPIN) => {
-		console.log(`PIN regenerated: ${newPIN}`);
-		if (advertiser.isAdvertising()) {
-			advertiser.updatePairingCode(newPIN);
-			console.log("mDNS advertisement updated with new PIN");
-		}
-	});
+	let currentPIN = generatePIN();
 
 	// Start advertising
 	advertiser.advertise({
 		port: 3000,
-		pin: pinManager.pin,
+		pin: currentPIN,
 	});
 
-	console.log(`Initial PIN: ${pinManager.pin}`);
+	console.log(`Initial PIN: ${currentPIN}`);
 	console.log("Waiting for PIN rotation (every 10 seconds)...\n");
+
+	const interval = setInterval(() => {
+		currentPIN = generatePIN();
+		console.log(`PIN regenerated: ${currentPIN}`);
+		if (advertiser.isAdvertising()) {
+			advertiser.updatePairingCode(currentPIN);
+			console.log("mDNS advertisement updated with new PIN");
+		}
+	}, 10_000);
 
 	// Run for 25 seconds to see 2 rotations
 	setTimeout(() => {
 		console.log("\nCleaning up...");
-		pinManager.dispose();
+		clearInterval(interval);
 		advertiser.destroy();
 		console.log("Done.");
 	}, 25_000);

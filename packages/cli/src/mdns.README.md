@@ -148,29 +148,30 @@ browser.start(queue: .main)
 ## Integration with PIN rotation
 
 If you rotate the pairing token, you can keep local discovery stable while updating the UI/QR.
-This example shows how to wire a PIN manager to re-advertise:
+This example shows a simple timer-based rotation:
 
 ```typescript
-import { MDNSAdvertiser, PINManager } from "codemote";
+import { MDNSAdvertiser, generatePIN } from "codemote";
 
 const advertiser = new MDNSAdvertiser();
-const pinManager = new PINManager(15 * 60 * 1000); // 15 minute TTL
+let currentPIN = generatePIN();
 
-// Update mDNS when PIN regenerates
-pinManager.setOnRegenerate((newPIN) => {
-  console.log(`PIN rotated to: ${newPIN}`);
-  advertiser.updatePairingCode(newPIN);
-});
-
-// Start advertising
 advertiser.advertise({
   port: 3000,
-  pin: pinManager.pin,
+  pin: currentPIN,
 });
 
+const interval = setInterval(() => {
+  currentPIN = generatePIN();
+  console.log(`PIN rotated to: ${currentPIN}`);
+  if (advertiser.isAdvertising()) {
+    advertiser.updatePairingCode(currentPIN);
+  }
+}, 15 * 60 * 1000);
+
 // Clean up on shutdown
-process.on('SIGINT', () => {
-  pinManager.dispose();
+process.on("SIGINT", () => {
+  clearInterval(interval);
   advertiser.destroy();
   process.exit(0);
 });
