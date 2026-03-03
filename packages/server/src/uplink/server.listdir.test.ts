@@ -1,5 +1,6 @@
 import { execSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -25,8 +26,43 @@ function waitForMessage(ws: WebSocket): Promise<Record<string, unknown>> {
 	});
 }
 
+function reserveFreePort(): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const server = createServer();
+		server.on("error", (err) => {
+			server.close(() => reject(err));
+		});
+		server.listen(0, "127.0.0.1", () => {
+			const address = server.address();
+			if (!address || typeof address === "string") {
+				server.close(() => reject(new Error("Failed to reserve port")));
+				return;
+			}
+			server.close(() => resolve(address.port));
+		});
+	});
+}
+
+async function startUplinkServer(): Promise<{ server: UplinkServer; port: number }> {
+	for (let attempt = 0; attempt < 10; attempt += 1) {
+		const port = await reserveFreePort();
+		const server = new UplinkServer({ port, host: "127.0.0.1", runtimes: [] });
+		try {
+			await server.start();
+			return { server, port };
+		} catch (error) {
+			if (error && typeof error === "object" && "code" in error && error.code === "EADDRINUSE") {
+				continue;
+			}
+			throw error;
+		}
+	}
+
+	throw new Error("Could not find a free port to start uplink server");
+}
+
 describe("UplinkServer list_directory", () => {
-	const port = 9970 + Math.floor(Math.random() * 20);
+	let port = 0;
 	let server: UplinkServer;
 	let tempDir: string;
 
@@ -44,14 +80,15 @@ describe("UplinkServer list_directory", () => {
 		// Create a hidden subdir (should be excluded)
 		mkdirSync(join(tempDir, ".hidden-dir"));
 
-		server = new UplinkServer({ port, host: "127.0.0.1", runtimes: [] });
-		await server.start();
-	});
+		const started = await startUplinkServer();
+		server = started.server;
+		port = started.port;
+	}, 30_000);
 
 	afterAll(async () => {
 		await server.stop();
 		rmSync(tempDir, { recursive: true, force: true });
-	});
+	}, 30_000);
 
 	it("lists directories with git detection, excludes hidden dirs, sorts git repos first", async () => {
 		const ws = new WebSocket(`ws://127.0.0.1:${port}`);
