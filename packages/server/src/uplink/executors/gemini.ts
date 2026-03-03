@@ -476,12 +476,13 @@ export class GeminiExecutor extends BaseExecutor {
 		} else if (hasHistory) {
 			args.push("--resume", "latest");
 		}
-		args.push("--prompt", prompt, "--output-format", "json");
+		args.push("--output-format", "json");
 		const selectedModel = model?.trim();
 		if (selectedModel && selectedModel.length > 0) {
 			args.push("--model", selectedModel);
 		}
 		args.push(...this.config.extraArgs);
+		args.push(prompt);
 		return args;
 	}
 }
