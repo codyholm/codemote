@@ -479,6 +479,144 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
+	it("forwards list_models to uplink and relays model_list back to mobile", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+		let listModelsPayload: JsonRecord | null = null;
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				const type = command["type"];
+
+				if (type === "list_sessions") {
+					socket.send(
+						JSON.stringify({
+							type: "sessions",
+							payload: [],
+						}),
+					);
+					return;
+				}
+
+				if (type === "list_models") {
+					listModelsPayload = (command["payload"] as JsonRecord | undefined) ?? null;
+					socket.send(
+						JSON.stringify({
+							type: "model_list",
+							payload: {
+								runtime: "claude",
+								models: [
+									{ id: "claude-sonnet-4-20250514", label: "Sonnet 4" },
+									{ id: "claude-opus-4-20250514", label: "Opus 4" },
+									{ id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+								],
+							},
+						}),
+					);
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "333334" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-test-model-list" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: "mobile-test-model-list",
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				} else if (socket === relayUplinkSocket) {
+					relayMobileSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			const mobilePayloads: JsonRecord[] = [];
+
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+			mobileSocket.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (!payload) return;
+				mobilePayloads.push(payload);
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-test-model-list",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(
+				() => mobilePayloads.some((payload) => payload["type"] === "session_list"),
+				8000,
+			);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: {
+						type: "list_models",
+						runtime: "claude",
+					},
+				}),
+			);
+
+			await waitForCondition(() => listModelsPayload !== null, 8000);
+			expect(listModelsPayload?.["profile"]).toBe("claude");
+
+			await waitForCondition(
+				() => mobilePayloads.some((payload) => payload["type"] === "model_list"),
+				8000,
+			);
+
+			const modelList = mobilePayloads.find((payload) => payload["type"] === "model_list");
+			expect(modelList?.["runtime"]).toBe("claude");
+			expect(modelList?.["models"]).toEqual([
+				{ id: "claude-sonnet-4-20250514", label: "Sonnet 4" },
+				{ id: "claude-opus-4-20250514", label: "Opus 4" },
+				{ id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+			]);
+		} finally {
+			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+				mobileSocket.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
 	it("drops timed-out start_run waiters so late responses do not satisfy the next start_run", async () => {
 		const previousTimeout = process.env["CODEMOTE_UPLINK_COMMAND_TIMEOUT_MS"];
 		const previousLongTimeout = process.env["CODEMOTE_UPLINK_LONG_COMMAND_TIMEOUT_MS"];

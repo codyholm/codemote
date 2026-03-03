@@ -1,4 +1,5 @@
 import type {
+	ModelInfo,
 	RunOptions,
 	RunResult,
 	RuntimeType,
@@ -7,7 +8,7 @@ import type {
 } from "@codemote/common";
 
 // Re-export common types
-export type { RunOptions, RunResult, RuntimeType, SessionStatus, StreamEvent };
+export type { ModelInfo, RunOptions, RunResult, RuntimeType, SessionStatus, StreamEvent };
 
 /**
  * Workspace configuration for a session runtime.
@@ -97,6 +98,7 @@ export type UplinkCommand =
 			payload: { sessionId: string; title?: string; body?: string };
 	  }
 	| { type: "list_sessions" }
+	| { type: "list_models"; payload: { profile: RuntimeType } }
 	| { type: "list_directory"; payload: { path?: string } }
 	| { type: "ping" };
 
@@ -120,6 +122,7 @@ export type UplinkResponse =
 	  }
 	| { type: "git_pr_result"; payload: { sessionId: string; url: string } }
 	| { type: "sessions"; payload: Session[] }
+	| { type: "model_list"; payload: { runtime: RuntimeType; models: ModelInfo[] } }
 	| { type: "pong" }
 	| { type: "directory_listing"; payload: { path: string; entries: DirectoryEntry[] } }
 	| { type: "error"; payload: { message: string; code: string } }

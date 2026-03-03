@@ -13,6 +13,31 @@ export {
 // Runtime types
 export type RuntimeType = "opencode" | "claude" | "codex" | "gemini";
 
+export interface ModelInfo {
+	id: string;
+	label: string;
+}
+
+export const RUNTIME_MODELS: Record<RuntimeType, ModelInfo[]> = {
+	claude: [
+		{ id: "claude-sonnet-4-20250514", label: "Sonnet 4" },
+		{ id: "claude-opus-4-20250514", label: "Opus 4" },
+		{ id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+	],
+	opencode: [
+		{ id: "claude-sonnet-4-20250514", label: "Claude Sonnet 4" },
+		{ id: "gpt-4o", label: "GPT-4o" },
+	],
+	codex: [
+		{ id: "codex-mini", label: "Codex Mini" },
+		{ id: "o4-mini", label: "o4-mini" },
+	],
+	gemini: [
+		{ id: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
+		{ id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+	],
+};
+
 // Session status
 export type SessionStatus = "starting" | "running" | "idle" | "ended" | "error";
 

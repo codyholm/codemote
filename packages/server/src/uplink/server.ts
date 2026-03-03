@@ -1,7 +1,12 @@
 import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { RuntimeType, StreamEvent } from "@codemote/common";
+import {
+	type ModelInfo,
+	RUNTIME_MODELS,
+	type RuntimeType,
+	type StreamEvent,
+} from "@codemote/common";
 import { WebSocket, WebSocketServer } from "ws";
 import { EventBus } from "./events.js";
 import type { BaseExecutor } from "./executor.js";
@@ -237,6 +242,12 @@ export class UplinkServer {
 			case "list_sessions":
 				return { type: "sessions", payload: this.sessionManager.list() };
 
+			case "list_models": {
+				const runtime = command.payload.profile;
+				const models = getModelsForRuntime(runtime);
+				return { type: "model_list", payload: { runtime, models } };
+			}
+
 			case "start_run": {
 				const executor = this.executors.get(command.payload.profile);
 				if (!executor) {
@@ -428,4 +439,8 @@ export class UplinkServer {
 	private isLoopbackHost(host: string): boolean {
 		return host === "127.0.0.1" || host === "localhost" || host === "::1";
 	}
+}
+
+function getModelsForRuntime(runtime: RuntimeType): ModelInfo[] {
+	return RUNTIME_MODELS[runtime] ?? [];
 }

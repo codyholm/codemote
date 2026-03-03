@@ -74,6 +74,12 @@ interface SessionListMessage {
 	sessions: SessionInfo[];
 }
 
+interface ModelListMessage {
+	type: "model_list";
+	runtime: RuntimeType;
+	models: Array<{ id: string; label: string }>;
+}
+
 interface SessionOutputMessage {
 	type: "session_output";
 	sessionId: string;
@@ -171,6 +177,11 @@ interface NewSessionMessage {
 	model?: string;
 }
 
+interface ListModelsMessage {
+	type: "list_models";
+	runtime: RuntimeType;
+}
+
 type DiffScope = "staged" | "unstaged" | "all";
 
 interface GetDiffMessage {
@@ -262,6 +273,7 @@ type MobileInboundMessage =
 	| SendPromptMessage
 	| StopMessage
 	| NewSessionMessage
+	| ListModelsMessage
 	| GetDiffMessage
 	| RequestDeviceInfoMessage
 	| ListDirectoryMessage
@@ -273,6 +285,7 @@ type MobileInboundMessage =
 
 type MobileOutboundMessage =
 	| SessionListMessage
+	| ModelListMessage
 	| SessionOutputMessage
 	| SessionMessageMessage
 	| SessionToolCallMessage
@@ -418,6 +431,13 @@ class UplinkWsClient {
 	async listSessions() {
 		return this.sendAndWait({
 			type: "list_sessions",
+		});
+	}
+
+	async listModels(profile: RuntimeType) {
+		return this.sendAndWait({
+			type: "list_models",
+			payload: { profile },
 		});
 	}
 
@@ -572,6 +592,8 @@ function expectedResponseType(commandType: UplinkCommand["type"]): UplinkRespons
 			return "pong";
 		case "list_sessions":
 			return "sessions";
+		case "list_models":
+			return "model_list";
 		case "start_run":
 			return "run_started";
 		case "send_input":
@@ -827,6 +849,9 @@ export async function startRelayUplinkBridge(
 				return;
 			case "git_submit_pr":
 				await handleGitSubmitPR(message);
+				return;
+			case "list_models":
+				await handleListModels(message);
 				return;
 			case "list_directory":
 				await handleListDirectory(message);
@@ -1243,6 +1268,36 @@ export async function startRelayUplinkBridge(
 				type: "diff",
 				sessionId: message.sessionId,
 				diff: `Failed to get diff. ${error instanceof Error ? error.message : String(error)}`,
+			});
+		}
+	}
+
+	async function handleListModels(message: ListModelsMessage): Promise<void> {
+		const requestedRuntime = message.runtime;
+		try {
+			const response = await uplinkClient.listModels(requestedRuntime);
+			if (response.type !== "model_list") {
+				throw new Error("Unexpected list_models response");
+			}
+			if (response.payload.runtime !== requestedRuntime) {
+				throw new Error(
+					`Unexpected list_models runtime: requested ${requestedRuntime}, received ${response.payload.runtime}`,
+				);
+			}
+
+			sendToMobile({
+				type: "model_list",
+				runtime: requestedRuntime,
+				models: response.payload.models,
+			});
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to list models: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			sendToMobile({
+				type: "model_list",
+				runtime: requestedRuntime,
+				models: [],
 			});
 		}
 	}
@@ -1773,6 +1828,19 @@ function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 			typeof approved === "boolean"
 		) {
 			return { type: "approval_response", sessionId, requestId, approved };
+		}
+		return null;
+	}
+
+	if (type === "list_models") {
+		const runtime = (payload as { runtime?: unknown }).runtime;
+		if (
+			runtime === "opencode" ||
+			runtime === "claude" ||
+			runtime === "codex" ||
+			runtime === "gemini"
+		) {
+			return { type: "list_models", runtime };
 		}
 		return null;
 	}
