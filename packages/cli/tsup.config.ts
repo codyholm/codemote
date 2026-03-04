@@ -18,7 +18,8 @@ export default defineConfig({
 	},
 	splitting: false,
 	clean: true,
-	sourcemap: true,
+	sourcemap: false,
+	minify: true,
 	esbuildOptions(options) {
 		// Prevent esbuild from inheriting "strict": true from the root tsconfig,
 		// which blocks bundling CJS modules that use legacy octal escapes (e.g. qrcode-terminal).
