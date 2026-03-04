@@ -69,10 +69,27 @@ describe("UplinkServer list_models", () => {
 
 			expect(payload.runtime).toBe("claude");
 			expect(payload.models).toEqual([
-				{ id: "claude-sonnet-4-20250514", label: "Sonnet 4" },
-				{ id: "claude-opus-4-20250514", label: "Opus 4" },
-				{ id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+				{ id: "sonnet", label: "Sonnet" },
+				{ id: "opus", label: "Opus" },
+				{ id: "haiku", label: "Haiku" },
 			]);
+		} finally {
+			ws.close();
+		}
+	});
+
+	it("returns available runtimes via list_runtimes", async () => {
+		const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+		await waitForOpen(ws);
+		try {
+			const msgPromise = waitForMessage(ws);
+			ws.send(JSON.stringify({ type: "list_runtimes" }));
+			const msg = await msgPromise;
+
+			expect(msg["type"]).toBe("runtime_list");
+			const payload = msg["payload"] as { runtimes: string[] };
+			// Server started with runtimes: [] so probe finds none
+			expect(payload.runtimes).toEqual([]);
 		} finally {
 			ws.close();
 		}

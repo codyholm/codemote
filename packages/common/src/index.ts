@@ -16,27 +16,33 @@ export type RuntimeType = "opencode" | "claude" | "codex" | "gemini";
 export interface ModelInfo {
 	id: string;
 	label: string;
+	provider?: string;
 }
 
 export const RUNTIME_MODELS: Record<RuntimeType, ModelInfo[]> = {
 	claude: [
-		{ id: "claude-sonnet-4-6", label: "Sonnet 4.6" },
-		{ id: "claude-opus-4-6", label: "Opus 4.6" },
-		{ id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+		{ id: "sonnet", label: "Sonnet" },
+		{ id: "opus", label: "Opus" },
+		{ id: "haiku", label: "Haiku" },
 	],
 	opencode: [
-		{ id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-		{ id: "gpt-4.1", label: "GPT-4.1" },
-		{ id: "o4-mini", label: "o4-mini" },
+		{ id: "anthropic/claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "anthropic" },
+		{ id: "anthropic/claude-opus-4-6", label: "Claude Opus 4.6", provider: "anthropic" },
+		{ id: "openai/gpt-5.3-codex", label: "GPT 5.3 Codex", provider: "openai" },
+		{ id: "openai/gpt-5.2-codex", label: "GPT 5.2 Codex", provider: "openai" },
+		{ id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash", provider: "google" },
+		{ id: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro", provider: "google" },
 	],
 	codex: [
-		{ id: "o4-mini", label: "o4-mini" },
-		{ id: "o3", label: "o3" },
-		{ id: "gpt-4.1", label: "GPT-4.1" },
+		{ id: "gpt-5.3-codex", label: "GPT 5.3 Codex" },
+		{ id: "gpt-5.2-codex", label: "GPT 5.2 Codex" },
+		{ id: "gpt-5.2", label: "GPT 5.2" },
 	],
 	gemini: [
 		{ id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
 		{ id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+		{ id: "gemini-3-flash-preview", label: "Gemini 3 Flash (Preview)" },
+		{ id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (Preview)" },
 	],
 };
 

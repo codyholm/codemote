@@ -507,13 +507,17 @@ describe("RelayUplinkBridge", () => {
 							payload: {
 								runtime: "claude",
 								models: [
-									{ id: "claude-sonnet-4-20250514", label: "Sonnet 4" },
-									{ id: "claude-opus-4-20250514", label: "Opus 4" },
-									{ id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+									{ id: "sonnet", label: "Sonnet" },
+									{ id: "opus", label: "Opus" },
+									{ id: "haiku", label: "Haiku" },
 								],
 							},
 						}),
 					);
+				}
+
+				if (type === "list_runtimes") {
+					socket.send(JSON.stringify({ type: "runtime_list", payload: { runtimes: [] } }));
 				}
 			});
 		});
@@ -605,9 +609,9 @@ describe("RelayUplinkBridge", () => {
 			const modelList = mobilePayloads.find((payload) => payload["type"] === "model_list");
 			expect(modelList?.["runtime"]).toBe("claude");
 			expect(modelList?.["models"]).toEqual([
-				{ id: "claude-sonnet-4-20250514", label: "Sonnet 4" },
-				{ id: "claude-opus-4-20250514", label: "Opus 4" },
-				{ id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+				{ id: "sonnet", label: "Sonnet" },
+				{ id: "opus", label: "Opus" },
+				{ id: "haiku", label: "Haiku" },
 			]);
 		} finally {
 			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
@@ -1433,6 +1437,9 @@ describe("RelayUplinkBridge", () => {
 				if (command["type"] === "list_sessions") {
 					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
 				}
+				if (command["type"] === "list_runtimes") {
+					socket.send(JSON.stringify({ type: "runtime_list", payload: { runtimes: [] } }));
+				}
 			});
 		});
 
@@ -1534,6 +1541,9 @@ describe("RelayUplinkBridge", () => {
 				const command = JSON.parse(raw.toString()) as JsonRecord;
 				if (command["type"] === "list_sessions") {
 					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+				}
+				if (command["type"] === "list_runtimes") {
+					socket.send(JSON.stringify({ type: "runtime_list", payload: { runtimes: [] } }));
 				}
 			});
 		});
@@ -1671,6 +1681,9 @@ describe("RelayUplinkBridge", () => {
 				const command = JSON.parse(raw.toString()) as JsonRecord;
 				if (command["type"] === "list_sessions") {
 					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+				}
+				if (command["type"] === "list_runtimes") {
+					socket.send(JSON.stringify({ type: "runtime_list", payload: { runtimes: [] } }));
 				}
 			});
 		});

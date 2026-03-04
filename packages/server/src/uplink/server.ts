@@ -17,6 +17,8 @@ import {
 	OpenCodeExecutor,
 } from "./executors/index.js";
 import { MockExecutor } from "./mock-executor.js";
+import { discoverOpenCodeModels } from "./opencode-models.js";
+import { probeInstalledRuntimes } from "./runtime-probe.js";
 import { SessionManager } from "./session.js";
 import type {
 	DirectoryEntry,
@@ -38,6 +40,8 @@ export class UplinkServer {
 	private sessionManager: SessionManager;
 	private eventBus: EventBus;
 	private executors = new Map<RuntimeType, BaseExecutor>();
+	private availableRuntimes: RuntimeType[] = [];
+	private dynamicModels = new Map<RuntimeType, ModelInfo[]>();
 	private clients = new Set<WebSocket>();
 	private static readonly LIST_DIRECTORY_STAT_CONCURRENCY = 50;
 
@@ -51,54 +55,6 @@ export class UplinkServer {
 		this.registerExecutor(
 			new MockExecutor(this.workspaceManager, this.sessionManager, this.eventBus),
 		);
-
-		// Register OpenCode executor
-		if (this.config.runtimes.includes("opencode")) {
-			this.registerExecutor(
-				new OpenCodeExecutor(
-					this.workspaceManager,
-					this.sessionManager,
-					this.eventBus,
-					this.config.runtimeConfigs?.opencode,
-				),
-			);
-		}
-
-		// Register Claude executor
-		if (this.config.runtimes.includes("claude")) {
-			this.registerExecutor(
-				new ClaudeExecutor(
-					this.workspaceManager,
-					this.sessionManager,
-					this.eventBus,
-					this.config.runtimeConfigs?.claude,
-				),
-			);
-		}
-
-		// Register Codex executor
-		if (this.config.runtimes.includes("codex")) {
-			this.registerExecutor(
-				new CodexExecutor(
-					this.workspaceManager,
-					this.sessionManager,
-					this.eventBus,
-					this.config.runtimeConfigs?.codex,
-				),
-			);
-		}
-
-		// Register Gemini executor
-		if (this.config.runtimes.includes("gemini")) {
-			this.registerExecutor(
-				new GeminiExecutor(
-					this.workspaceManager,
-					this.sessionManager,
-					this.eventBus,
-					this.config.runtimeConfigs?.gemini,
-				),
-			);
-		}
 
 		// Subscribe to all events and broadcast to clients
 		this.eventBus.subscribe((event) => this.broadcast({ type: "event", payload: event }));
@@ -126,6 +82,68 @@ export class UplinkServer {
 			throw new Error(
 				`Refusing to start uplink on non-loopback host (${this.config.host}). Uplink must be loopback-only for safety.`,
 			);
+		}
+
+		// Probe which runtimes are actually installed
+		this.availableRuntimes = await probeInstalledRuntimes(this.config.runtimes);
+
+		// Register executors only for available runtimes
+		if (this.availableRuntimes.includes("opencode")) {
+			this.registerExecutor(
+				new OpenCodeExecutor(
+					this.workspaceManager,
+					this.sessionManager,
+					this.eventBus,
+					this.config.runtimeConfigs?.opencode,
+				),
+			);
+		}
+
+		if (this.availableRuntimes.includes("claude")) {
+			this.registerExecutor(
+				new ClaudeExecutor(
+					this.workspaceManager,
+					this.sessionManager,
+					this.eventBus,
+					this.config.runtimeConfigs?.claude,
+				),
+			);
+		}
+
+		if (this.availableRuntimes.includes("codex")) {
+			this.registerExecutor(
+				new CodexExecutor(
+					this.workspaceManager,
+					this.sessionManager,
+					this.eventBus,
+					this.config.runtimeConfigs?.codex,
+				),
+			);
+		}
+
+		if (this.availableRuntimes.includes("gemini")) {
+			this.registerExecutor(
+				new GeminiExecutor(
+					this.workspaceManager,
+					this.sessionManager,
+					this.eventBus,
+					this.config.runtimeConfigs?.gemini,
+				),
+			);
+		}
+
+		// Discover dynamic models for OpenCode
+		if (this.availableRuntimes.includes("opencode")) {
+			try {
+				const models = await discoverOpenCodeModels(
+					this.config.runtimeConfigs?.opencode?.opencodePath,
+				);
+				if (models.length > 0) {
+					this.dynamicModels.set("opencode", models);
+				}
+			} catch {
+				// Fall back to curated list
+			}
 		}
 
 		return new Promise((resolve, reject) => {
@@ -242,9 +260,12 @@ export class UplinkServer {
 			case "list_sessions":
 				return { type: "sessions", payload: this.sessionManager.list() };
 
+			case "list_runtimes":
+				return { type: "runtime_list", payload: { runtimes: this.availableRuntimes } };
+
 			case "list_models": {
 				const runtime = command.payload.profile;
-				const models = getModelsForRuntime(runtime);
+				const models = this.getModelsForRuntime(runtime);
 				return { type: "model_list", payload: { runtime, models } };
 			}
 
@@ -436,11 +457,11 @@ export class UplinkServer {
 		}
 	}
 
+	private getModelsForRuntime(runtime: RuntimeType): ModelInfo[] {
+		return this.dynamicModels.get(runtime) ?? RUNTIME_MODELS[runtime];
+	}
+
 	private isLoopbackHost(host: string): boolean {
 		return host === "127.0.0.1" || host === "localhost" || host === "::1";
 	}
-}
-
-function getModelsForRuntime(runtime: RuntimeType): ModelInfo[] {
-	return RUNTIME_MODELS[runtime] ?? [];
 }

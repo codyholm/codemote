@@ -100,6 +100,7 @@ export type UplinkCommand =
 	| { type: "list_sessions" }
 	| { type: "list_models"; payload: { profile: RuntimeType } }
 	| { type: "list_directory"; payload: { path?: string } }
+	| { type: "list_runtimes" }
 	| { type: "ping" };
 
 /**
@@ -125,6 +126,7 @@ export type UplinkResponse =
 	| { type: "model_list"; payload: { runtime: RuntimeType; models: ModelInfo[] } }
 	| { type: "pong" }
 	| { type: "directory_listing"; payload: { path: string; entries: DirectoryEntry[] } }
+	| { type: "runtime_list"; payload: { runtimes: RuntimeType[] } }
 	| { type: "error"; payload: { message: string; code: string } }
 	| { type: "event"; payload: StreamEvent };
 

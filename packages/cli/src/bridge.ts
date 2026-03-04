@@ -77,7 +77,12 @@ interface SessionListMessage {
 interface ModelListMessage {
 	type: "model_list";
 	runtime: RuntimeType;
-	models: Array<{ id: string; label: string }>;
+	models: Array<{ id: string; label: string; provider?: string }>;
+}
+
+interface RuntimeListMessage {
+	type: "runtime_list";
+	runtimes: RuntimeType[];
 }
 
 interface SessionOutputMessage {
@@ -144,6 +149,7 @@ interface DeviceInfoMessage {
 	type: "device_info";
 	uplinkDeviceId: string;
 	endpoints: DeviceEndpointMessage[];
+	availableRuntimes?: RuntimeType[];
 }
 
 interface RequestDeviceInfoMessage {
@@ -180,6 +186,10 @@ interface NewSessionMessage {
 interface ListModelsMessage {
 	type: "list_models";
 	runtime: RuntimeType;
+}
+
+interface ListRuntimesMessage {
+	type: "list_runtimes";
 }
 
 type DiffScope = "staged" | "unstaged" | "all";
@@ -274,6 +284,7 @@ type MobileInboundMessage =
 	| StopMessage
 	| NewSessionMessage
 	| ListModelsMessage
+	| ListRuntimesMessage
 	| GetDiffMessage
 	| RequestDeviceInfoMessage
 	| ListDirectoryMessage
@@ -299,6 +310,7 @@ type MobileOutboundMessage =
 	| GitPullResultMessage
 	| GitPushResultMessage
 	| GitWorktreeResultMessage
+	| RuntimeListMessage
 	| GitPRResultMessage;
 
 const AUTO_RESUME_RUNTIMES: ReadonlySet<RuntimeType> = new Set(["claude", "opencode"]);
@@ -438,6 +450,12 @@ class UplinkWsClient {
 		return this.sendAndWait({
 			type: "list_models",
 			payload: { profile },
+		});
+	}
+
+	async listRuntimes() {
+		return this.sendAndWait({
+			type: "list_runtimes",
 		});
 	}
 
@@ -594,6 +612,8 @@ function expectedResponseType(commandType: UplinkCommand["type"]): UplinkRespons
 			return "sessions";
 		case "list_models":
 			return "model_list";
+		case "list_runtimes":
+			return "runtime_list";
 		case "start_run":
 			return "run_started";
 		case "send_input":
@@ -852,6 +872,9 @@ export async function startRelayUplinkBridge(
 				return;
 			case "list_models":
 				await handleListModels(message);
+				return;
+			case "list_runtimes":
+				await handleListRuntimes();
 				return;
 			case "list_directory":
 				await handleListDirectory(message);
@@ -1302,6 +1325,28 @@ export async function startRelayUplinkBridge(
 		}
 	}
 
+	async function handleListRuntimes(): Promise<void> {
+		try {
+			const response = await uplinkClient.listRuntimes();
+			if (response.type !== "runtime_list") {
+				throw new Error("Unexpected list_runtimes response");
+			}
+
+			sendToMobile({
+				type: "runtime_list",
+				runtimes: response.payload.runtimes,
+			});
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to list runtimes: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			sendToMobile({
+				type: "runtime_list",
+				runtimes: [],
+			});
+		}
+	}
+
 	async function handleListDirectory(message: ListDirectoryMessage): Promise<void> {
 		try {
 			const response = await uplinkClient.listDirectory(message.path);
@@ -1579,11 +1624,22 @@ export async function startRelayUplinkBridge(
 				return;
 			}
 
+			let availableRuntimes: RuntimeType[] | undefined;
+			try {
+				const rtResponse = await uplinkClient.listRuntimes();
+				if (rtResponse.type === "runtime_list") {
+					availableRuntimes = rtResponse.payload.runtimes;
+				}
+			} catch {
+				// Don't fail device info if runtimes query fails
+			}
+
 			// Outgoing endpoints replace all previously-known endpoints on the mobile side.
 			sendToMobile({
 				type: "device_info",
 				uplinkDeviceId,
 				endpoints,
+				...(availableRuntimes ? { availableRuntimes } : {}),
 			});
 		} catch (error) {
 			log?.(
@@ -1843,6 +1899,10 @@ function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 			return { type: "list_models", runtime };
 		}
 		return null;
+	}
+
+	if (type === "list_runtimes") {
+		return { type: "list_runtimes" };
 	}
 
 	if (type === "list_directory") {
