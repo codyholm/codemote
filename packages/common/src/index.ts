@@ -100,3 +100,6 @@ export interface RunResult {
 	runId: string;
 	sessionId: string;
 }
+
+// Config types
+export type { CodemoteConfig, RuntimeSettings } from "./config.js";

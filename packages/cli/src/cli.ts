@@ -21,6 +21,7 @@
  * ```
  */
 
+import { runCacheRefresh, runConfigSubcommand } from "./config.js";
 import { advertiseService } from "./mdns.js";
 import { buildPairingURL, generateQRCode, getLocalIP } from "./qrcode.js";
 import { startServer } from "./server.js";
@@ -122,6 +123,8 @@ Usage:
   codemote
   codemote serve [--remote <relay-url>]
   codemote service install|start|stop|status|uninstall|logs [--remote <relay-url>]
+  codemote cache refresh
+  codemote config [list|get <key>|set <key> <value>|path]
 
 Options:
   -h, --help     Show this help message
@@ -539,6 +542,20 @@ async function run(): Promise<void> {
 
 	if (command === "service") {
 		await runServiceSubcommand(rawArgs.slice(1));
+		return;
+	}
+
+	if (command === "cache") {
+		const subAction = rawArgs[1];
+		if (subAction === "refresh") {
+			await runCacheRefresh();
+			return;
+		}
+		throw new Error("Usage: codemote cache refresh");
+	}
+
+	if (command === "config") {
+		await runConfigSubcommand(rawArgs.slice(1));
 		return;
 	}
 

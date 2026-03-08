@@ -109,7 +109,8 @@ export type UplinkCommand =
 	| ({ type: "list_models"; payload: { profile: RuntimeType } } & RequestEnvelope)
 	| ({ type: "list_directory"; payload: { path?: string } } & RequestEnvelope)
 	| ({ type: "list_runtimes" } & RequestEnvelope)
-	| ({ type: "ping" } & RequestEnvelope);
+	| ({ type: "ping" } & RequestEnvelope)
+	| ({ type: "refresh_cache" } & RequestEnvelope);
 
 /**
  * Response from Uplink via WebSocket
@@ -141,6 +142,10 @@ export type UplinkResponse =
 			payload: { path: string; entries: DirectoryEntry[] };
 	  } & RequestEnvelope)
 	| ({ type: "runtime_list"; payload: { runtimes: RuntimeType[] } } & RequestEnvelope)
+	| ({
+			type: "cache_refreshed";
+			payload: { availableRuntimes: RuntimeType[]; modelCounts: Record<string, number> };
+	  } & RequestEnvelope)
 	| ({ type: "error"; payload: { message: string; code: string } } & RequestEnvelope)
 	| ({ type: "event"; payload: StreamEvent } & RequestEnvelope);
 

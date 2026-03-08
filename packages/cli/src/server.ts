@@ -32,10 +32,11 @@
  * - Transport is WSS by default using a self-signed cert under `~/.codemote/tls/`.
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { unwatchFile, watchFile } from "node:fs";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	type RelayServerConfig,
 	type RuntimeType,
@@ -266,6 +267,9 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 			updatedAt: string;
 		};
 		stoppedAt?: string;
+		availableRuntimes?: string[];
+		modelCounts?: Record<string, number>;
+		cacheRefreshedAt?: string;
 	} = {
 		running: true,
 		mode: localRelayEnabled ? "local" : "remote",
@@ -292,6 +296,49 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 			);
 		});
 	};
+
+	// Write initial cache state from uplink probe results
+	const initialCache = uplink.getCacheSnapshot();
+	writeStatusSafely(
+		{
+			availableRuntimes: initialCache.availableRuntimes,
+			modelCounts: initialCache.modelCounts,
+			cacheRefreshedAt: initialCache.refreshedAt,
+		},
+		"initial_cache",
+	);
+
+	// Watch for signal file to trigger cache refresh from external processes
+	const refreshSignalPath = statusFilePath
+		? join(dirname(statusFilePath), "refresh-requested")
+		: null;
+	const REFRESH_POLL_MS = 1000;
+
+	if (refreshSignalPath) {
+		// If the server previously crashed before deleting the signal file,
+		// this triggers an immediate refresh on restart -- intentional behavior
+		// to ensure stale cache state doesn't persist across restarts.
+		watchFile(refreshSignalPath, { interval: REFRESH_POLL_MS }, async (curr) => {
+			if (curr.size > 0 || curr.mtimeMs > 0) {
+				console.log("[Server] Cache refresh requested via signal file");
+				try {
+					await uplink.refreshCaches();
+					const snap = uplink.getCacheSnapshot();
+					writeStatusSafely(
+						{
+							availableRuntimes: snap.availableRuntimes,
+							modelCounts: snap.modelCounts,
+							cacheRefreshedAt: snap.refreshedAt,
+						},
+						"cache_refresh",
+					);
+				} catch (err) {
+					console.warn("[Server] Cache refresh failed:", err);
+				}
+				await unlink(refreshSignalPath).catch(() => {});
+			}
+		});
+	}
 
 	// Connect an uplink "device" to the relay and bridge messages to the uplink server
 	const bridgeRelayUrl = remoteRelayTarget ?? `${wsScheme}://127.0.0.1:${port}`;
@@ -423,6 +470,9 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 		async stop() {
 			console.log("[Server] Stopping servers...");
+			if (refreshSignalPath) {
+				unwatchFile(refreshSignalPath);
+			}
 			if (mobileConnectionPoll) {
 				clearInterval(mobileConnectionPoll);
 			}
@@ -485,7 +535,6 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		},
 	};
 }
-
 function normalizeRelayWsUrl(raw: string | undefined): string | null {
 	if (!raw) {
 		return null;

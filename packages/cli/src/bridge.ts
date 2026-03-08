@@ -680,6 +680,8 @@ function expectedResponseType(commandType: UplinkCommand["type"]): UplinkRespons
 			return "git_worktree_result";
 		case "git_submit_pr":
 			return "git_pr_result";
+		case "refresh_cache":
+			return "cache_refreshed";
 		default:
 			return "error";
 	}

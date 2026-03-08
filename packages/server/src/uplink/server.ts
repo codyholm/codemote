@@ -75,64 +75,14 @@ export class UplinkServer {
 	}
 
 	/**
-	 * Start the WebSocket server
+	 * Refresh runtime probe results and dynamic model caches.
+	 * Called during start() and on-demand via the refresh_cache command.
 	 */
-	async start(): Promise<void> {
-		if (!this.isLoopbackHost(this.config.host)) {
-			throw new Error(
-				`Refusing to start uplink on non-loopback host (${this.config.host}). Uplink must be loopback-only for safety.`,
-			);
-		}
-
-		// Probe which runtimes are actually installed
+	async refreshCaches(): Promise<void> {
 		this.availableRuntimes = await probeInstalledRuntimes(this.config.runtimes);
-
-		// Register executors only for available runtimes
-		if (this.availableRuntimes.includes("opencode")) {
-			this.registerExecutor(
-				new OpenCodeExecutor(
-					this.workspaceManager,
-					this.sessionManager,
-					this.eventBus,
-					this.config.runtimeConfigs?.opencode,
-				),
-			);
+		for (const runtime of this.availableRuntimes) {
+			this.registerRuntimeExecutor(runtime);
 		}
-
-		if (this.availableRuntimes.includes("claude")) {
-			this.registerExecutor(
-				new ClaudeExecutor(
-					this.workspaceManager,
-					this.sessionManager,
-					this.eventBus,
-					this.config.runtimeConfigs?.claude,
-				),
-			);
-		}
-
-		if (this.availableRuntimes.includes("codex")) {
-			this.registerExecutor(
-				new CodexExecutor(
-					this.workspaceManager,
-					this.sessionManager,
-					this.eventBus,
-					this.config.runtimeConfigs?.codex,
-				),
-			);
-		}
-
-		if (this.availableRuntimes.includes("gemini")) {
-			this.registerExecutor(
-				new GeminiExecutor(
-					this.workspaceManager,
-					this.sessionManager,
-					this.eventBus,
-					this.config.runtimeConfigs?.gemini,
-				),
-			);
-		}
-
-		// Discover dynamic models for OpenCode
 		if (this.availableRuntimes.includes("opencode")) {
 			try {
 				const models = await discoverOpenCodeModels(
@@ -142,9 +92,41 @@ export class UplinkServer {
 					this.dynamicModels.set("opencode", models);
 				}
 			} catch {
-				// Fall back to curated list
+				// Keep existing cache
 			}
 		}
+	}
+
+	/**
+	 * Return a snapshot of cached runtime/model state for status reporting.
+	 */
+	getCacheSnapshot(): {
+		availableRuntimes: RuntimeType[];
+		modelCounts: Record<string, number>;
+		refreshedAt: string;
+	} {
+		const modelCounts: Record<string, number> = {};
+		for (const [runtime, models] of this.dynamicModels) {
+			modelCounts[runtime] = models.length;
+		}
+		return {
+			availableRuntimes: this.availableRuntimes,
+			modelCounts,
+			refreshedAt: new Date().toISOString(),
+		};
+	}
+
+	/**
+	 * Start the WebSocket server
+	 */
+	async start(): Promise<void> {
+		if (!this.isLoopbackHost(this.config.host)) {
+			throw new Error(
+				`Refusing to start uplink on non-loopback host (${this.config.host}). Uplink must be loopback-only for safety.`,
+			);
+		}
+
+		await this.refreshCaches();
 
 		return new Promise((resolve, reject) => {
 			const wss = new WebSocketServer({
@@ -381,6 +363,18 @@ export class UplinkServer {
 				return { type: "directory_listing", payload: { path: resolvedPath, entries } };
 			}
 
+			case "refresh_cache": {
+				await this.refreshCaches();
+				const snap = this.getCacheSnapshot();
+				return {
+					type: "cache_refreshed",
+					payload: {
+						availableRuntimes: snap.availableRuntimes,
+						modelCounts: snap.modelCounts,
+					},
+				};
+			}
+
 			default:
 				throw new Error("Unknown command type");
 		}
@@ -476,5 +470,50 @@ export class UplinkServer {
 
 	private isLoopbackHost(host: string): boolean {
 		return host === "127.0.0.1" || host === "localhost" || host === "::1";
+	}
+
+	private registerRuntimeExecutor(runtime: RuntimeType): void {
+		switch (runtime) {
+			case "opencode":
+				this.registerExecutor(
+					new OpenCodeExecutor(
+						this.workspaceManager,
+						this.sessionManager,
+						this.eventBus,
+						this.config.runtimeConfigs?.opencode,
+					),
+				);
+				break;
+			case "claude":
+				this.registerExecutor(
+					new ClaudeExecutor(
+						this.workspaceManager,
+						this.sessionManager,
+						this.eventBus,
+						this.config.runtimeConfigs?.claude,
+					),
+				);
+				break;
+			case "codex":
+				this.registerExecutor(
+					new CodexExecutor(
+						this.workspaceManager,
+						this.sessionManager,
+						this.eventBus,
+						this.config.runtimeConfigs?.codex,
+					),
+				);
+				break;
+			case "gemini":
+				this.registerExecutor(
+					new GeminiExecutor(
+						this.workspaceManager,
+						this.sessionManager,
+						this.eventBus,
+						this.config.runtimeConfigs?.gemini,
+					),
+				);
+				break;
+		}
 	}
 }
