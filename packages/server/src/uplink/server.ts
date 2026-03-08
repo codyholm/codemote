@@ -209,19 +209,23 @@ export class UplinkServer {
 		console.log("Client connected");
 
 		ws.on("message", async (data) => {
+			let requestId: string | undefined;
 			try {
 				const command = JSON.parse(data.toString()) as UplinkCommand;
+				requestId = command.requestId;
 				const response = await this.handleCommand(command);
 				ws.send(JSON.stringify(response));
 			} catch (error) {
 				const safe = this.toSafeError(error);
 				console.error("Uplink WS command failed:", error);
-				ws.send(
-					JSON.stringify({
-						type: "error",
-						payload: safe,
-					} satisfies UplinkResponse),
-				);
+				const errorResponse: UplinkResponse = {
+					type: "error",
+					payload: safe,
+				};
+				if (requestId) {
+					errorResponse.requestId = requestId;
+				}
+				ws.send(JSON.stringify(errorResponse));
 			}
 		});
 
@@ -253,6 +257,15 @@ export class UplinkServer {
 	}
 
 	private async handleCommand(command: UplinkCommand): Promise<UplinkResponse> {
+		const { requestId } = command;
+		const response = await this.handleCommandInner(command);
+		if (requestId) {
+			response.requestId = requestId;
+		}
+		return response;
+	}
+
+	private async handleCommandInner(command: UplinkCommand): Promise<UplinkResponse> {
 		switch (command.type) {
 			case "ping":
 				return { type: "pong" };

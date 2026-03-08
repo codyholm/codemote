@@ -14,6 +14,7 @@ export type {
 	Session,
 	UplinkCommand,
 	UplinkResponse,
+	RequestEnvelope,
 	UplinkConfig,
 	RuntimeConfigs,
 } from "./types.js";

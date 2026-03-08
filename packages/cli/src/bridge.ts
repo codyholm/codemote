@@ -359,6 +359,7 @@ const DEVICE_ID_PATH = join(homedir(), ".codemote", "device-id");
 
 class UplinkWsClient {
 	private readonly pending: Array<{
+		requestId: string;
 		expectedType: UplinkResponse["type"];
 		resolve: (msg: UplinkResponse) => void;
 		reject: (err: Error) => void;
@@ -521,7 +522,33 @@ class UplinkWsClient {
 		}
 
 		if (msg.type === "error") {
-			const waiter = this.pending.pop();
+			const errorRequestId = msg.requestId;
+			let waiter: (typeof this.pending)[number] | undefined;
+			if (errorRequestId) {
+				const idx = this.pending.findIndex((entry) => entry.requestId === errorRequestId);
+				if (idx >= 0) {
+					waiter = this.pending.splice(idx, 1)[0];
+				}
+			}
+			if (!waiter) {
+				if (!errorRequestId) {
+					// Pre-requestId fallback: error responses from older servers lack requestId,
+					// so pop the most recent waiter. Safe because queued commands serialize,
+					// and queue-bypassing commands (stopSession, sendInput) will carry requestId
+					// once both sides support it.
+					waiter = this.pending.pop();
+				} else {
+					// Orphaned/late error with an unknown requestId; ignore to avoid
+					// rejecting the wrong pending request.
+					console.warn(
+						"Bridge received error for unknown requestId:",
+						errorRequestId,
+						"-",
+						msg.payload.message,
+					);
+					return;
+				}
+			}
 			if (waiter) {
 				clearTimeout(waiter.timeout);
 				waiter.reject(new Error(msg.payload.message));
@@ -529,7 +556,22 @@ class UplinkWsClient {
 			return;
 		}
 
-		const waiterIndex = this.pending.findIndex((entry) => entry.expectedType === msg.type);
+		let waiterIndex = -1;
+		const responseId = msg.requestId;
+		if (responseId) {
+			waiterIndex = this.pending.findIndex((entry) => entry.requestId === responseId);
+			if (waiterIndex < 0) {
+				console.warn(
+					"Bridge received response for unknown requestId:",
+					responseId,
+					"type:",
+					msg.type,
+				);
+				return;
+			}
+		} else {
+			waiterIndex = this.pending.findIndex((entry) => entry.expectedType === msg.type);
+		}
 		if (waiterIndex < 0) {
 			return;
 		}
@@ -576,16 +618,20 @@ class UplinkWsClient {
 	}
 
 	private sendAndWaitImmediate(command: UplinkCommand): Promise<UplinkResponse> {
+		const requestId = randomUUID();
 		const expectedType = expectedResponseType(command.type);
 		const timeoutMs = commandTimeoutFor(command.type);
+		const taggedCommand = { ...command, requestId };
 
 		return new Promise((resolve, reject) => {
 			const waiter: {
+				requestId: string;
 				expectedType: UplinkResponse["type"];
 				resolve: (msg: UplinkResponse) => void;
 				reject: (err: Error) => void;
 				timeout: ReturnType<typeof setTimeout>;
 			} = {
+				requestId,
 				expectedType,
 				resolve,
 				reject,
@@ -599,7 +645,7 @@ class UplinkWsClient {
 				}, timeoutMs),
 			};
 			this.pending.push(waiter);
-			this.ws.send(JSON.stringify(command));
+			this.ws.send(JSON.stringify(taggedCommand));
 		});
 	}
 }
