@@ -143,6 +143,21 @@ interface RelayStats {
  * @param config - Server configuration
  * @returns Server handle for control and monitoring
  */
+export function resolveEncryptionMode(raw: string | undefined): "off" | "opportunistic" {
+	const value = raw ?? "off";
+	if (value === "required") {
+		console.warn(
+			'[Server] CODEMOTE_ENCRYPTION="required" is not yet implemented, using "opportunistic"',
+		);
+		return "opportunistic";
+	}
+	if (value === "off" || value === "opportunistic") {
+		return value;
+	}
+	console.warn(`[Server] Invalid CODEMOTE_ENCRYPTION "${value}", falling back to "off"`);
+	return "off";
+}
+
 export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	const {
 		port,
@@ -346,6 +361,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	const statusRelayUrl = localRelayEnabled
 		? (advertisedRelayUrl ?? bridgeRelayUrl)
 		: bridgeRelayUrl;
+	const encryptionMode = resolveEncryptionMode(process.env["CODEMOTE_ENCRYPTION"]);
 	const bridge = await startRelayUplinkBridge({
 		relayUrl: bridgeRelayUrl,
 		...(localRelayEnabled && relayCertPem ? { relayWsOptions: { ca: relayCertPem } } : {}),
@@ -354,6 +370,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		...(advertisedRelayUrl ? { localEndpointUrl: advertisedRelayUrl } : {}),
 		...(bridgeHostedEndpointUrl ? { hostedEndpointUrl: bridgeHostedEndpointUrl } : {}),
 		...(process.env["GUILD_REMOTE_DEBUG"] ? { log: (message) => console.log(message) } : {}),
+		encryptionMode,
 		onPairingCode: (pin) => {
 			currentPIN = pin;
 			writeStatusSafely(

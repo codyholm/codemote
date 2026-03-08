@@ -1,11 +1,13 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { WebSocket } from "ws";
 
+import { decodeBase64, decrypt, encodeBase64, encrypt, generateKeyPair } from "./encryption.js";
+import type { KeyPair } from "./encryption.js";
 import { WS_MAX_PAYLOAD_BYTES } from "./messageLimits.js";
-import type { EncryptedPayload } from "./protocol.js";
+import type { EncryptedPayload, EncryptionAccept, EncryptionOffer } from "./protocol.js";
 import { ReplayGuard } from "./replayProtection.js";
 import { detectTailscaleEndpoint } from "./tailscale.js";
 import { validateEncryptedPayload } from "./validateEncryptedPayload.js";
@@ -334,6 +336,13 @@ export interface RelayUplinkBridgeConfig {
 	 * When omitted, encrypted payloads are rejected after validation + replay checks.
 	 */
 	decryptEncryptedPayload?: (payload: EncryptedPayload) => unknown;
+	/**
+	 * E2E encryption mode for relay traffic.
+	 * - "off": No encryption (default for local/Tailscale)
+	 * - "opportunistic": Offer encryption, fall back to plaintext if peer doesn't respond
+	 * - "required": Not yet implemented (server.ts normalizes to "opportunistic")
+	 */
+	encryptionMode?: "off" | "opportunistic" | "required";
 	onPairingCode?: (code: string) => void;
 	onMobilePaired?: () => void;
 	onMobileDisconnected?: () => void;
@@ -350,6 +359,11 @@ export interface RelayUplinkBridgeHandle {
 	uplinkDeviceId: string;
 	/** @deprecated alias of uplinkDeviceId for back-compat */
 	uplinkPublicKey: string;
+	/**
+	 * Base64-encoded NaCl public key for E2E encryption.
+	 * Undefined when encryption is not enabled.
+	 */
+	encryptionPublicKey?: string | undefined;
 	startSession: (runtime: RuntimeType, prompt: string) => Promise<{ sessionId: string }>;
 	refreshPairingCode: () => Promise<string>;
 	stop: () => Promise<void>;
@@ -727,7 +741,8 @@ export async function startRelayUplinkBridge(
 		repoPath,
 		localEndpointUrl,
 		hostedEndpointUrl,
-		decryptEncryptedPayload,
+		decryptEncryptedPayload: decryptEncryptedPayloadOverride,
+		encryptionMode: configEncryptionMode,
 		onPairingCode,
 		onMobilePaired,
 		onMobileDisconnected,
@@ -736,6 +751,35 @@ export async function startRelayUplinkBridge(
 	} = config;
 
 	const uplinkDeviceId = await getOrCreateUplinkDeviceId();
+
+	// E2E encryption state
+	let encryptionKeys: KeyPair | undefined;
+	let remotePublicKey: Uint8Array | undefined;
+	let encryptionPublicKeyBase64: string | undefined;
+	const encryptionMode = configEncryptionMode ?? "off";
+
+	if (encryptionMode !== "off") {
+		encryptionKeys = generateKeyPair();
+		encryptionPublicKeyBase64 = encodeBase64(encryptionKeys.publicKey);
+		log?.(`[Bridge] E2E encryption mode: ${encryptionMode}, keypair generated`);
+	}
+
+	// Wire automatic decryption — closure checks current remotePublicKey at call time
+	const decryptEncryptedPayload =
+		decryptEncryptedPayloadOverride ??
+		(encryptionMode !== "off"
+			? (payload: EncryptedPayload): unknown => {
+					if (!encryptionKeys || !remotePublicKey) {
+						throw new Error("Encryption keys not yet exchanged");
+					}
+					const senderPubKey = decodeBase64(payload.senderPublicKey);
+					if (!timingSafeEqual(Buffer.from(senderPubKey), Buffer.from(remotePublicKey))) {
+						throw new Error("Sender public key does not match expected peer");
+					}
+					const plaintext = decrypt(payload, senderPubKey, encryptionKeys.secretKey);
+					return JSON.parse(plaintext) as unknown;
+				}
+			: undefined);
 
 	const sessions = new Map<string, SessionInfo>();
 	const approvalRequests = new Map<string, { sessionId: string }>();
@@ -837,6 +881,23 @@ export async function startRelayUplinkBridge(
 					await syncSessionsFromUplink();
 					sendSessionList();
 					void sendDeviceInfoToMobile();
+
+					// Clear stale encryption state from previous pairing (key rotation)
+					if (encryptionMode !== "off") {
+						remotePublicKey = undefined;
+						encryptionKeys = generateKeyPair();
+						encryptionPublicKeyBase64 = encodeBase64(encryptionKeys.publicKey);
+						log?.("[Bridge] Rotated encryption keypair for new pairing");
+					}
+
+					// Offer E2E encryption if enabled
+					if (encryptionMode !== "off" && encryptionKeys && encryptionPublicKeyBase64) {
+						log?.("[Bridge] Sending encryption_offer to mobile");
+						sendToMobileRaw({
+							type: "encryption_offer",
+							publicKey: encryptionPublicKeyBase64,
+						} satisfies EncryptionOffer);
+					}
 				}
 				return;
 
@@ -851,6 +912,36 @@ export async function startRelayUplinkBridge(
 				return;
 
 			case "message": {
+				// Handle key exchange messages before encryption/decryption
+				if (
+					typeof relayMessage.payload === "object" &&
+					relayMessage.payload !== null &&
+					"type" in relayMessage.payload
+				) {
+					const innerType = (relayMessage.payload as { type: string }).type;
+					if (innerType === "encryption_accept" && encryptionKeys) {
+						const acceptPayload = relayMessage.payload as EncryptionAccept;
+						if (typeof acceptPayload.publicKey !== "string") {
+							log?.("[Bridge] encryption_accept: missing or invalid publicKey");
+							return;
+						}
+						let peerKey: Uint8Array;
+						try {
+							peerKey = decodeBase64(acceptPayload.publicKey);
+						} catch {
+							log?.("[Bridge] encryption_accept: failed to decode publicKey");
+							return;
+						}
+						if (peerKey.length !== 32) {
+							log?.(`[Bridge] encryption_accept: invalid key length ${peerKey.length}`);
+							return;
+						}
+						remotePublicKey = peerKey;
+						log?.("[Bridge] E2E encryption activated (received encryption_accept)");
+						return;
+					}
+				}
+
 				let inboundPayload: unknown = relayMessage.payload;
 				const encrypted = validateEncryptedPayload(relayMessage.payload);
 				if (encrypted.ok) {
@@ -1578,7 +1669,27 @@ export async function startRelayUplinkBridge(
 		} else {
 			log?.(`[Bridge] sendToMobile: type=${message.type}`);
 		}
-		relayWs.send(JSON.stringify({ type: "message", payload: message }));
+		const plainJson = JSON.stringify(message);
+		if (encryptionKeys && remotePublicKey) {
+			const encryptedPayload = encrypt(
+				plainJson,
+				remotePublicKey,
+				encryptionKeys.secretKey,
+				encryptionKeys.publicKey,
+			);
+			relayWs.send(JSON.stringify({ type: "message", payload: encryptedPayload }));
+		} else {
+			relayWs.send(JSON.stringify({ type: "message", payload: message }));
+		}
+	}
+
+	/** Send a raw (unencrypted) message to mobile. Used for key exchange. */
+	function sendToMobileRaw(payload: Record<string, unknown>): void {
+		if (mobileDeviceIds.size === 0) {
+			log?.("[Bridge] sendToMobileRaw: skipped (no paired mobiles)");
+			return;
+		}
+		relayWs.send(JSON.stringify({ type: "message", payload }));
 	}
 
 	function toSessionInfo(session: {
@@ -1707,6 +1818,9 @@ export async function startRelayUplinkBridge(
 		pairingCode,
 		uplinkDeviceId,
 		uplinkPublicKey: uplinkDeviceId,
+		get encryptionPublicKey() {
+			return encryptionPublicKeyBase64;
+		},
 		startSession,
 		refreshPairingCode,
 		stop: async () => {
