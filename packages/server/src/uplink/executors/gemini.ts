@@ -1,4 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { createInterface } from "node:readline";
 import type { RunOptions, RuntimeType } from "@codemote/common";
 import spawn from "cross-spawn";
 import { BaseExecutor } from "../executor.js";
@@ -25,21 +26,17 @@ interface GeminiSession {
 	hasHistory: boolean;
 	runtimeSessionId: string | null;
 	model: string | null;
+	stderrBuffer: string;
+	toolNames: Map<string, string>;
 }
 
-interface GeminiHeadlessResponse {
-	session_id?: unknown;
-	sessionId?: unknown;
-	response?: unknown;
-	candidates?: unknown;
-	content?: unknown;
-}
+const STDERR_BUFFER_LIMIT = 8_000;
 
 /**
  * Gemini CLI executor - controls Gemini via subprocess
  *
- * This executor runs Gemini in headless mode per turn (`--prompt`), captures
- * JSON output, and resumes follow-up turns with Gemini's persisted session ID.
+ * Uses `--output-format stream-json` to receive JSONL events in real time,
+ * mapping each event type to the appropriate StreamEvent emission.
  *
  * Environment variables:
  * - GEMINI_PATH: Override path to gemini binary
@@ -73,6 +70,8 @@ export class GeminiExecutor extends BaseExecutor {
 			hasHistory: !!resumeSessionId,
 			runtimeSessionId: resumeSessionId && resumeSessionId.length > 0 ? resumeSessionId : null,
 			model,
+			stderrBuffer: "",
+			toolNames: new Map(),
 		};
 		if (geminiSession.runtimeSessionId) {
 			this.sessionManager.setRuntimeSessionId(session.id, geminiSession.runtimeSessionId);
@@ -117,6 +116,7 @@ export class GeminiExecutor extends BaseExecutor {
 		}
 
 		geminiSession.running = true;
+		geminiSession.stderrBuffer = "";
 		this.emitStatus(session.id, "running");
 
 		const args = this.buildPromptArgs(
@@ -146,287 +146,171 @@ export class GeminiExecutor extends BaseExecutor {
 
 		geminiSession.process = proc;
 
-		let stdoutBuffer = "";
-		let stderrBuffer = "";
-		proc.stdout.on("data", (chunk) => {
-			stdoutBuffer += chunk.toString("utf8");
+		const stdoutLines = createInterface({ input: proc.stdout });
+		const stderrLines = createInterface({ input: proc.stderr });
+
+		stdoutLines.on("line", (line) => {
+			this.handleStdoutLine(session.id, geminiSession, line);
 		});
-		proc.stderr.on("data", (chunk) => {
-			stderrBuffer += chunk.toString("utf8");
+		stderrLines.on("line", (line) => {
+			this.handleStderrLine(session.id, geminiSession, line);
 		});
 
 		await new Promise<void>((resolve, reject) => {
+			let settled = false;
+
+			const finish = (handler: () => void): void => {
+				if (settled) return;
+				settled = true;
+				handler();
+			};
+
 			proc.on("error", (error) => {
-				this.emitOutput(session.id, `Error: ${error.message}\n`);
-				this.emitStatus(session.id, "error");
-				reject(error);
+				finish(() => {
+					this.emitOutput(session.id, `Error: ${error.message}\n`);
+					this.emitStatus(session.id, "error");
+					reject(error);
+				});
 			});
 
 			proc.on("exit", (exitCode) => {
-				if (exitCode === 0) {
-					this.handleSuccessfulTurn(session.id, geminiSession, stdoutBuffer, stderrBuffer);
-					geminiSession.hasHistory = true;
-					this.emitStatus(session.id, "idle");
-					resolve();
-					return;
-				}
-				this.emitBufferedOutput(session.id, stdoutBuffer);
-				this.emitBufferedOutput(session.id, stderrBuffer);
-				this.emitStatus(session.id, "error");
-				reject(new Error(`Gemini exited with code ${exitCode ?? "unknown"}`));
+				finish(() => {
+					if (exitCode === 0) {
+						geminiSession.hasHistory = true;
+						this.emitStatus(session.id, "idle");
+						resolve();
+						return;
+					}
+
+					if (geminiSession.stderrBuffer.trim().length > 0) {
+						this.emitOutput(session.id, geminiSession.stderrBuffer);
+					}
+					this.emitStatus(session.id, "error");
+					reject(new Error(`Gemini exited with code ${exitCode ?? "unknown"}`));
+				});
 			});
 		}).finally(() => {
+			stdoutLines.close();
+			stderrLines.close();
 			geminiSession.running = false;
 			geminiSession.process = null;
 		});
 	}
 
-	private handleSuccessfulTurn(
+	private handleStdoutLine(sessionId: string, geminiSession: GeminiSession, line: string): void {
+		if (line.trim().length === 0) {
+			return;
+		}
+
+		let event: { type?: unknown; [key: string]: unknown };
+		try {
+			event = JSON.parse(line) as { type?: unknown; [key: string]: unknown };
+		} catch {
+			this.emitOutput(sessionId, `${line}\n`);
+			return;
+		}
+
+		this.handleStreamEvent(sessionId, geminiSession, event);
+	}
+
+	private handleStreamEvent(
 		sessionId: string,
 		geminiSession: GeminiSession,
-		stdout: string,
-		stderr: string,
+		event: { type?: unknown; [key: string]: unknown },
 	): void {
-		const parsed = this.parseHeadlessJson(stdout);
-		let emittedStructured = false;
-		if (parsed) {
-			if (parsed.sessionId) {
-				geminiSession.runtimeSessionId = parsed.sessionId;
-				this.sessionManager.setRuntimeSessionId(sessionId, parsed.sessionId);
-			}
-			if (parsed.response !== null && parsed.response !== undefined) {
-				emittedStructured = this.emitStructuredResponse(sessionId, parsed.response);
-				if (!emittedStructured) {
-					this.emitBufferedOutput(sessionId, this.stringifyJsonValue(parsed.response) ?? "");
+		const eventType = typeof event["type"] === "string" ? event["type"] : "";
+
+		switch (eventType) {
+			case "init": {
+				const runtimeSessionId =
+					typeof event["session_id"] === "string" && event["session_id"].length > 0
+						? event["session_id"]
+						: null;
+				if (runtimeSessionId) {
+					geminiSession.runtimeSessionId = runtimeSessionId;
+					this.sessionManager.setRuntimeSessionId(sessionId, runtimeSessionId);
 				}
+				this.emitStatus(sessionId, "running");
+				break;
 			}
-		}
-
-		if (!parsed) {
-			this.emitBufferedOutput(sessionId, stdout);
-		}
-
-		this.emitBufferedOutput(sessionId, stderr);
-	}
-
-	private parseHeadlessJson(
-		stdout: string,
-	): { sessionId: string | null; response: unknown | null } | null {
-		const trimmed = stdout.trim();
-		if (trimmed.length === 0) {
-			return null;
-		}
-
-		const lines = trimmed.split("\n");
-		for (let i = 0; i < lines.length; i += 1) {
-			if (!lines[i]?.trimStart().startsWith("{")) {
-				continue;
-			}
-			const candidate = lines.slice(i).join("\n");
-			try {
-				const parsed = JSON.parse(candidate) as GeminiHeadlessResponse;
-				const sessionId =
-					typeof parsed.session_id === "string" && parsed.session_id.length > 0
-						? parsed.session_id
-						: typeof parsed.sessionId === "string" && parsed.sessionId.length > 0
-							? parsed.sessionId
-							: null;
-				const response = this.resolveResponseCandidate(parsed);
-				if (!sessionId && !response) {
-					continue;
+			case "message": {
+				const role = typeof event["role"] === "string" ? event["role"] : "";
+				const content = typeof event["content"] === "string" ? event["content"] : "";
+				if (role === "assistant" && content.length > 0) {
+					if (event["delta"]) {
+						this.emitOutput(sessionId, content);
+					} else {
+						this.emitMessage(sessionId, "assistant", content);
+					}
 				}
-				return { sessionId, response };
-			} catch {
-				// Keep scanning in case non-JSON preamble contains braces.
+				break;
+			}
+			case "tool_use": {
+				const toolId =
+					typeof event["tool_id"] === "string" ? event["tool_id"] : this.generateToolCallId();
+				const toolName = typeof event["tool_name"] === "string" ? event["tool_name"] : "tool";
+				geminiSession.toolNames.set(toolId, toolName);
+				const parameters = this.stringifyJsonValue(event["parameters"]);
+				this.emitToolCall(sessionId, toolId, toolName, parameters ?? undefined);
+				break;
+			}
+			case "tool_result": {
+				const toolId =
+					typeof event["tool_id"] === "string" ? event["tool_id"] : this.generateToolCallId();
+				const status = typeof event["status"] === "string" ? event["status"] : "";
+				const output = typeof event["output"] === "string" ? event["output"] : undefined;
+				const errorObj = event["error"];
+				const errorMessage =
+					errorObj && typeof errorObj === "object" && !Array.isArray(errorObj)
+						? typeof (errorObj as Record<string, unknown>)["message"] === "string"
+							? ((errorObj as Record<string, unknown>)["message"] as string)
+							: undefined
+						: undefined;
+
+				const isError = status === "error";
+				const resultOutput = isError ? undefined : output;
+				const resultError = isError ? (errorMessage ?? "Tool error") : undefined;
+				const toolName = geminiSession.toolNames.get(toolId) ?? "tool";
+
+				this.emitToolResult(sessionId, toolId, toolName, resultOutput, resultError);
+				break;
+			}
+			case "error": {
+				const message = typeof event["message"] === "string" ? event["message"] : "Unknown error";
+				this.emitOutput(sessionId, `Error: ${message}\n`);
+				break;
+			}
+			case "result": {
+				const status = typeof event["status"] === "string" ? event["status"] : "";
+				if (status === "error") {
+					const errorObj = event["error"];
+					const errorMessage =
+						errorObj && typeof errorObj === "object" && !Array.isArray(errorObj)
+							? typeof (errorObj as Record<string, unknown>)["message"] === "string"
+								? ((errorObj as Record<string, unknown>)["message"] as string)
+								: "Unknown error"
+							: "Unknown error";
+					this.emitOutput(sessionId, `Session error: ${errorMessage}\n`);
+				}
+				break;
 			}
 		}
-
-		return null;
 	}
 
-	private resolveResponseCandidate(parsed: GeminiHeadlessResponse): unknown | null {
-		if (parsed.response !== undefined) {
-			return parsed.response;
+	private handleStderrLine(sessionId: string, geminiSession: GeminiSession, line: string): void {
+		if (line.trim().length === 0) {
+			return;
 		}
-		if (parsed.candidates !== undefined) {
-			return parsed.candidates;
+
+		const normalized = line.endsWith("\n") ? line : `${line}\n`;
+		geminiSession.stderrBuffer += normalized;
+		if (geminiSession.stderrBuffer.length > STDERR_BUFFER_LIMIT) {
+			geminiSession.stderrBuffer = geminiSession.stderrBuffer.slice(-STDERR_BUFFER_LIMIT);
 		}
-		if (parsed.content !== undefined) {
-			return parsed.content;
-		}
-		return null;
 	}
 
-	private emitStructuredResponse(sessionId: string, response: unknown): boolean {
-		const pendingToolCalls = new Map<string, { toolCallId: string; toolName: string }>();
-		const seen = new Set<object>();
-		return this.walkGeminiValue(sessionId, response, pendingToolCalls, seen);
-	}
-
-	private walkGeminiValue(
-		sessionId: string,
-		value: unknown,
-		pendingToolCalls: Map<string, { toolCallId: string; toolName: string }>,
-		seen: Set<object>,
-		parentToolUseId?: string,
-	): boolean {
-		if (value === null || value === undefined) {
-			return false;
-		}
-
-		if (typeof value === "string") {
-			const text = this.sanitizeAssistantText(value).trim();
-			if (!text) {
-				return false;
-			}
-			this.emitMessage(sessionId, "assistant", text, parentToolUseId);
-			return true;
-		}
-
-		if (Array.isArray(value)) {
-			let emitted = false;
-			for (const entry of value) {
-				emitted =
-					this.walkGeminiValue(sessionId, entry, pendingToolCalls, seen, parentToolUseId) ||
-					emitted;
-			}
-			return emitted;
-		}
-
-		const record = this.asRecord(value);
-		if (!record) {
-			return false;
-		}
-		if (seen.has(record)) {
-			return false;
-		}
-		seen.add(record);
-
-		const resolvedParent = this.resolveParentToolUseId(record, parentToolUseId);
-		let emitted = false;
-
-		const functionCall =
-			this.asRecord(record["functionCall"]) ??
-			this.asRecord(record["function_call"]) ??
-			this.asRecord(record["toolCall"]) ??
-			this.asRecord(record["tool_call"]);
-		if (functionCall) {
-			emitted =
-				this.emitGeminiToolCall(sessionId, functionCall, pendingToolCalls, resolvedParent) ||
-				emitted;
-		}
-
-		const functionResponse =
-			this.asRecord(record["functionResponse"]) ??
-			this.asRecord(record["function_response"]) ??
-			this.asRecord(record["toolResult"]) ??
-			this.asRecord(record["tool_result"]);
-		if (functionResponse) {
-			emitted =
-				this.emitGeminiToolResult(sessionId, functionResponse, pendingToolCalls, resolvedParent) ||
-				emitted;
-		}
-
-		const directText =
-			this.asNonEmptyString(record["text"]) ??
-			this.asNonEmptyString(record["output_text"]) ??
-			this.asNonEmptyString(record["message"]);
-		if (directText) {
-			const sanitized = this.sanitizeAssistantText(directText).trim();
-			if (sanitized.length > 0) {
-				this.emitMessage(sessionId, "assistant", sanitized, resolvedParent);
-				emitted = true;
-			}
-		}
-
-		const nestedKeys: Array<keyof typeof record> = [
-			"parts",
-			"content",
-			"candidates",
-			"response",
-			"messages",
-			"items",
-			"data",
-			"value",
-		];
-		for (const key of nestedKeys) {
-			if (!(key in record)) {
-				continue;
-			}
-			emitted =
-				this.walkGeminiValue(sessionId, record[key], pendingToolCalls, seen, resolvedParent) ||
-				emitted;
-		}
-
-		return emitted;
-	}
-
-	private emitGeminiToolCall(
-		sessionId: string,
-		record: Record<string, unknown>,
-		pendingToolCalls: Map<string, { toolCallId: string; toolName: string }>,
-		parentToolUseId?: string,
-	): boolean {
-		const toolName = this.asNonEmptyString(record["name"]) ?? "tool";
-		const callId =
-			this.asNonEmptyString(record["id"]) ??
-			this.asNonEmptyString(record["toolCallId"]) ??
-			this.generateToolCallId();
-		const args =
-			this.stringifyJsonValue(record["args"]) ??
-			this.stringifyJsonValue(record["arguments"]) ??
-			this.stringifyJsonValue(record["input"]) ??
-			undefined;
-		this.emitToolCall(sessionId, callId, toolName, args, parentToolUseId);
-		pendingToolCalls.set(callId, { toolCallId: callId, toolName });
-		return true;
-	}
-
-	private emitGeminiToolResult(
-		sessionId: string,
-		record: Record<string, unknown>,
-		pendingToolCalls: Map<string, { toolCallId: string; toolName: string }>,
-		parentToolUseId?: string,
-	): boolean {
-		const explicitId =
-			this.asNonEmptyString(record["id"]) ?? this.asNonEmptyString(record["toolCallId"]);
-		const explicitName = this.asNonEmptyString(record["name"]) ?? "tool";
-		const pending = explicitId ? pendingToolCalls.get(explicitId) : undefined;
-		const toolCallId = pending?.toolCallId ?? explicitId ?? this.generateToolCallId();
-		const toolName = pending?.toolName ?? explicitName;
-
-		const rawOutput =
-			record["response"] ?? record["result"] ?? record["output"] ?? record["content"] ?? record;
-		const output = this.stringifyJsonValue(rawOutput) ?? undefined;
-		const error = this.asNonEmptyString(record["error"]);
-
-		this.emitToolResult(sessionId, toolCallId, toolName, output, error, parentToolUseId);
-		return true;
-	}
-
-	private resolveParentToolUseId(
-		record: Record<string, unknown>,
-		parentToolUseId?: string,
-	): string | undefined {
-		const own =
-			this.asNonEmptyString(record["parentToolUseId"]) ??
-			this.asNonEmptyString(record["parent_tool_use_id"]);
-		return own ?? parentToolUseId;
-	}
-
-	private asRecord(value: unknown): Record<string, unknown> | null {
-		if (!value || typeof value !== "object" || Array.isArray(value)) {
-			return null;
-		}
-		return value as Record<string, unknown>;
-	}
-
-	private asNonEmptyString(value: unknown): string | undefined {
-		if (typeof value !== "string") {
-			return undefined;
-		}
-		const trimmed = value.trim();
-		return trimmed.length > 0 ? trimmed : undefined;
+	private generateToolCallId(): string {
+		return `gemini-tool-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 	}
 
 	private stringifyJsonValue(value: unknown): string | null {
@@ -443,26 +327,6 @@ export class GeminiExecutor extends BaseExecutor {
 		}
 	}
 
-	private sanitizeAssistantText(text: string): string {
-		return text
-			.replaceAll(/Loaded cached credentials\.\s*/gi, "")
-			.replaceAll(/Loading extension:[^\n]*(\n|$)/gi, "")
-			.replaceAll(/\n{3,}/g, "\n\n");
-	}
-
-	private generateToolCallId(): string {
-		return `gemini-tool-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-	}
-
-	private emitBufferedOutput(sessionId: string, text: string): void {
-		const sanitized = this.sanitizeAssistantText(text);
-		const trimmed = sanitized.trim();
-		if (trimmed.length === 0) {
-			return;
-		}
-		this.emitOutput(sessionId, sanitized.endsWith("\n") ? sanitized : `${sanitized}\n`);
-	}
-
 	private buildPromptArgs(
 		prompt: string,
 		runtimeSessionId: string | null,
@@ -476,7 +340,7 @@ export class GeminiExecutor extends BaseExecutor {
 		} else if (hasHistory) {
 			args.push("--resume", "latest");
 		}
-		args.push("--output-format", "json");
+		args.push("--output-format", "stream-json");
 		const selectedModel = model?.trim();
 		if (selectedModel && selectedModel.length > 0) {
 			args.push("--model", selectedModel);

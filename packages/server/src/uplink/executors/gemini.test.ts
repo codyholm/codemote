@@ -8,19 +8,6 @@ import { SessionManager } from "../session.js";
 import { WorkspaceManager } from "../workspace.js";
 import { GeminiExecutor } from "./gemini.js";
 
-async function waitFor(
-	predicate: () => boolean,
-	{ timeoutMs = 4000, intervalMs = 50 }: { timeoutMs?: number; intervalMs?: number } = {},
-): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) {
-			return;
-		}
-		await new Promise((r) => setTimeout(r, intervalMs));
-	}
-}
-
 describe("GeminiExecutor", () => {
 	let testDir: string;
 	let mockGeminiPath: string;
@@ -46,6 +33,7 @@ describe("GeminiExecutor", () => {
 
 		argsLogPath = join(testDir, "gemini-args.log");
 		mockGeminiPath = join(testDir, "mock-gemini");
+		// Default mock emits stream-json JSONL events
 		const mockScriptContent = `#!/bin/bash
 set -euo pipefail
 raw_args="$*"
@@ -53,15 +41,15 @@ prompt=""
 resume=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-		-p|--prompt)
-			prompt="$2"
-			shift 2
-			;;
-		-r|--resume)
+		--resume)
 			resume="$2"
 			shift 2
 			;;
+		--output-format|--model)
+			shift 2
+			;;
 		*)
+			prompt="$1"
 			shift
 			;;
 	esac
@@ -69,14 +57,14 @@ done
 printf '%s\\n' "$raw_args" >> "${argsLogPath}"
 if [[ -n "$resume" ]]; then
 	session_id="$resume"
-	response="Follow-up from mock Gemini! ($prompt)"
+	printf '{"type":"init","timestamp":"2026-01-01T00:00:00Z","session_id":"%s","model":"gemini-2.5-flash"}\\n' "$session_id"
+	printf '{"type":"message","timestamp":"2026-01-01T00:00:01Z","role":"assistant","content":"Follow-up from mock Gemini! (%s)"}\\n' "$prompt"
+	printf '{"type":"result","timestamp":"2026-01-01T00:00:02Z","status":"success"}\\n'
 else
-	session_id="mock-session-abc"
-	response="Hello from mock Gemini! ($prompt)"
+	printf '{"type":"init","timestamp":"2026-01-01T00:00:00Z","session_id":"mock-session-abc","model":"gemini-2.5-flash"}\\n'
+	printf '{"type":"message","timestamp":"2026-01-01T00:00:01Z","role":"assistant","content":"Hello from mock Gemini! (%s)"}\\n' "$prompt"
+	printf '{"type":"result","timestamp":"2026-01-01T00:00:02Z","status":"success"}\\n'
 fi
-printf 'Loaded cached credentials.\\n'
-printf '{\\n  "session_id": "%s",\\n  "response": "%s"\\n}\\n' "$session_id" "$response"
-sleep 0.2
 exit 0
 `;
 		await writeFile(mockGeminiPath, mockScriptContent);
@@ -123,8 +111,6 @@ exit 0
 		});
 		activeSessionId = result.sessionId;
 
-		await waitFor(() => events.some((e) => (e as { type: string }).type === "session.message"));
-
 		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
 		expect(messageEvents.length).toBeGreaterThan(0);
 
@@ -135,26 +121,13 @@ exit 0
 		expect(hasGeminiMessage).toBe(true);
 		expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
 
-		// Mark as cleaned up so afterEach doesn't try to stop again
 		activeSessionId = null;
 	});
 
-	it("ignores unrelated JSON preamble before the headless payload", async () => {
-		const noisyMockPath = join(testDir, "mock-gemini-noisy");
-		const noisyScriptContent = `#!/bin/bash
-set -euo pipefail
-printf '{ "level": "info", "message": "warming up" }\\n'
-printf '{\\n  "session_id": "mock-session-noisy",\\n  "response": "Noisy hello"\\n}\\n'
-`;
-		await writeFile(noisyMockPath, noisyScriptContent);
-		await chmod(noisyMockPath, 0o755);
-
+	it("init event captures runtime session ID", async () => {
 		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
-			geminiPath: noisyMockPath,
+			geminiPath: mockGeminiPath,
 		});
-
-		const events: unknown[] = [];
-		eventBus.subscribe((event) => events.push(event));
 
 		const result = await activeExecutor.startRun({
 			profile: "gemini",
@@ -163,29 +136,24 @@ printf '{\\n  "session_id": "mock-session-noisy",\\n  "response": "Noisy hello"\
 		});
 		activeSessionId = result.sessionId;
 
-		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
-		const outputText = messageEvents
-			.map((e) => (e as { payload?: { content?: string } }).payload?.content ?? "")
-			.join("\n");
-
-		expect(outputText).toContain("Noisy hello");
-		expect(outputText).not.toContain("warming up");
-		expect(sessionManager.get(result.sessionId)?.runtimeSessionId).toBe("mock-session-noisy");
+		expect(sessionManager.get(result.sessionId)?.runtimeSessionId).toBe("mock-session-abc");
 
 		activeSessionId = null;
 	});
 
-	it("strips Gemini startup noise from assistant response text", async () => {
-		const noisyResponsePath = join(testDir, "mock-gemini-noisy-response");
-		const noisyResponseScript = `#!/bin/bash
+	it("message with delta:true emits session.output instead of session.message", async () => {
+		const deltaMockPath = join(testDir, "mock-gemini-delta");
+		const deltaMockScript = `#!/bin/bash
 set -euo pipefail
-printf '{\\n  "session_id": "mock-session-noise-response",\\n  "response": "GEMINI_SIM_TRYLoaded cached credentials.\\\\nLoading extension: conductor\\\\nLoading extension: nanobanana"\\n}\\n'
+printf '{"type":"init","timestamp":"2026-01-01T00:00:00Z","session_id":"ses-delta","model":"gemini-2.5-flash"}\\n'
+printf '{"type":"message","timestamp":"2026-01-01T00:00:01Z","role":"assistant","content":"streaming chunk","delta":true}\\n'
+printf '{"type":"result","timestamp":"2026-01-01T00:00:02Z","status":"success"}\\n'
 `;
-		await writeFile(noisyResponsePath, noisyResponseScript);
-		await chmod(noisyResponsePath, 0o755);
+		await writeFile(deltaMockPath, deltaMockScript);
+		await chmod(deltaMockPath, 0o755);
 
 		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
-			geminiPath: noisyResponsePath,
+			geminiPath: deltaMockPath,
 		});
 
 		const events: unknown[] = [];
@@ -194,58 +162,20 @@ printf '{\\n  "session_id": "mock-session-noise-response",\\n  "response": "GEMI
 		const result = await activeExecutor.startRun({
 			profile: "gemini",
 			workspace: testDir,
-			initialPrompt: "clean-response",
-		});
-		activeSessionId = result.sessionId;
-
-		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
-		expect(messageEvents.length).toBeGreaterThan(0);
-
-		const combined = messageEvents
-			.map((event) => (event as { payload?: { content?: string } }).payload?.content ?? "")
-			.join("\n");
-		expect(combined).toContain("GEMINI_SIM_TRY");
-		expect(combined).not.toContain("Loaded cached credentials.");
-		expect(combined).not.toContain("Loading extension:");
-
-		activeSessionId = null;
-	});
-
-	it("strips Gemini startup noise from fallback session.output text", async () => {
-		const fallbackNoisePath = join(testDir, "mock-gemini-fallback-noise");
-		const fallbackNoiseScript = `#!/bin/bash
-set -euo pipefail
-printf 'Loaded cached credentials.\\n'
-printf 'Loading extension: conductor\\n'
-printf 'Loading extension: nanobanana\\n'
-printf 'GEMINI_FALLBACK_TRY\\n'
-`;
-		await writeFile(fallbackNoisePath, fallbackNoiseScript);
-		await chmod(fallbackNoisePath, 0o755);
-
-		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
-			geminiPath: fallbackNoisePath,
-		});
-
-		const events: unknown[] = [];
-		eventBus.subscribe((event) => events.push(event));
-
-		const result = await activeExecutor.startRun({
-			profile: "gemini",
-			workspace: testDir,
-			initialPrompt: "fallback-noise",
+			initialPrompt: "delta-test",
 		});
 		activeSessionId = result.sessionId;
 
 		const outputEvents = events.filter((e) => (e as { type: string }).type === "session.output");
-		expect(outputEvents.length).toBeGreaterThan(0);
+		const messageEvents = events.filter((e) => (e as { type: string }).type === "session.message");
 
-		const combined = outputEvents
-			.map((event) => (event as { payload?: { text?: string } }).payload?.text ?? "")
-			.join("\n");
-		expect(combined).toContain("GEMINI_FALLBACK_TRY");
-		expect(combined).not.toContain("Loaded cached credentials.");
-		expect(combined).not.toContain("Loading extension:");
+		// Delta messages go to session.output, not session.message
+		const hasStreamingChunk = outputEvents.some((e) => {
+			const payload = (e as { payload?: { text?: string } }).payload;
+			return payload?.text?.includes("streaming chunk");
+		});
+		expect(hasStreamingChunk).toBe(true);
+		expect(messageEvents.length).toBe(0);
 
 		activeSessionId = null;
 	});
@@ -267,18 +197,17 @@ printf 'GEMINI_FALLBACK_TRY\\n'
 
 		await activeExecutor.sendInput(result.sessionId, "Follow-up prompt");
 
-		await waitFor(() =>
-			events.some((e) => {
-				if ((e as { type: string }).type !== "session.message") return false;
-				const payload = (e as { payload?: { content?: string } }).payload;
-				return payload?.content?.includes("Follow-up from mock Gemini") ?? false;
-			}),
-		);
+		const messageEvents = events.filter((e) => {
+			if ((e as { type: string }).type !== "session.message") return false;
+			const payload = (e as { payload?: { content?: string } }).payload;
+			return payload?.content?.includes("Follow-up from mock Gemini") ?? false;
+		});
+		expect(messageEvents.length).toBeGreaterThan(0);
 
 		const argsLog = await readFile(argsLogPath, "utf8");
-		expect(argsLog).toContain("--prompt Initial prompt --output-format json");
+		expect(argsLog).toContain("--output-format stream-json Initial prompt");
 		expect(argsLog).toContain(
-			"--resume mock-session-abc --prompt Follow-up prompt --output-format json",
+			"--resume mock-session-abc --output-format stream-json Follow-up prompt",
 		);
 		expect(sessionManager.get(result.sessionId)?.runtimeSessionId).toBe("mock-session-abc");
 
@@ -318,11 +247,15 @@ printf 'GEMINI_FALLBACK_TRY\\n'
 		activeSessionId = null;
 	});
 
-	it("maps Gemini tool blocks to session.tool_call and session.tool_result events", async () => {
+	it("maps tool_use and tool_result events to session.tool_call and session.tool_result", async () => {
 		const toolMockPath = join(testDir, "mock-gemini-tool");
 		const toolMockScript = `#!/bin/bash
 set -euo pipefail
-printf '{\\n  "session_id": "mock-session-tools",\\n  "response": {"parts":[{"functionCall":{"id":"gem-call-1","name":"read_file","args":{"path":"README.md"}}},{"text":"Tool executed."},{"functionResponse":{"id":"gem-call-1","name":"read_file","response":{"content":"# Test"}}}]}\\n}\\n'
+printf '{"type":"init","timestamp":"2026-01-01T00:00:00Z","session_id":"mock-session-tools","model":"gemini-2.5-flash"}\\n'
+printf '{"type":"tool_use","timestamp":"2026-01-01T00:00:01Z","tool_id":"gem-call-1","tool_name":"read_file","parameters":{"path":"README.md"}}\\n'
+printf '{"type":"tool_result","timestamp":"2026-01-01T00:00:02Z","tool_id":"gem-call-1","status":"success","output":"# Test"}\\n'
+printf '{"type":"message","timestamp":"2026-01-01T00:00:03Z","role":"assistant","content":"Tool executed."}\\n'
+printf '{"type":"result","timestamp":"2026-01-01T00:00:04Z","status":"success"}\\n'
 `;
 		await writeFile(toolMockPath, toolMockScript);
 		await chmod(toolMockPath, 0o755);
@@ -366,7 +299,156 @@ printf '{\\n  "session_id": "mock-session-tools",\\n  "response": {"parts":[{"fu
 		expect(callPayload.payload.toolName).toBe("read_file");
 		expect(resultPayload.payload.toolName).toBe("read_file");
 		expect(callPayload.payload.arguments).toContain("README.md");
-		expect(resultPayload.payload.output).toContain("content");
+		expect(resultPayload.payload.output).toContain("# Test");
+
+		activeSessionId = null;
+	});
+
+	it("tool_result with status error emits error tool result", async () => {
+		const errorToolMockPath = join(testDir, "mock-gemini-tool-error");
+		const errorToolMockScript = `#!/bin/bash
+set -euo pipefail
+printf '{"type":"init","timestamp":"2026-01-01T00:00:00Z","session_id":"ses-tool-err","model":"gemini-2.5-flash"}\\n'
+printf '{"type":"tool_use","timestamp":"2026-01-01T00:00:01Z","tool_id":"gem-err-1","tool_name":"write_file","parameters":{"path":"/etc/passwd"}}\\n'
+printf '{"type":"tool_result","timestamp":"2026-01-01T00:00:02Z","tool_id":"gem-err-1","status":"error","error":{"message":"Permission denied"}}\\n'
+printf '{"type":"result","timestamp":"2026-01-01T00:00:03Z","status":"success"}\\n'
+`;
+		await writeFile(errorToolMockPath, errorToolMockScript);
+		await chmod(errorToolMockPath, 0o755);
+
+		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
+			geminiPath: errorToolMockPath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "gemini",
+			workspace: testDir,
+			initialPrompt: "tool-error-test",
+		});
+		activeSessionId = result.sessionId;
+
+		const toolResultEvents = events.filter(
+			(event) => (event as { type: string }).type === "session.tool_result",
+		);
+		expect(toolResultEvents.length).toBe(1);
+
+		const resultPayload = toolResultEvents[0] as {
+			payload: { toolCallId: string; toolName: string; error?: string; output?: string };
+		};
+		expect(resultPayload.payload.toolCallId).toBe("gem-err-1");
+		expect(resultPayload.payload.toolName).toBe("write_file");
+		expect(resultPayload.payload.error).toBe("Permission denied");
+		expect(resultPayload.payload.output).toBeUndefined();
+
+		activeSessionId = null;
+	});
+
+	it("error event emits session.output with error text", async () => {
+		const errorMockPath = join(testDir, "mock-gemini-error-event");
+		const errorMockScript = `#!/bin/bash
+set -euo pipefail
+printf '{"type":"init","timestamp":"2026-01-01T00:00:00Z","session_id":"ses-err","model":"gemini-2.5-flash"}\\n'
+printf '{"type":"error","timestamp":"2026-01-01T00:00:01Z","severity":"error","message":"Rate limit exceeded"}\\n'
+printf '{"type":"result","timestamp":"2026-01-01T00:00:02Z","status":"success"}\\n'
+`;
+		await writeFile(errorMockPath, errorMockScript);
+		await chmod(errorMockPath, 0o755);
+
+		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
+			geminiPath: errorMockPath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "gemini",
+			workspace: testDir,
+			initialPrompt: "error-test",
+		});
+		activeSessionId = result.sessionId;
+
+		const outputEvents = events.filter(
+			(event) => (event as { type: string }).type === "session.output",
+		);
+		const combinedOutput = outputEvents
+			.map((event) => (event as { payload?: { text?: string } }).payload?.text ?? "")
+			.join("");
+		expect(combinedOutput).toContain("Error: Rate limit exceeded");
+
+		activeSessionId = null;
+	});
+
+	it("forwards non-JSON stdout lines as session.output", async () => {
+		const nonJsonMockPath = join(testDir, "mock-gemini-nonjson");
+		const nonJsonMockScript = `#!/bin/bash
+set -euo pipefail
+printf 'plain text line\\n'
+printf '{"type":"init","timestamp":"2026-01-01T00:00:00Z","session_id":"ses-nj","model":"gemini-2.5-flash"}\\n'
+printf '{"type":"result","timestamp":"2026-01-01T00:00:01Z","status":"success"}\\n'
+`;
+		await writeFile(nonJsonMockPath, nonJsonMockScript);
+		await chmod(nonJsonMockPath, 0o755);
+
+		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
+			geminiPath: nonJsonMockPath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "gemini",
+			workspace: testDir,
+			initialPrompt: "nonjson-test",
+		});
+		activeSessionId = result.sessionId;
+
+		const outputEvents = events.filter(
+			(event) => (event as { type: string }).type === "session.output",
+		);
+		const combinedOutput = outputEvents
+			.map((event) => (event as { payload?: { text?: string } }).payload?.text ?? "")
+			.join("");
+		expect(combinedOutput).toContain("plain text line");
+
+		activeSessionId = null;
+	});
+
+	it("handles result event with error status", async () => {
+		const resultErrorMockPath = join(testDir, "mock-gemini-result-error");
+		const resultErrorMockScript = `#!/bin/bash
+set -euo pipefail
+printf '{"type":"init","timestamp":"2026-01-01T00:00:00Z","session_id":"ses-re","model":"gemini-2.5-flash"}\\n'
+printf '{"type":"result","timestamp":"2026-01-01T00:00:01Z","status":"error","error":{"message":"Context window exceeded"}}\\n'
+`;
+		await writeFile(resultErrorMockPath, resultErrorMockScript);
+		await chmod(resultErrorMockPath, 0o755);
+
+		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
+			geminiPath: resultErrorMockPath,
+		});
+
+		const events: unknown[] = [];
+		eventBus.subscribe((event) => events.push(event));
+
+		const result = await activeExecutor.startRun({
+			profile: "gemini",
+			workspace: testDir,
+			initialPrompt: "result-error-test",
+		});
+		activeSessionId = result.sessionId;
+
+		const outputEvents = events.filter(
+			(event) => (event as { type: string }).type === "session.output",
+		);
+		const combinedOutput = outputEvents
+			.map((event) => (event as { payload?: { text?: string } }).payload?.text ?? "")
+			.join("");
+		expect(combinedOutput).toContain("Session error: Context window exceeded");
 
 		activeSessionId = null;
 	});
