@@ -17,32 +17,85 @@ export interface ModelInfo {
 	id: string;
 	label: string;
 	provider?: string;
+	costTier?: "low" | "medium" | "high";
+	capabilityTier?: "basic" | "standard" | "advanced";
 }
 
 export const RUNTIME_MODELS: Record<RuntimeType, ModelInfo[]> = {
 	claude: [
-		{ id: "sonnet", label: "Sonnet" },
-		{ id: "opus", label: "Opus" },
-		{ id: "haiku", label: "Haiku" },
+		{ id: "sonnet", label: "Sonnet", costTier: "medium", capabilityTier: "standard" },
+		{ id: "opus", label: "Opus", costTier: "high", capabilityTier: "advanced" },
+		{ id: "haiku", label: "Haiku", costTier: "low", capabilityTier: "basic" },
 	],
 	opencode: [
-		{ id: "anthropic/claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "anthropic" },
-		{ id: "anthropic/claude-opus-4-6", label: "Claude Opus 4.6", provider: "anthropic" },
-		{ id: "openai/gpt-5.3-codex", label: "GPT 5.3 Codex", provider: "openai" },
-		{ id: "openai/gpt-5.2-codex", label: "GPT 5.2 Codex", provider: "openai" },
-		{ id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash", provider: "google" },
-		{ id: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro", provider: "google" },
+		{
+			id: "anthropic/claude-sonnet-4-6",
+			label: "Claude Sonnet 4.6",
+			provider: "anthropic",
+			costTier: "medium",
+			capabilityTier: "standard",
+		},
+		{
+			id: "anthropic/claude-opus-4-6",
+			label: "Claude Opus 4.6",
+			provider: "anthropic",
+			costTier: "high",
+			capabilityTier: "advanced",
+		},
+		{
+			id: "openai/gpt-5.3-codex",
+			label: "GPT 5.3 Codex",
+			provider: "openai",
+			costTier: "medium",
+			capabilityTier: "standard",
+		},
+		{
+			id: "openai/gpt-5.2-codex",
+			label: "GPT 5.2 Codex",
+			provider: "openai",
+			costTier: "low",
+			capabilityTier: "standard",
+		},
+		{
+			id: "google/gemini-2.5-flash",
+			label: "Gemini 2.5 Flash",
+			provider: "google",
+			costTier: "low",
+			capabilityTier: "basic",
+		},
+		{
+			id: "google/gemini-2.5-pro",
+			label: "Gemini 2.5 Pro",
+			provider: "google",
+			costTier: "medium",
+			capabilityTier: "standard",
+		},
 	],
 	codex: [
-		{ id: "gpt-5.3-codex", label: "GPT 5.3 Codex" },
-		{ id: "gpt-5.2-codex", label: "GPT 5.2 Codex" },
-		{ id: "gpt-5.2", label: "GPT 5.2" },
+		{ id: "gpt-5.3-codex", label: "GPT 5.3 Codex", costTier: "medium", capabilityTier: "standard" },
+		{ id: "gpt-5.2-codex", label: "GPT 5.2 Codex", costTier: "low", capabilityTier: "standard" },
+		{ id: "gpt-5.2", label: "GPT 5.2", costTier: "low", capabilityTier: "basic" },
 	],
 	gemini: [
-		{ id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
-		{ id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-		{ id: "gemini-3-flash-preview", label: "Gemini 3 Flash (Preview)" },
-		{ id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (Preview)" },
+		{ id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", costTier: "low", capabilityTier: "basic" },
+		{
+			id: "gemini-2.5-pro",
+			label: "Gemini 2.5 Pro",
+			costTier: "medium",
+			capabilityTier: "standard",
+		},
+		{
+			id: "gemini-3-flash-preview",
+			label: "Gemini 3 Flash (Preview)",
+			costTier: "low",
+			capabilityTier: "standard",
+		},
+		{
+			id: "gemini-3.1-pro-preview",
+			label: "Gemini 3.1 Pro (Preview)",
+			costTier: "medium",
+			capabilityTier: "advanced",
+		},
 	],
 };
 

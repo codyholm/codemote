@@ -1,5 +1,5 @@
 import { exec } from "node:child_process";
-import type { ModelInfo } from "@codemote/common";
+import { type ModelInfo, RUNTIME_MODELS } from "@codemote/common";
 
 function titleCase(str: string): string {
 	return str
@@ -15,6 +15,20 @@ function titleCase(str: string): string {
 		.join(" ")
 		.replace(/ \./g, ".");
 }
+
+// Derive tier indicators from the canonical RUNTIME_MODELS registry
+const MODEL_INDICATORS = new Map(
+	RUNTIME_MODELS["opencode"]
+		.filter(
+			(
+				m,
+			): m is ModelInfo & {
+				costTier: NonNullable<ModelInfo["costTier"]>;
+				capabilityTier: NonNullable<ModelInfo["capabilityTier"]>;
+			} => m.costTier != null && m.capabilityTier != null,
+		)
+		.map((m) => [m.id, { costTier: m.costTier, capabilityTier: m.capabilityTier }] as const),
+);
 
 export async function discoverOpenCodeModels(
 	opencodePath = "opencode",
@@ -48,5 +62,12 @@ export async function discoverOpenCodeModels(
 			}
 		}),
 	);
-	return results.flat();
+	const flat = results.flat();
+	return flat.map((model) => {
+		const indicators = MODEL_INDICATORS.get(model.id);
+		if (indicators) {
+			return { ...model, ...indicators };
+		}
+		return model;
+	});
 }

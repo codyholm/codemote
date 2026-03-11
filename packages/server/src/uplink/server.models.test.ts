@@ -1,4 +1,5 @@
 import { createServer } from "node:net";
+import type { ModelInfo } from "@codemote/common";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { UplinkServer } from "./server.js";
@@ -64,14 +65,19 @@ describe("UplinkServer list_models", () => {
 			expect(msg["type"]).toBe("model_list");
 			const payload = msg["payload"] as {
 				runtime: string;
-				models: Array<{ id: string; label: string }>;
+				models: Array<{
+					id: string;
+					label: string;
+					costTier?: ModelInfo["costTier"];
+					capabilityTier?: ModelInfo["capabilityTier"];
+				}>;
 			};
 
 			expect(payload.runtime).toBe("claude");
 			expect(payload.models).toEqual([
-				{ id: "sonnet", label: "Sonnet" },
-				{ id: "opus", label: "Opus" },
-				{ id: "haiku", label: "Haiku" },
+				{ id: "sonnet", label: "Sonnet", costTier: "medium", capabilityTier: "standard" },
+				{ id: "opus", label: "Opus", costTier: "high", capabilityTier: "advanced" },
+				{ id: "haiku", label: "Haiku", costTier: "low", capabilityTier: "basic" },
 			]);
 		} finally {
 			ws.close();

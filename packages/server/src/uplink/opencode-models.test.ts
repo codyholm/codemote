@@ -29,9 +29,27 @@ describe("discoverOpenCodeModels", () => {
 
 		const result = await discoverOpenCodeModels("opencode", ["anthropic", "openai", "google"]);
 		expect(result).toEqual([
-			{ id: "anthropic/claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "anthropic" },
-			{ id: "anthropic/claude-opus-4-6", label: "Claude Opus 4.6", provider: "anthropic" },
-			{ id: "openai/gpt-5.3-codex", label: "Gpt 5.3 Codex", provider: "openai" },
+			{
+				id: "anthropic/claude-sonnet-4-6",
+				label: "Claude Sonnet 4.6",
+				provider: "anthropic",
+				costTier: "medium",
+				capabilityTier: "standard",
+			},
+			{
+				id: "anthropic/claude-opus-4-6",
+				label: "Claude Opus 4.6",
+				provider: "anthropic",
+				costTier: "high",
+				capabilityTier: "advanced",
+			},
+			{
+				id: "openai/gpt-5.3-codex",
+				label: "Gpt 5.3 Codex",
+				provider: "openai",
+				costTier: "medium",
+				capabilityTier: "standard",
+			},
 		]);
 	});
 
@@ -48,7 +66,13 @@ describe("discoverOpenCodeModels", () => {
 
 		const result = await discoverOpenCodeModels("opencode", ["anthropic", "openai"]);
 		expect(result).toEqual([
-			{ id: "anthropic/claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "anthropic" },
+			{
+				id: "anthropic/claude-sonnet-4-6",
+				label: "Claude Sonnet 4.6",
+				provider: "anthropic",
+				costTier: "medium",
+				capabilityTier: "standard",
+			},
 		]);
 	});
 

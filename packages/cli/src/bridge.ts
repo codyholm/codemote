@@ -13,6 +13,7 @@ import { detectTailscaleEndpoint } from "./tailscale.js";
 import { validateEncryptedPayload } from "./validateEncryptedPayload.js";
 
 import type {
+	ModelInfo,
 	RuntimeType,
 	SessionStatus,
 	StreamEvent,
@@ -79,7 +80,7 @@ interface SessionListMessage {
 interface ModelListMessage {
 	type: "model_list";
 	runtime: RuntimeType;
-	models: Array<{ id: string; label: string; provider?: string }>;
+	models: ModelInfo[];
 }
 
 interface RuntimeListMessage {
