@@ -6,6 +6,7 @@
 import os from "node:os";
 import { Bonjour } from "bonjour-service";
 import type { Service } from "bonjour-service";
+import { DnsSdAdvertiser } from "./mdns-dnssd.js";
 
 /**
  * Configuration for advertising the Codemote service
@@ -22,10 +23,25 @@ export interface ServiceConfig {
 }
 
 /**
- * Advertises Codemote service via mDNS/Bonjour
- * iOS apps discover this service using _codemote._tcp.local
+ * Strategy interface for mDNS service advertisement.
+ * Platform-specific implementations handle the details of registering
+ * and tearing down the service record.
  */
-export class MDNSAdvertiser {
+export interface MDNSAdvertiser {
+	advertise(config: ServiceConfig): void;
+	updatePairingCode(newPairingCode: string): void;
+	stop(): void;
+	destroy(): Promise<void>;
+	isAdvertising(): boolean;
+	getConfig(): ServiceConfig | null;
+}
+
+/**
+ * Advertises Codemote service via the bonjour-service npm package.
+ * Works cross-platform but runs its own mDNS responder on port 5353,
+ * which can conflict with macOS's built-in mDNSResponder.
+ */
+export class BonjourAdvertiser implements MDNSAdvertiser {
 	private bonjour: Bonjour;
 	private service: Service | null = null;
 	private currentConfig: ServiceConfig | null = null;
@@ -88,12 +104,28 @@ export class MDNSAdvertiser {
 	}
 
 	/**
-	 * Destroys the Bonjour instance and stops all services
-	 * Should be called when completely shutting down
+	 * Destroys the Bonjour instance and stops all services.
+	 * Waits for goodbye packets (TTL=0) before closing the socket.
 	 */
-	destroy(): void {
-		this.stop();
+	async destroy(): Promise<void> {
+		if (!this.service) {
+			try {
+				this.bonjour.destroy();
+			} catch {
+				// Already destroyed
+			}
+			return;
+		}
+		const goodbyeTimeout = 2000;
+		await Promise.race([
+			new Promise<void>((resolve) => {
+				this.bonjour.unpublishAll(() => resolve());
+			}),
+			new Promise<void>((resolve) => setTimeout(resolve, goodbyeTimeout)),
+		]);
 		this.bonjour.destroy();
+		this.service = null;
+		this.currentConfig = null;
 	}
 
 	/**
@@ -112,13 +144,20 @@ export class MDNSAdvertiser {
 }
 
 /**
- * Convenience function to quickly advertise a service
- * @param port - Port number where the service is listening
- * @param pin - Pairing PIN for authentication
- * @returns MDNSAdvertiser instance (remember to call destroy() when done)
+ * Creates a platform-appropriate mDNS advertiser.
+ * On macOS, uses dns-sd(1) to delegate to the OS mDNSResponder.
+ * On other platforms, uses bonjour-service.
  */
+export function createAdvertiser(): MDNSAdvertiser {
+	if (process.platform === "darwin") {
+		return new DnsSdAdvertiser();
+	}
+	return new BonjourAdvertiser();
+}
+
+/** @deprecated Use createAdvertiser() instead */
 export function advertiseService(port: number, pin: string): MDNSAdvertiser {
-	const advertiser = new MDNSAdvertiser();
+	const advertiser = createAdvertiser();
 	advertiser.advertise({ port, pin });
 	return advertiser;
 }

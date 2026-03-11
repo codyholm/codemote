@@ -22,7 +22,7 @@
  */
 
 import { runCacheRefresh, runConfigSubcommand } from "./config.js";
-import { advertiseService } from "./mdns.js";
+import { createAdvertiser } from "./mdns.js";
 import { buildPairingURL, generateQRCode, getLocalIP } from "./qrcode.js";
 import { startServer } from "./server.js";
 import {
@@ -214,8 +214,9 @@ async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 	});
 
 	const localMode = !remoteRelayUrl;
-	const mdns = localMode ? advertiseService(port, server.pin) : { destroy: () => undefined };
-	if (localMode) {
+	const mdns = localMode ? createAdvertiser() : null;
+	if (mdns) {
+		mdns.advertise({ port, pin: server.pin });
 		console.log(`[CLI] mDNS advertising on port ${port}`);
 	} else {
 		console.log("[CLI] mDNS disabled in hosted relay mode");
@@ -417,7 +418,7 @@ async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 			console.log("\n[CLI] Shutting down...");
 
 			try {
-				mdns.destroy();
+				await mdns?.destroy();
 			} catch (err) {
 				console.error(
 					`[CLI] Failed to stop mDNS: ${err instanceof Error ? err.message : String(err)}`,

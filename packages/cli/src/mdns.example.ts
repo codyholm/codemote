@@ -3,10 +3,10 @@
  * Run with: tsx src/mdns.example.ts
  */
 
-import { MDNSAdvertiser, advertiseService } from "./mdns.js";
+import { BonjourAdvertiser, createAdvertiser } from "./mdns.js";
 import { generatePIN } from "./pairing.js";
 
-// Example 1: Quick start with convenience function
+// Example 1: Quick start with factory function
 function quickExample() {
 	console.log("Example 1: Quick Start");
 	console.log("======================\n");
@@ -17,26 +17,27 @@ function quickExample() {
 	console.log(`Advertising Codemote service on port ${port}`);
 	console.log(`PIN: ${pin}\n`);
 
-	const advertiser = advertiseService(port, pin);
+	const advertiser = createAdvertiser();
+	advertiser.advertise({ port, pin });
 
 	// Service is now discoverable on the local network
 	console.log("Service is advertising...");
 	console.log("iOS app can discover this via _codemote._tcp.local\n");
 
 	// Clean up after 5 seconds
-	setTimeout(() => {
+	setTimeout(async () => {
 		console.log("Stopping advertisement...");
-		advertiser.destroy();
+		await advertiser.destroy();
 		console.log("Done.\n");
 	}, 5000);
 }
 
-// Example 2: Full control with MDNSAdvertiser class
+// Example 2: Full control with BonjourAdvertiser class
 function advancedExample() {
 	console.log("Example 2: Advanced Usage");
 	console.log("=========================\n");
 
-	const advertiser = new MDNSAdvertiser();
+	const advertiser = new BonjourAdvertiser();
 
 	// Start advertising
 	const config = {
@@ -63,9 +64,9 @@ function advancedExample() {
 	}, 3000);
 
 	// Stop after 6 seconds
-	setTimeout(() => {
+	setTimeout(async () => {
 		console.log("Stopping service...");
-		advertiser.destroy();
+		await advertiser.destroy();
 		console.log(`Is advertising: ${advertiser.isAdvertising()}`);
 		console.log("Done.");
 	}, 6000);
@@ -76,7 +77,7 @@ function pinRotationExample() {
 	console.log("Example 3: Automatic PIN Rotation");
 	console.log("==================================\n");
 
-	const advertiser = new MDNSAdvertiser();
+	const advertiser = createAdvertiser();
 	let currentPIN = generatePIN();
 
 	// Start advertising
@@ -98,10 +99,10 @@ function pinRotationExample() {
 	}, 10_000);
 
 	// Run for 25 seconds to see 2 rotations
-	setTimeout(() => {
+	setTimeout(async () => {
 		console.log("\nCleaning up...");
 		clearInterval(interval);
-		advertiser.destroy();
+		await advertiser.destroy();
 		console.log("Done.");
 	}, 25_000);
 }

@@ -4,28 +4,28 @@ The `mdns` module provides Bonjour/mDNS service advertisement for Codemote, enab
 
 ## Overview
 
-This module uses the `bonjour-service` package to advertise the Codemote service as `_codemote._tcp.local`, which iOS apps can discover using the Network framework.
+This module uses a platform-aware strategy pattern to advertise the Codemote service as `_codemote._tcp.local`. On macOS, it delegates to the OS's native `mDNSResponder` via `dns-sd -R`, avoiding UDP socket conflicts and hostname collisions. On Linux and Windows, it uses the `bonjour-service` npm package. The `createAdvertiser()` factory selects the right implementation automatically.
 
 ## Quick Start
 
 ```typescript
-import { advertiseService } from "codemote";
+import { createAdvertiser } from "codemote";
 
-// Start advertising on port 8080
-// NOTE: the PIN is NOT advertised via mDNS TXT records.
-const advertiser = advertiseService(8080, "123456");
+const advertiser = createAdvertiser();
+advertiser.advertise({ port: 8080, pin: "123456" });
 
-process.on("SIGINT", () => {
-	advertiser.destroy();
+// destroy() is async — await it for clean goodbye packets
+process.on("SIGINT", async () => {
+	await advertiser.destroy();
 	process.exit(0);
 });
 ```
 
 ## API Reference
 
-### `MDNSAdvertiser`
+### `MDNSAdvertiser` (interface)
 
-The main class for managing mDNS service advertisement.
+Strategy interface implemented by platform-specific advertisers.
 
 #### Methods
 
@@ -34,7 +34,7 @@ The main class for managing mDNS service advertisement.
 Starts advertising the Codemote service on the local network.
 
 ```typescript
-const advertiser = new MDNSAdvertiser();
+const advertiser = createAdvertiser();
 advertiser.advertise({
   port: 3000,
   pin: "123456",
@@ -55,18 +55,18 @@ advertiser.updatePairingCode("654321");
 
 ##### `stop(): void`
 
-Stops advertising the service but keeps the Bonjour instance alive.
+Stops advertising the service but keeps the underlying instance alive.
 
 ```typescript
 advertiser.stop();
 ```
 
-##### `destroy(): void`
+##### `destroy(): Promise<void>`
 
-Stops advertising and destroys the Bonjour instance. Call this when completely shutting down.
+Stops advertising and releases all resources. Call this when completely shutting down.
 
 ```typescript
-advertiser.destroy();
+await advertiser.destroy();
 ```
 
 ##### `isAdvertising(): boolean`
@@ -88,13 +88,35 @@ const config = advertiser.getConfig();
 console.log(`Port: ${config?.port}, PIN: ${config?.pin}`);
 ```
 
-### `advertiseService(port: number, pin: string): MDNSAdvertiser`
+### `createAdvertiser(): MDNSAdvertiser`
 
-Convenience function to quickly start advertising.
+Factory function that returns a platform-appropriate advertiser:
+
+- **macOS**: `DnsSdAdvertiser` (delegates to mDNSResponder via `dns-sd -R`)
+- **Linux/Windows**: `BonjourAdvertiser` (uses `bonjour-service` npm package)
 
 ```typescript
+const advertiser = createAdvertiser();
+```
+
+### `advertiseService(port, pin)` (deprecated)
+
+Convenience function that creates an advertiser and immediately starts advertising. Use `createAdvertiser()` instead.
+
+```typescript
+// Deprecated — prefer createAdvertiser()
 const advertiser = advertiseService(3000, "123456");
 ```
+
+### Implementations
+
+#### `BonjourAdvertiser`
+
+Uses the `bonjour-service` npm package. Runs its own mDNS responder on UDP port 5353. `destroy()` waits for goodbye packets (TTL=0) before closing the socket.
+
+#### `DnsSdAdvertiser`
+
+macOS-only. Spawns `dns-sd -R` as a child process to register the service with the OS mDNSResponder. Goodbye packets are sent automatically when the process is killed — no manual teardown delay needed. Uses `scutil --get ComputerName` for stable service naming (unaffected by mDNS hostname collisions).
 
 ### Types
 
@@ -108,6 +130,14 @@ interface ServiceConfig {
 	version?: string; // Protocol version (default: "1")
 }
 ```
+
+## Platform Behavior
+
+**macOS**: Uses the system mDNSResponder via `dns-sd -R`. No UDP socket conflicts, no hostname collisions (the `LocalHostName rename` popup). Service names use `ComputerName` from `scutil` for stability.
+
+**Linux**: Uses `bonjour-service`. Typically no mDNS conflicts because Avahi (the common Linux mDNS implementation) uses a different socket model.
+
+**Windows**: Uses `bonjour-service`. Windows mDNS is passive — no conflict with the npm package's responder.
 
 ## Service Discovery
 
@@ -151,9 +181,9 @@ If you rotate the pairing token, you can keep local discovery stable while updat
 This example shows a simple timer-based rotation:
 
 ```typescript
-import { MDNSAdvertiser, generatePIN } from "codemote";
+import { createAdvertiser, generatePIN } from "codemote";
 
-const advertiser = new MDNSAdvertiser();
+const advertiser = createAdvertiser();
 let currentPIN = generatePIN();
 
 advertiser.advertise({
@@ -170,9 +200,9 @@ const interval = setInterval(() => {
 }, 15 * 60 * 1000);
 
 // Clean up on shutdown
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
   clearInterval(interval);
-  advertiser.destroy();
+  await advertiser.destroy();
   process.exit(0);
 });
 ```
@@ -213,7 +243,7 @@ tsx src/mdns.example.ts
 
 ## Best Practices
 
-1. **Always clean up**: Call `destroy()` when shutting down to release network resources
+1. **Always clean up**: Call `await destroy()` when shutting down to release network resources
 2. **Do not advertise secrets**: keep the PIN out of mDNS TXT records
 3. **Handle errors**: Wrap `updatePairingCode` in try-catch blocks
 4. **Single instance**: Only create one advertiser per port to avoid conflicts
@@ -238,10 +268,13 @@ tsx src/mdns.example.ts
 
 ```typescript
 // Good: Different ports
-const advertiser1 = advertiseService(3000, "123456");
-const advertiser2 = advertiseService(3001, "654321");
+const a1 = createAdvertiser();
+a1.advertise({ port: 3000, pin: "123456" });
+
+const a2 = createAdvertiser();
+a2.advertise({ port: 3001, pin: "654321" });
 
 // Bad: Same port will cause issues
-const advertiser1 = advertiseService(3000, "123456");
-const advertiser2 = advertiseService(3000, "654321"); // Conflict!
+const a3 = createAdvertiser();
+a3.advertise({ port: 3000, pin: "111111" }); // Conflict with a1!
 ```

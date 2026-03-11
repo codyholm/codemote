@@ -10,8 +10,10 @@ export {
 } from "./pairing.js";
 
 export {
-	MDNSAdvertiser,
+	BonjourAdvertiser,
 	advertiseService,
+	createAdvertiser,
+	type MDNSAdvertiser,
 	type ServiceConfig,
 } from "./mdns.js";
 
