@@ -1,5 +1,5 @@
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { simpleGit } from "simple-git";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -8,7 +8,7 @@ import { SessionManager } from "../session.js";
 import { WorkspaceManager } from "../workspace.js";
 import { OpenCodeExecutor } from "./opencode.js";
 
-describe("OpenCodeExecutor", () => {
+describe.skipIf(platform() === "win32")("OpenCodeExecutor", () => {
 	let testDir: string;
 	let mockOpenCodePath: string;
 	let argsLogPath: string;

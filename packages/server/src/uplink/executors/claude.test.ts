@@ -1,5 +1,5 @@
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { simpleGit } from "simple-git";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -21,7 +21,7 @@ async function waitFor(
 	}
 }
 
-describe("ClaudeExecutor", () => {
+describe.skipIf(platform() === "win32")("ClaudeExecutor", () => {
 	let testDir: string;
 	let mockClaudePath: string;
 	let workspaceManager: WorkspaceManager;
