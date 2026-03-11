@@ -42,6 +42,10 @@ interface ClaudeSession {
 	claudeSessionId: string | null;
 	/** Selected model override (optional) */
 	model: string | null;
+	/** Temperature override (optional) */
+	temperature: number | null;
+	/** Max tokens override (optional) */
+	maxTokens: number | null;
 	/** Child process (stdio pipes) */
 	process: ChildProcessWithoutNullStreams | null;
 	/** Data buffer for incomplete JSON lines */
@@ -154,11 +158,19 @@ export class ClaudeExecutor extends BaseExecutor {
 	 */
 	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
 		const model = options.model?.trim() ? options.model.trim() : null;
-		const args = this.buildArgs(options.resumeSessionId, model);
+		const temperature =
+			typeof options.temperature === "number" && options.temperature >= 0
+				? options.temperature
+				: null;
+		const maxTokens =
+			typeof options.maxTokens === "number" && options.maxTokens > 0 ? options.maxTokens : null;
+		const args = this.buildArgs(options.resumeSessionId, model, temperature, maxTokens);
 
 		const claudeSession: ClaudeSession = {
 			claudeSessionId: null,
 			model,
+			temperature,
+			maxTokens,
 			process: null,
 			buffer: "",
 			running: true,
@@ -312,7 +324,12 @@ export class ClaudeExecutor extends BaseExecutor {
 	 * The session stays alive as long as stdin remains open. If a resume ID
 	 * is provided, Claude resumes that persisted conversation thread.
 	 */
-	private buildArgs(resumeSessionId?: string, model?: string | null): string[] {
+	private buildArgs(
+		resumeSessionId?: string,
+		model?: string | null,
+		temperature?: number | null,
+		maxTokens?: number | null,
+	): string[] {
 		const args: string[] = [
 			"-p", // Print mode (required for programmatic control)
 			"--verbose", // Include detailed events
@@ -332,6 +349,14 @@ export class ClaudeExecutor extends BaseExecutor {
 		const selectedModel = model?.trim();
 		if (selectedModel && selectedModel.length > 0) {
 			args.push("--model", selectedModel);
+		}
+
+		if (typeof temperature === "number" && temperature >= 0) {
+			args.push("--temperature", String(temperature));
+		}
+
+		if (typeof maxTokens === "number" && maxTokens > 0) {
+			args.push("--max-tokens", String(maxTokens));
 		}
 
 		const resumeId = resumeSessionId?.trim();

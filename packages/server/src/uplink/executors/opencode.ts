@@ -34,6 +34,10 @@ interface OpenCodeSession {
 	runtimeSessionId: string | null;
 	/** Selected model override (optional) */
 	model: string | null;
+	/** Temperature override (optional) */
+	temperature: number | null;
+	/** Max tokens override (optional) */
+	maxTokens: number | null;
 	/** Tool calls we have already emitted for this session */
 	seenToolCallIds: Set<string>;
 	/** Recent stderr for diagnostics */
@@ -72,11 +76,19 @@ export class OpenCodeExecutor extends BaseExecutor {
 	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
 		const resumeSessionId = options.resumeSessionId?.trim();
 		const model = options.model?.trim() ? options.model.trim() : null;
+		const temperature =
+			typeof options.temperature === "number" && options.temperature >= 0
+				? options.temperature
+				: null;
+		const maxTokens =
+			typeof options.maxTokens === "number" && options.maxTokens > 0 ? options.maxTokens : null;
 		const openCodeSession: OpenCodeSession = {
 			process: null,
 			running: false,
 			runtimeSessionId: resumeSessionId && resumeSessionId.length > 0 ? resumeSessionId : null,
 			model,
+			temperature,
+			maxTokens,
 			seenToolCallIds: new Set(),
 			stderrBuffer: "",
 		};
@@ -209,6 +221,12 @@ export class OpenCodeExecutor extends BaseExecutor {
 		const selectedModel = openCodeSession.model?.trim();
 		if (selectedModel && selectedModel.length > 0) {
 			args.push("--model", selectedModel);
+		}
+		if (typeof openCodeSession.temperature === "number" && openCodeSession.temperature >= 0) {
+			args.push("--temperature", String(openCodeSession.temperature));
+		}
+		if (typeof openCodeSession.maxTokens === "number" && openCodeSession.maxTokens > 0) {
+			args.push("--max-tokens", String(openCodeSession.maxTokens));
 		}
 		args.push(prompt);
 		args.push(...this.config.extraArgs);

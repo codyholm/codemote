@@ -26,6 +26,8 @@ interface GeminiSession {
 	hasHistory: boolean;
 	runtimeSessionId: string | null;
 	model: string | null;
+	temperature: number | null;
+	maxTokens: number | null;
 	stderrBuffer: string;
 	toolNames: Map<string, string>;
 }
@@ -64,12 +66,20 @@ export class GeminiExecutor extends BaseExecutor {
 	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
 		const resumeSessionId = options.resumeSessionId?.trim();
 		const model = options.model?.trim() ? options.model.trim() : null;
+		const temperature =
+			typeof options.temperature === "number" && options.temperature >= 0
+				? options.temperature
+				: null;
+		const maxTokens =
+			typeof options.maxTokens === "number" && options.maxTokens > 0 ? options.maxTokens : null;
 		const geminiSession: GeminiSession = {
 			process: null,
 			running: false,
 			hasHistory: !!resumeSessionId,
 			runtimeSessionId: resumeSessionId && resumeSessionId.length > 0 ? resumeSessionId : null,
 			model,
+			temperature,
+			maxTokens,
 			stderrBuffer: "",
 			toolNames: new Map(),
 		};
@@ -124,6 +134,8 @@ export class GeminiExecutor extends BaseExecutor {
 			geminiSession.runtimeSessionId,
 			geminiSession.hasHistory,
 			geminiSession.model,
+			geminiSession.temperature,
+			geminiSession.maxTokens,
 		);
 		const proc = spawn(this.config.geminiPath, args, {
 			cwd: session.workspace.workingDir,
@@ -332,6 +344,8 @@ export class GeminiExecutor extends BaseExecutor {
 		runtimeSessionId: string | null,
 		hasHistory: boolean,
 		model: string | null,
+		temperature: number | null = null,
+		maxTokens: number | null = null,
 	): string[] {
 		const args: string[] = [];
 		const resumeId = runtimeSessionId?.trim();
@@ -344,6 +358,12 @@ export class GeminiExecutor extends BaseExecutor {
 		const selectedModel = model?.trim();
 		if (selectedModel && selectedModel.length > 0) {
 			args.push("--model", selectedModel);
+		}
+		if (typeof temperature === "number" && temperature >= 0) {
+			args.push("--temperature", String(temperature));
+		}
+		if (typeof maxTokens === "number" && maxTokens > 0) {
+			args.push("--max-tokens", String(maxTokens));
 		}
 		args.push(...this.config.extraArgs);
 		args.push(prompt);

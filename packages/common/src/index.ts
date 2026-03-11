@@ -147,6 +147,8 @@ export interface RunOptions {
 	initialPrompt: string;
 	resumeSessionId?: string;
 	model?: string;
+	temperature?: number;
+	maxTokens?: number;
 }
 
 export interface RunResult {

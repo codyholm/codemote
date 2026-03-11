@@ -45,6 +45,10 @@ interface CodexSession {
 	threadId: string | null;
 	/** Selected model override (optional) */
 	model: string | null;
+	/** Temperature override (optional) */
+	temperature: number | null;
+	/** Max tokens override (optional) */
+	maxTokens: number | null;
 	/** Whether process is running */
 	running: boolean;
 	/** Non-JSON stderr output for troubleshooting process failures */
@@ -136,9 +140,15 @@ export class CodexExecutor extends BaseExecutor {
 	 */
 	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
 		const model = options.model?.trim() ? options.model.trim() : null;
+		const temperature =
+			typeof options.temperature === "number" && options.temperature >= 0
+				? options.temperature
+				: null;
+		const maxTokens =
+			typeof options.maxTokens === "number" && options.maxTokens > 0 ? options.maxTokens : null;
 		const isGitRepo = await this.checkIsGitRepo(session.workspace.workingDir);
-		const args = this.buildExecArgs(options.initialPrompt, model, isGitRepo);
-		const codexSession = this.createCodexSession(null, model);
+		const args = this.buildExecArgs(options.initialPrompt, model, temperature, maxTokens, isGitRepo);
+		const codexSession = this.createCodexSession(null, model, temperature, maxTokens);
 
 		this.codexSessions.set(session.id, codexSession);
 
@@ -239,10 +249,25 @@ export class CodexExecutor extends BaseExecutor {
 		const session = this.sessionManager.get(sessionId);
 		if (!session) throw new Error("Session not found");
 
-		const preservedModel = this.codexSessions.get(sessionId)?.model ?? null;
+		const existing = this.codexSessions.get(sessionId);
+		const preservedModel = existing?.model ?? null;
+		const preservedTemperature = existing?.temperature ?? null;
+		const preservedMaxTokens = existing?.maxTokens ?? null;
 		const isGitRepo = await this.checkIsGitRepo(session.workspace.workingDir);
-		const args = this.buildResumeArgs(codexSessionId, followUp, preservedModel, isGitRepo);
-		const codexSession = this.createCodexSession(codexSessionId, preservedModel);
+		const args = this.buildResumeArgs(
+			codexSessionId,
+			followUp,
+			preservedModel,
+			preservedTemperature,
+			preservedMaxTokens,
+			isGitRepo,
+		);
+		const codexSession = this.createCodexSession(
+			codexSessionId,
+			preservedModel,
+			preservedTemperature,
+			preservedMaxTokens,
+		);
 
 		this.codexSessions.set(session.id, codexSession);
 
@@ -262,12 +287,16 @@ export class CodexExecutor extends BaseExecutor {
 	private createCodexSession(
 		initialSessionId: string | null = null,
 		model: string | null = null,
+		temperature: number | null = null,
+		maxTokens: number | null = null,
 	): CodexSession {
 		return {
 			process: null,
 			codexSessionId: initialSessionId,
 			threadId: null,
 			model,
+			temperature,
+			maxTokens,
 			running: true,
 			stderr: "",
 			pendingToolCalls: new Map(),
@@ -289,7 +318,13 @@ export class CodexExecutor extends BaseExecutor {
 	 * `--ask-for-approval` and `--sandbox` are top-level Codex flags, so they
 	 * must appear before the `exec` subcommand.
 	 */
-	private buildExecArgs(task: string, model: string | null, isGitRepo: boolean): string[] {
+	private buildExecArgs(
+		task: string,
+		model: string | null,
+		temperature: number | null = null,
+		maxTokens: number | null = null,
+		isGitRepo: boolean = true,
+	): string[] {
 		const args: string[] = [
 			"--ask-for-approval",
 			this.config.approvalPolicy,
@@ -300,6 +335,14 @@ export class CodexExecutor extends BaseExecutor {
 			...(isGitRepo ? [] : ["--skip-git-repo-check"]),
 			"--json",
 		];
+
+		if (typeof temperature === "number" && temperature >= 0) {
+			args.push("--temperature", String(temperature));
+		}
+
+		if (typeof maxTokens === "number" && maxTokens > 0) {
+			args.push("--max-tokens", String(maxTokens));
+		}
 
 		if (this.config.outputSchema) {
 			args.push("--output-schema", this.config.outputSchema);
@@ -318,7 +361,9 @@ export class CodexExecutor extends BaseExecutor {
 		codexSessionId: string,
 		followUp: string | undefined,
 		model: string | null,
-		isGitRepo: boolean,
+		temperature: number | null = null,
+		maxTokens: number | null = null,
+		isGitRepo: boolean = true,
 	): string[] {
 		const args: string[] = [
 			"--ask-for-approval",
@@ -332,6 +377,14 @@ export class CodexExecutor extends BaseExecutor {
 			codexSessionId,
 			"--json",
 		];
+
+		if (typeof temperature === "number" && temperature >= 0) {
+			args.push("--temperature", String(temperature));
+		}
+
+		if (typeof maxTokens === "number" && maxTokens > 0) {
+			args.push("--max-tokens", String(maxTokens));
+		}
 
 		if (followUp) {
 			args.push(followUp);

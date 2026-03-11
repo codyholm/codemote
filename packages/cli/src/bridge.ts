@@ -190,6 +190,8 @@ interface NewSessionMessage {
 	resumeSessionId?: string;
 	workspace?: string;
 	model?: string;
+	temperature?: number;
+	maxTokens?: number;
 }
 
 interface ListModelsMessage {
@@ -422,6 +424,8 @@ class UplinkWsClient {
 		initialPrompt: string,
 		resumeSessionId?: string,
 		model?: string,
+		temperature?: number,
+		maxTokens?: number,
 	) {
 		const normalizedModel = typeof model === "string" ? model.trim() : "";
 		const payload = {
@@ -430,6 +434,8 @@ class UplinkWsClient {
 			initialPrompt,
 			...(resumeSessionId ? { resumeSessionId } : {}),
 			...(normalizedModel ? { model: normalizedModel } : {}),
+			...(typeof temperature === "number" && temperature >= 0 ? { temperature } : {}),
+			...(typeof maxTokens === "number" && maxTokens > 0 ? { maxTokens } : {}),
 		};
 		return this.sendAndWait({
 			type: "start_run",
@@ -1251,6 +1257,8 @@ export async function startRelayUplinkBridge(
 				resumeSessionId,
 				message.workspace,
 				message.model,
+				message.temperature,
+				message.maxTokens,
 			);
 		} catch (error) {
 			let sessionStartError: unknown = error;
@@ -1267,6 +1275,8 @@ export async function startRelayUplinkBridge(
 						undefined,
 						message.workspace,
 						message.model,
+						message.temperature,
+						message.maxTokens,
 					);
 					return;
 				} catch (fallbackError) {
@@ -1352,6 +1362,8 @@ export async function startRelayUplinkBridge(
 		resumeSessionId?: string,
 		workspace?: string,
 		model?: string,
+		temperature?: number,
+		maxTokens?: number,
 	): Promise<{ sessionId: string }> {
 		const started = await uplinkClient.startRun(
 			runtime,
@@ -1359,6 +1371,8 @@ export async function startRelayUplinkBridge(
 			prompt,
 			resumeSessionId,
 			model,
+			temperature,
+			maxTokens,
 		);
 		if (started.type !== "run_started") {
 			throw new Error("Unexpected start_run response");
@@ -2132,6 +2146,8 @@ function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 		const resumeSessionId = (payload as { resumeSessionId?: unknown }).resumeSessionId;
 		const workspace = (payload as { workspace?: unknown }).workspace;
 		const model = (payload as { model?: unknown }).model;
+		const temperature = (payload as { temperature?: unknown }).temperature;
+		const maxTokens = (payload as { maxTokens?: unknown }).maxTokens;
 		if (
 			(runtime === "opencode" ||
 				runtime === "claude" ||
@@ -2148,6 +2164,17 @@ function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 			}
 			if (typeof model === "string" && model.trim().length > 0) {
 				msg.model = model.trim();
+			}
+			if (
+				typeof temperature === "number" &&
+				Number.isFinite(temperature) &&
+				temperature >= 0 &&
+				temperature <= 2
+			) {
+				msg.temperature = temperature;
+			}
+			if (typeof maxTokens === "number" && Number.isInteger(maxTokens) && maxTokens > 0) {
+				msg.maxTokens = maxTokens;
 			}
 			return msg;
 		}

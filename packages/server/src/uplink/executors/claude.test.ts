@@ -200,6 +200,37 @@ exit 0
 		activeSessionId = null;
 	});
 
+	it("passes --temperature when temperature is provided", async () => {
+		const argsPath = join(testDir, "claude-args-temp.txt");
+		const argsCapturingMockPath = join(testDir, "mock-claude-args-temp");
+		const argsScript = `#!/bin/sh
+echo "$@" > "${argsPath}"
+printf '%s\\n' '{"type":"session_start","session_id":"mock-session"}'
+printf '%s\\n' '{"type":"end"}'
+exit 0
+`;
+		await writeFile(argsCapturingMockPath, argsScript);
+		await chmod(argsCapturingMockPath, 0o755);
+
+		activeExecutor = new ClaudeExecutor(workspaceManager, sessionManager, eventBus, {
+			claudePath: argsCapturingMockPath,
+		});
+
+		const result = await activeExecutor.startRun({
+			profile: "claude",
+			workspace: testDir,
+			initialPrompt: "Hello",
+			temperature: 0.7,
+		});
+		activeSessionId = result.sessionId;
+
+		await waitFor(() => sessionManager.get(result.sessionId)?.status === "ended");
+		const invokedArgs = await readFile(argsPath, "utf8");
+		expect(invokedArgs).toContain("--temperature 0.7");
+
+		activeSessionId = null;
+	});
+
 	it("allows overriding claude permission mode", async () => {
 		const argsPath = join(testDir, "claude-args-permission-mode.txt");
 		const argsCapturingMockPath = join(testDir, "mock-claude-args-permission-mode");
