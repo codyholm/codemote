@@ -243,7 +243,11 @@ export async function readServiceLogs(lines = 200): Promise<string> {
 			["--user", "-u", LINUX_UNIT, "-n", String(lines), "--no-pager"],
 			{ allowFailure: true },
 		);
-		if (journal.code === 0 && journal.stdout.trim().length > 0) {
+		if (
+			journal.code === 0 &&
+			journal.stdout.trim().length > 0 &&
+			!journal.stdout.includes("-- No entries --")
+		) {
 			return journal.stdout;
 		}
 	}
