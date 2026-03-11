@@ -137,9 +137,8 @@ describe("UplinkServer list_directory", () => {
 			expect(msg.type).toBe("directory_listing");
 			const payload = msg.payload as { path: string; entries: unknown[] };
 
-			// Should resolve to home directory
-			const { homedir } = await import("node:os");
-			expect(payload.path).toBe(homedir());
+			// Should resolve to process.cwd() (server WorkingDirectory)
+			expect(payload.path).toBe(process.cwd());
 			expect(Array.isArray(payload.entries)).toBe(true);
 		} finally {
 			ws.close();

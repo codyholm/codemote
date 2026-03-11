@@ -39,11 +39,14 @@ import { renderUI, updateStatus } from "./ui.js";
 
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import type { RuntimeType } from "@codemote/server";
+
+const CODEMOTE_DEFAULT_WORKSPACE = join(homedir(), ".codemote", "workspace");
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "../package.json"), "utf-8"));
@@ -460,10 +463,11 @@ async function runServiceSubcommand(args: string[]): Promise<void> {
 
 	switch (action) {
 		case "install":
+			await mkdir(CODEMOTE_DEFAULT_WORKSPACE, { recursive: true });
 			await installService({
 				nodePath: process.execPath,
 				scriptPath,
-				workingDirectory: process.cwd(),
+				workingDirectory: CODEMOTE_DEFAULT_WORKSPACE,
 				...(remoteRelayUrl ? { remoteRelayUrl } : {}),
 			});
 			console.log("Service installed.");

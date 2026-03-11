@@ -1,5 +1,4 @@
 import { readdir, stat } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import {
 	type ModelInfo,
@@ -357,7 +356,7 @@ export class UplinkServer {
 			}
 
 			case "list_directory": {
-				const requestedPath = command.payload.path?.trim() || homedir();
+				const requestedPath = command.payload.path?.trim() || process.cwd();
 				const resolvedPath = resolve(requestedPath);
 				const entries = await this.listDirectory(resolvedPath);
 				return { type: "directory_listing", payload: { path: resolvedPath, entries } };

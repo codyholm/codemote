@@ -55,6 +55,31 @@ interface ClaudeSession {
 /**
  * Claude stream event types from --output-format stream-json
  */
+/** A content block inside a Claude API message (tool_use, tool_result, or text). */
+interface ClaudeContentBlock {
+	type: string;
+	/** text content (type=text) */
+	text?: string;
+	/** tool_use block ID (type=tool_use) */
+	id?: string;
+	/** tool name (type=tool_use) */
+	name?: string;
+	/** tool input (type=tool_use) */
+	input?: unknown;
+	/** tool_use_id reference (type=tool_result) */
+	tool_use_id?: string;
+	/** tool result content — string or array (type=tool_result) */
+	content?: unknown;
+	/** whether tool execution errored (type=tool_result) */
+	is_error?: boolean;
+}
+
+/** Wrapper for the full API message object inside "assistant"/"user" events. */
+interface ClaudeApiMessage {
+	role?: string;
+	content?: ClaudeContentBlock[];
+}
+
 interface ClaudeStreamEvent {
 	type: string;
 	session_id?: string;
@@ -63,7 +88,8 @@ interface ClaudeStreamEvent {
 	description?: string;
 	args?: unknown;
 	output?: string;
-	message?: string;
+	/** Full API message (present on "assistant" / "user" wrapper events) */
+	message?: ClaudeApiMessage | string;
 	error?: string;
 	/** Tool use block ID from Claude SDK (present on tool_use events) */
 	id?: string;
@@ -419,6 +445,16 @@ export class ClaudeExecutor extends BaseExecutor {
 				this.emitStatus(sessionId, "running");
 				break;
 
+			case "assistant":
+				// stream-json wrapper: message.content[] contains text and tool_use blocks
+				this.handleAssistantWrapper(sessionId, event, parentToolUseId);
+				break;
+
+			case "user":
+				// stream-json wrapper: message.content[] contains tool_result blocks
+				this.handleUserWrapper(sessionId, event, parentToolUseId);
+				break;
+
 			case "assistant_message":
 			case "message":
 				if (event.content) {
@@ -479,10 +515,12 @@ export class ClaudeExecutor extends BaseExecutor {
 				});
 				break;
 
-			case "error":
-				this.emitOutput(sessionId, `Error: ${event.message || event.error || "Unknown error"}\n`);
+			case "error": {
+				const errMsg = typeof event.message === "string" ? event.message : event.error;
+				this.emitOutput(sessionId, `Error: ${errMsg || "Unknown error"}\n`);
 				this.emitStatus(sessionId, "error");
 				break;
+			}
 
 			case "end":
 			case "session_end":
@@ -491,6 +529,83 @@ export class ClaudeExecutor extends BaseExecutor {
 
 			default:
 				break;
+		}
+	}
+
+	/**
+	 * Handle "assistant" wrapper events from stream-json output.
+	 * These wrap the full API message, whose content[] may include
+	 * text blocks and tool_use blocks.
+	 */
+	private handleAssistantWrapper(
+		sessionId: string,
+		event: ClaudeStreamEvent,
+		parentToolUseId: string | undefined,
+	): void {
+		const claudeSession = this.claudeSessions.get(sessionId);
+		const msg = typeof event.message === "object" ? event.message : undefined;
+		if (!msg?.content) return;
+
+		const textParts: string[] = [];
+		for (const block of msg.content) {
+			if (block.type === "text" && block.text) {
+				textParts.push(block.text);
+			} else if (block.type === "tool_use") {
+				if (claudeSession) {
+					const toolCallId = this.generateToolCallId();
+					const toolName = block.name || "unknown";
+					if (block.id) {
+						claudeSession.pendingToolCalls.set(block.id, { toolCallId, toolName });
+					}
+					const argsString = block.input !== undefined ? JSON.stringify(block.input) : undefined;
+					this.emitToolCall(sessionId, toolCallId, toolName, argsString, parentToolUseId);
+				}
+			}
+		}
+		if (textParts.length > 0) {
+			this.emitMessage(sessionId, "assistant", textParts.join("\n"), parentToolUseId);
+		}
+	}
+
+	/**
+	 * Handle "user" wrapper events from stream-json output.
+	 * These wrap tool_result blocks that complete pending tool calls.
+	 */
+	private handleUserWrapper(
+		sessionId: string,
+		event: ClaudeStreamEvent,
+		parentToolUseId: string | undefined,
+	): void {
+		const claudeSession = this.claudeSessions.get(sessionId);
+		const msg = typeof event.message === "object" ? event.message : undefined;
+		if (!msg?.content) return;
+
+		for (const block of msg.content) {
+			if (block.type === "tool_result" && block.tool_use_id) {
+				const output =
+					typeof block.content === "string"
+						? block.content
+						: block.content !== undefined
+							? JSON.stringify(block.content)
+							: undefined;
+
+				const pending = claudeSession?.pendingToolCalls.get(block.tool_use_id);
+				if (pending) {
+					claudeSession?.pendingToolCalls.delete(block.tool_use_id);
+					const error = block.is_error ? (output ?? "Tool execution failed") : undefined;
+					this.emitToolResult(
+						sessionId,
+						pending.toolCallId,
+						pending.toolName,
+						block.is_error ? undefined : output,
+						error,
+						parentToolUseId,
+					);
+				} else if (output) {
+					// Fallback: no matching tool_use found, emit as raw output
+					this.emitOutput(sessionId, `${output}\n`);
+				}
+			}
 		}
 	}
 }

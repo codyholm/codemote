@@ -1,4 +1,6 @@
 import type { ChildProcess } from "node:child_process";
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import {
 	type RunOptions,
@@ -134,7 +136,8 @@ export class CodexExecutor extends BaseExecutor {
 	 */
 	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
 		const model = options.model?.trim() ? options.model.trim() : null;
-		const args = this.buildExecArgs(options.initialPrompt, model);
+		const isGitRepo = await this.checkIsGitRepo(session.workspace.workingDir);
+		const args = this.buildExecArgs(options.initialPrompt, model, isGitRepo);
 		const codexSession = this.createCodexSession(null, model);
 
 		this.codexSessions.set(session.id, codexSession);
@@ -237,7 +240,8 @@ export class CodexExecutor extends BaseExecutor {
 		if (!session) throw new Error("Session not found");
 
 		const preservedModel = this.codexSessions.get(sessionId)?.model ?? null;
-		const args = this.buildResumeArgs(codexSessionId, followUp, preservedModel);
+		const isGitRepo = await this.checkIsGitRepo(session.workspace.workingDir);
+		const args = this.buildResumeArgs(codexSessionId, followUp, preservedModel, isGitRepo);
 		const codexSession = this.createCodexSession(codexSessionId, preservedModel);
 
 		this.codexSessions.set(session.id, codexSession);
@@ -270,13 +274,22 @@ export class CodexExecutor extends BaseExecutor {
 		};
 	}
 
+	private async checkIsGitRepo(dir: string): Promise<boolean> {
+		try {
+			await stat(join(dir, ".git"));
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
 	/**
 	 * Build command line arguments for new `codex exec` runs.
 	 *
 	 * `--ask-for-approval` and `--sandbox` are top-level Codex flags, so they
 	 * must appear before the `exec` subcommand.
 	 */
-	private buildExecArgs(task: string, model: string | null): string[] {
+	private buildExecArgs(task: string, model: string | null, isGitRepo: boolean): string[] {
 		const args: string[] = [
 			"--ask-for-approval",
 			this.config.approvalPolicy,
@@ -284,6 +297,7 @@ export class CodexExecutor extends BaseExecutor {
 			this.config.sandbox,
 			...(model ? ["--model", model] : []),
 			"exec",
+			...(isGitRepo ? [] : ["--skip-git-repo-check"]),
 			"--json",
 		];
 
@@ -304,6 +318,7 @@ export class CodexExecutor extends BaseExecutor {
 		codexSessionId: string,
 		followUp: string | undefined,
 		model: string | null,
+		isGitRepo: boolean,
 	): string[] {
 		const args: string[] = [
 			"--ask-for-approval",
@@ -312,6 +327,7 @@ export class CodexExecutor extends BaseExecutor {
 			this.config.sandbox,
 			...(model ? ["--model", model] : []),
 			"exec",
+			...(isGitRepo ? [] : ["--skip-git-repo-check"]),
 			"resume",
 			codexSessionId,
 			"--json",
