@@ -16,3 +16,15 @@ export interface EncryptionAccept {
 	type: "encryption_accept";
 	publicKey: string;
 }
+
+/** Sent by bridge to initiate mid-session key rotation (encrypted). */
+export interface EncryptionRotate {
+	type: "encryption_rotate";
+	publicKey: string;
+}
+
+/** Sent by mobile to acknowledge key rotation (encrypted with OLD keys). */
+export interface EncryptionRotateAck {
+	type: "encryption_rotate_ack";
+	publicKey: string;
+}

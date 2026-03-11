@@ -2,10 +2,11 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
 import { startRelayUplinkBridge } from "./bridge.js";
-import { decodeBase64, encodeBase64, generateKeyPair } from "./encryption.js";
+import { decodeBase64, decrypt, encodeBase64, encrypt, generateKeyPair } from "./encryption.js";
+import type { EncryptedPayload } from "./protocol.js";
 
 interface JsonRecord {
 	[key: string]: unknown;
@@ -877,6 +878,667 @@ describe("Bridge key exchange", () => {
 			await bridge.stop();
 		}
 	}, 15_000);
+
+	it("completes key rotation and encrypts subsequent messages with new keys", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+		const messagesFromBridge: JsonRecord[] = [];
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+				}
+				if (command["type"] === "list_runtimes") {
+					socket.send(JSON.stringify({ type: "runtime_list", payload: { runtimes: ["claude"] } }));
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "200001" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					relayUplinkSocket?.on("message", (bridgeRaw) => {
+						const bridgeMsg = JSON.parse(bridgeRaw.toString()) as JsonRecord;
+						messagesFromBridge.push(bridgeMsg);
+					});
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-rot-1" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({ type: "paired", mobileDeviceId: "mobile-rot-1" }),
+					);
+					return;
+				}
+
+				// Forward mobile -> bridge
+				if (type === "message" && socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+			encryptionMode: "opportunistic",
+			keyRotationIntervalMs: 500,
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-rot-1",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			// Wait for the encryption offer
+			await waitForCondition(
+				() =>
+					messagesFromBridge.some(
+						(msg) =>
+							msg["type"] === "message" &&
+							(msg["payload"] as JsonRecord | undefined)?.["type"] === "encryption_offer",
+					),
+				5000,
+			);
+
+			// Complete initial key exchange
+			const mobileKeys = generateKeyPair();
+			const mobilePublicKeyB64 = encodeBase64(mobileKeys.publicKey);
+			const offerMsg = messagesFromBridge.find(
+				(msg) =>
+					msg["type"] === "message" &&
+					(msg["payload"] as JsonRecord | undefined)?.["type"] === "encryption_offer",
+			);
+			const bridgeOriginalPubKeyB64 = (offerMsg?.["payload"] as JsonRecord)["publicKey"] as string;
+			const bridgeOriginalPubKey = decodeBase64(bridgeOriginalPubKeyB64);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "encryption_accept", publicKey: mobilePublicKeyB64 },
+				}),
+			);
+
+			// Wait for bridge to send rotation request (encrypted payload)
+			const preRotationCount = messagesFromBridge.length;
+			await waitForCondition(() => {
+				return messagesFromBridge.slice(preRotationCount).some((msg) => {
+					if (msg["type"] !== "message") return false;
+					const p = msg["payload"] as JsonRecord | undefined;
+					if (!p || typeof p["senderPublicKey"] !== "string" || typeof p["ciphertext"] !== "string")
+						return false;
+					try {
+						const plaintext = decrypt(
+							p as unknown as import("./protocol.js").EncryptedPayload,
+							decodeBase64(p["senderPublicKey"] as string),
+							mobileKeys.secretKey,
+						);
+						const parsed = JSON.parse(plaintext) as JsonRecord;
+						return parsed["type"] === "encryption_rotate";
+					} catch {
+						return false;
+					}
+				});
+			}, 8000);
+
+			// Find the rotation message and extract new bridge public key
+			const rotationMsg = messagesFromBridge.slice(preRotationCount).find((msg) => {
+				const p = msg["payload"] as JsonRecord | undefined;
+				if (!p || typeof p["ciphertext"] !== "string") return false;
+				try {
+					const plaintext = decrypt(
+						p as unknown as import("./protocol.js").EncryptedPayload,
+						decodeBase64(p["senderPublicKey"] as string),
+						mobileKeys.secretKey,
+					);
+					return (JSON.parse(plaintext) as JsonRecord)["type"] === "encryption_rotate";
+				} catch {
+					return false;
+				}
+			});
+			const rotPayload = rotationMsg?.["payload"] as JsonRecord;
+			const rotPlaintext = decrypt(
+				rotPayload as unknown as import("./protocol.js").EncryptedPayload,
+				decodeBase64(rotPayload["senderPublicKey"] as string),
+				mobileKeys.secretKey,
+			);
+			const rotParsed = JSON.parse(rotPlaintext) as JsonRecord;
+			const bridgeNewPubKeyB64 = rotParsed["publicKey"] as string;
+
+			// Mobile generates new keypair and sends ack encrypted with OLD keys
+			const newMobileKeys = generateKeyPair();
+			const ackPayload = JSON.stringify({
+				type: "encryption_rotate_ack",
+				publicKey: encodeBase64(newMobileKeys.publicKey),
+			});
+			const encryptedAck = encrypt(
+				ackPayload,
+				bridgeOriginalPubKey,
+				mobileKeys.secretKey,
+				mobileKeys.publicKey,
+			);
+			mobileSocket.send(JSON.stringify({ type: "message", payload: encryptedAck }));
+
+			// Give bridge time to process the ack
+			await new Promise((resolve) => setTimeout(resolve, 100));
+
+			// Trigger an outbound message from bridge
+			const preListCount = messagesFromBridge.length;
+			// Send list_runtimes encrypted with NEW keys
+			const listMsg = JSON.stringify({ type: "list_runtimes" });
+			const encryptedList = encrypt(
+				listMsg,
+				decodeBase64(bridgeNewPubKeyB64),
+				newMobileKeys.secretKey,
+				newMobileKeys.publicKey,
+			);
+			mobileSocket.send(JSON.stringify({ type: "message", payload: encryptedList }));
+
+			// Wait for bridge response encrypted with NEW keys
+			await waitForCondition(() => {
+				return messagesFromBridge.slice(preListCount).some((msg) => {
+					const p = msg["payload"] as JsonRecord | undefined;
+					return (
+						p !== undefined &&
+						typeof p["senderPublicKey"] === "string" &&
+						typeof p["ciphertext"] === "string"
+					);
+				});
+			}, 8000);
+
+			const responseMsg = messagesFromBridge.slice(preListCount).find((msg) => {
+				const p = msg["payload"] as JsonRecord | undefined;
+				return (
+					p !== undefined &&
+					typeof p["senderPublicKey"] === "string" &&
+					typeof p["ciphertext"] === "string"
+				);
+			});
+			const respPayload = responseMsg?.["payload"] as JsonRecord;
+
+			// The response should be encrypted with the bridge's NEW public key
+			expect(respPayload["senderPublicKey"]).toBe(bridgeNewPubKeyB64);
+			expect(respPayload["senderPublicKey"]).not.toBe(bridgeOriginalPubKeyB64);
+
+			// Verify mobile can decrypt with new keys
+			const respPlaintext = decrypt(
+				respPayload as unknown as import("./protocol.js").EncryptedPayload,
+				decodeBase64(respPayload["senderPublicKey"] as string),
+				newMobileKeys.secretKey,
+			);
+			const respParsed = JSON.parse(respPlaintext) as JsonRecord;
+			expect(respParsed["type"]).toBe("runtime_list");
+		} finally {
+			if (mobileSocket?.readyState === WebSocket.OPEN) mobileSocket.close();
+			await bridge.stop();
+		}
+	}, 30_000);
+
+	it("rotation times out and bridge continues with current keys", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+		const messagesFromBridge: JsonRecord[] = [];
+		const logLines: string[] = [];
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+				}
+				if (command["type"] === "list_runtimes") {
+					socket.send(JSON.stringify({ type: "runtime_list", payload: { runtimes: ["claude"] } }));
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "200002" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					relayUplinkSocket?.on("message", (bridgeRaw) => {
+						const bridgeMsg = JSON.parse(bridgeRaw.toString()) as JsonRecord;
+						messagesFromBridge.push(bridgeMsg);
+					});
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-rot-2" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({ type: "paired", mobileDeviceId: "mobile-rot-2" }),
+					);
+					return;
+				}
+
+				if (type === "message" && socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		// Use fake timers with shouldAdvanceTime to allow async I/O while controlling timers
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+			encryptionMode: "opportunistic",
+			keyRotationIntervalMs: 1000,
+			log: (msg) => logLines.push(msg),
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-rot-2",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			// Wait for encryption offer
+			await waitForCondition(
+				() =>
+					messagesFromBridge.some(
+						(msg) =>
+							msg["type"] === "message" &&
+							(msg["payload"] as JsonRecord | undefined)?.["type"] === "encryption_offer",
+					),
+				5000,
+			);
+
+			// Complete initial handshake
+			const mobileKeys = generateKeyPair();
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "encryption_accept", publicKey: encodeBase64(mobileKeys.publicKey) },
+				}),
+			);
+
+			// Let the bridge process the accept
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			const originalPubKey = bridge.encryptionPublicKey;
+
+			// Advance past the rotation interval to trigger rotation
+			await vi.advanceTimersByTimeAsync(1100);
+
+			// Rotation should have been initiated
+			expect(logLines.some((l) => l.includes("Key rotation initiated"))).toBe(true);
+
+			// Do NOT send the ack. Advance past the 30-second timeout.
+			await vi.advanceTimersByTimeAsync(31_000);
+
+			// Bridge should have timed out
+			expect(logLines.some((l) => l.includes("Key rotation timed out, reverting"))).toBe(true);
+
+			// Bridge should still be using original keys
+			expect(bridge.encryptionPublicKey).toBe(originalPubKey);
+		} finally {
+			vi.useRealTimers();
+			if (mobileSocket?.readyState === WebSocket.OPEN) mobileSocket.close();
+			await bridge.stop();
+		}
+	}, 30_000);
+
+	it("re-pairing during rotation clears rotation state", async () => {
+		const sockets: { uplink: WebSocket | null; mobile: WebSocket | null } = {
+			uplink: null,
+			mobile: null,
+		};
+		const messagesFromBridge: JsonRecord[] = [];
+		const logLines: string[] = [];
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					sockets.uplink = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "200003" }));
+					return;
+				}
+
+				if (type === "pair") {
+					sockets.mobile = socket;
+					sockets.uplink?.on("message", (bridgeRaw) => {
+						const bridgeMsg = JSON.parse(bridgeRaw.toString()) as JsonRecord;
+						messagesFromBridge.push(bridgeMsg);
+					});
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-rot-3" }));
+					sockets.uplink?.send(JSON.stringify({ type: "paired", mobileDeviceId: "mobile-rot-3" }));
+					return;
+				}
+
+				if (type === "message" && socket === sockets.mobile) {
+					sockets.uplink?.send(raw.toString());
+				}
+			});
+		});
+
+		// Use fake timers with shouldAdvanceTime to allow async I/O
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+			encryptionMode: "opportunistic",
+			keyRotationIntervalMs: 1000,
+			log: (msg) => logLines.push(msg),
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-rot-3",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			// Wait for encryption offer
+			await waitForCondition(
+				() =>
+					messagesFromBridge.some(
+						(msg) =>
+							msg["type"] === "message" &&
+							(msg["payload"] as JsonRecord | undefined)?.["type"] === "encryption_offer",
+					),
+				5000,
+			);
+
+			// Complete initial handshake
+			const mobileKeys = generateKeyPair();
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "encryption_accept", publicKey: encodeBase64(mobileKeys.publicKey) },
+				}),
+			);
+
+			// Let the bridge process the accept
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			// Advance past rotation interval to trigger rotation
+			await vi.advanceTimersByTimeAsync(1100);
+			expect(logLines.some((l) => l.includes("Key rotation initiated"))).toBe(true);
+
+			// Trigger a re-pair before ack arrives
+			sockets.uplink?.send(JSON.stringify({ type: "paired", mobileDeviceId: "mobile-rot-3-new" }));
+
+			// Wait for the bridge to process the new pairing and send a new offer
+			await waitForCondition(
+				() => logLines.some((l) => l.includes("Rotated encryption keypair for new pairing")),
+				5000,
+			);
+
+			// Wait for the second encryption_offer to arrive
+			await waitForCondition(
+				() =>
+					messagesFromBridge.filter(
+						(msg) =>
+							msg["type"] === "message" &&
+							(msg["payload"] as JsonRecord | undefined)?.["type"] === "encryption_offer",
+					).length >= 2,
+				5000,
+			);
+
+			// A new encryption_offer should have been sent
+			const newOffers = messagesFromBridge.filter(
+				(msg) =>
+					msg["type"] === "message" &&
+					(msg["payload"] as JsonRecord | undefined)?.["type"] === "encryption_offer",
+			);
+			expect(newOffers.length).toBeGreaterThanOrEqual(2);
+		} finally {
+			vi.useRealTimers();
+			if (mobileSocket?.readyState === WebSocket.OPEN) mobileSocket.close();
+			await bridge.stop();
+		}
+	}, 30_000);
+
+	it("transition window clears previousRemotePublicKey after timeout", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+		const messagesFromBridge: JsonRecord[] = [];
+		const logLines: string[] = [];
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+				}
+				if (command["type"] === "list_runtimes") {
+					socket.send(JSON.stringify({ type: "runtime_list", payload: { runtimes: ["claude"] } }));
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "200004" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					relayUplinkSocket?.on("message", (bridgeRaw) => {
+						const bridgeMsg = JSON.parse(bridgeRaw.toString()) as JsonRecord;
+						messagesFromBridge.push(bridgeMsg);
+					});
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-rot-4" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({ type: "paired", mobileDeviceId: "mobile-rot-4" }),
+					);
+					return;
+				}
+
+				if (type === "message" && socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+			encryptionMode: "opportunistic",
+			keyRotationIntervalMs: 500,
+			log: (msg) => logLines.push(msg),
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-rot-4",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			// Wait for the encryption offer
+			await waitForCondition(
+				() =>
+					messagesFromBridge.some(
+						(msg) =>
+							msg["type"] === "message" &&
+							(msg["payload"] as JsonRecord | undefined)?.["type"] === "encryption_offer",
+					),
+				5000,
+			);
+
+			// Complete initial key exchange
+			const mobileKeys = generateKeyPair();
+			const offerMsg = messagesFromBridge.find(
+				(msg) =>
+					msg["type"] === "message" &&
+					(msg["payload"] as JsonRecord | undefined)?.["type"] === "encryption_offer",
+			);
+			const bridgeOriginalPubKeyB64 = (offerMsg?.["payload"] as JsonRecord)["publicKey"] as string;
+			const bridgeOriginalPubKey = decodeBase64(bridgeOriginalPubKeyB64);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "encryption_accept", publicKey: encodeBase64(mobileKeys.publicKey) },
+				}),
+			);
+
+			// Wait for rotation request
+			const preRotationCount = messagesFromBridge.length;
+			await waitForCondition(() => {
+				return messagesFromBridge.slice(preRotationCount).some((msg) => {
+					const p = msg["payload"] as JsonRecord | undefined;
+					if (!p || typeof p["ciphertext"] !== "string") return false;
+					try {
+						const plaintext = decrypt(
+							p as unknown as import("./protocol.js").EncryptedPayload,
+							decodeBase64(p["senderPublicKey"] as string),
+							mobileKeys.secretKey,
+						);
+						return (JSON.parse(plaintext) as JsonRecord)["type"] === "encryption_rotate";
+					} catch {
+						return false;
+					}
+				});
+			}, 8000);
+
+			// Complete the rotation
+			const rotationMsg = messagesFromBridge.slice(preRotationCount).find((msg) => {
+				const p = msg["payload"] as JsonRecord | undefined;
+				if (!p || typeof p["ciphertext"] !== "string") return false;
+				try {
+					const plaintext = decrypt(
+						p as unknown as import("./protocol.js").EncryptedPayload,
+						decodeBase64(p["senderPublicKey"] as string),
+						mobileKeys.secretKey,
+					);
+					return (JSON.parse(plaintext) as JsonRecord)["type"] === "encryption_rotate";
+				} catch {
+					return false;
+				}
+			});
+			const rotPayload = rotationMsg?.["payload"] as JsonRecord;
+			const rotPlaintext = decrypt(
+				rotPayload as unknown as import("./protocol.js").EncryptedPayload,
+				decodeBase64(rotPayload["senderPublicKey"] as string),
+				mobileKeys.secretKey,
+			);
+			const rotParsed = JSON.parse(rotPlaintext) as JsonRecord;
+			const bridgeNewPubKeyB64 = rotParsed["publicKey"] as string;
+			expect(decodeBase64(bridgeNewPubKeyB64)).toHaveLength(32);
+
+			const newMobileKeys = generateKeyPair();
+			const ackPayload = JSON.stringify({
+				type: "encryption_rotate_ack",
+				publicKey: encodeBase64(newMobileKeys.publicKey),
+			});
+			const encryptedAck = encrypt(
+				ackPayload,
+				bridgeOriginalPubKey,
+				mobileKeys.secretKey,
+				mobileKeys.publicKey,
+			);
+			mobileSocket.send(JSON.stringify({ type: "message", payload: encryptedAck }));
+
+			await waitForCondition(() => logLines.some((l) => l.includes("Key rotation complete")), 5000);
+
+			// After rotation, the bridge's secret key has changed. A message encrypted
+			// against the OLD bridge public key uses a stale shared secret and cannot be
+			// decrypted by the bridge, regardless of the transition window for identity.
+			// Use the OLD mobile keys as the sender to simulate a stale peer.
+			const staleMsg = JSON.stringify({ type: "list_runtimes" });
+			const stalePayload = encrypt(
+				staleMsg,
+				bridgeOriginalPubKey,
+				mobileKeys.secretKey,
+				mobileKeys.publicKey,
+			);
+
+			mobileSocket.send(JSON.stringify({ type: "message", payload: stalePayload }));
+
+			// Wait for the bridge to process and reject it
+			await waitForCondition(
+				() =>
+					logLines.some(
+						(l) =>
+							l.includes("encrypted_payload_decode_failed") ||
+							l.includes("Sender public key does not match"),
+					),
+				5000,
+			);
+
+			// The message should have been rejected (either decode failed or sender key mismatch)
+			const rejected = logLines.some(
+				(l) =>
+					l.includes("encrypted_payload_decode_failed") ||
+					l.includes("Sender public key does not match"),
+			);
+			expect(rejected).toBe(true);
+		} finally {
+			if (mobileSocket?.readyState === WebSocket.OPEN) mobileSocket.close();
+			await bridge.stop();
+		}
+	}, 30_000);
 });
 
 async function createWsServer(): Promise<WebSocketServer> {

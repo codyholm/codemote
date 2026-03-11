@@ -158,6 +158,22 @@ export function resolveEncryptionMode(raw: string | undefined): "off" | "opportu
 	return "off";
 }
 
+export function parseKeyRotationInterval(raw: string | undefined): number | undefined {
+	if (raw === undefined || raw === "") return undefined;
+	const parsed = Number.parseInt(raw, 10);
+	if (!Number.isFinite(parsed)) {
+		console.warn(`[Server] Invalid CODEMOTE_KEY_ROTATION_INTERVAL_MS: "${raw}", ignoring`);
+		return undefined;
+	}
+	if (parsed < 0) {
+		console.warn(
+			`[Server] Negative CODEMOTE_KEY_ROTATION_INTERVAL_MS: ${parsed}, treating as disabled`,
+		);
+		return 0;
+	}
+	return parsed;
+}
+
 export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	const {
 		port,
@@ -362,6 +378,9 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		? (advertisedRelayUrl ?? bridgeRelayUrl)
 		: bridgeRelayUrl;
 	const encryptionMode = resolveEncryptionMode(process.env["CODEMOTE_ENCRYPTION"]);
+	const keyRotationIntervalMs = parseKeyRotationInterval(
+		process.env["CODEMOTE_KEY_ROTATION_INTERVAL_MS"],
+	);
 	const bridge = await startRelayUplinkBridge({
 		relayUrl: bridgeRelayUrl,
 		...(localRelayEnabled && relayCertPem ? { relayWsOptions: { ca: relayCertPem } } : {}),
@@ -371,6 +390,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		...(bridgeHostedEndpointUrl ? { hostedEndpointUrl: bridgeHostedEndpointUrl } : {}),
 		...(process.env["GUILD_REMOTE_DEBUG"] ? { log: (message) => console.log(message) } : {}),
 		encryptionMode,
+		...(keyRotationIntervalMs !== undefined ? { keyRotationIntervalMs } : {}),
 		onPairingCode: (pin) => {
 			currentPIN = pin;
 			writeStatusSafely(

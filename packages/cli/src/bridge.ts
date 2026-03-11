@@ -7,7 +7,13 @@ import { WebSocket } from "ws";
 import { decodeBase64, decrypt, encodeBase64, encrypt, generateKeyPair } from "./encryption.js";
 import type { KeyPair } from "./encryption.js";
 import { WS_MAX_PAYLOAD_BYTES } from "./messageLimits.js";
-import type { EncryptedPayload, EncryptionAccept, EncryptionOffer } from "./protocol.js";
+import type {
+	EncryptedPayload,
+	EncryptionAccept,
+	EncryptionOffer,
+	EncryptionRotate,
+	EncryptionRotateAck,
+} from "./protocol.js";
 import { ReplayGuard } from "./replayProtection.js";
 import { detectTailscaleEndpoint } from "./tailscale.js";
 import { validateEncryptedPayload } from "./validateEncryptedPayload.js";
@@ -344,6 +350,8 @@ export interface RelayUplinkBridgeConfig {
 	 * - "required": Not yet implemented (server.ts normalizes to "opportunistic")
 	 */
 	encryptionMode?: "off" | "opportunistic" | "required";
+	/** How often to rotate E2E keys in ms. 0 disables rotation. Default: 30 minutes. */
+	keyRotationIntervalMs?: number;
 	onPairingCode?: (code: string) => void;
 	onMobilePaired?: () => void;
 	onMobileDisconnected?: () => void;
@@ -765,6 +773,109 @@ export async function startRelayUplinkBridge(
 		log?.(`[Bridge] E2E encryption mode: ${encryptionMode}, keypair generated`);
 	}
 
+	// Key rotation state
+	const DEFAULT_KEY_ROTATION_INTERVAL_MS = 30 * 60 * 1000;
+	const ROTATION_TIMEOUT_MS = 30_000;
+	// Identity safety net during transition: the bridge validates that the sender's
+	// key matches a known peer (current or previous). After handleRotateAck() switches
+	// encryptionKeys, the bridge cannot decrypt messages encrypted with the OLD shared
+	// secret because the old secretKey is discarded. WebSocket ordering guarantees no
+	// iOS message encrypted with old keys arrives after the ack (the ack is the last
+	// message iOS sends with old keys). The 60-second timer is a safety margin, not
+	// a decryption fallback.
+	let previousRemotePublicKey: Uint8Array | undefined;
+	let rotationPendingKeys: KeyPair | undefined;
+	let rotationTimer: ReturnType<typeof setInterval> | undefined;
+	let rotationTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+	let rotationCleanupTimer: ReturnType<typeof setTimeout> | undefined;
+
+	function clearRotationTimer(): void {
+		if (rotationTimer) {
+			clearInterval(rotationTimer);
+			rotationTimer = undefined;
+		}
+	}
+
+	function clearRotationTimeout(): void {
+		if (rotationTimeoutTimer) {
+			clearTimeout(rotationTimeoutTimer);
+			rotationTimeoutTimer = undefined;
+		}
+	}
+
+	function scheduleRotationTimer(): void {
+		clearRotationTimer();
+		const intervalMs = config.keyRotationIntervalMs ?? DEFAULT_KEY_ROTATION_INTERVAL_MS;
+		if (intervalMs <= 0 || encryptionMode === "off") return;
+		rotationTimer = setInterval(() => {
+			void initiateKeyRotation();
+		}, intervalMs);
+	}
+
+	function initiateKeyRotation(): void {
+		if (rotationPendingKeys) return; // rotation already in progress
+		if (!remotePublicKey || !encryptionKeys) return; // encryption not active
+
+		rotationPendingKeys = generateKeyPair();
+		const rotatePayload: EncryptionRotate = {
+			type: "encryption_rotate",
+			publicKey: encodeBase64(rotationPendingKeys.publicKey),
+		};
+		const plainJson = JSON.stringify(rotatePayload);
+		const encryptedPayload = encrypt(
+			plainJson,
+			remotePublicKey,
+			encryptionKeys.secretKey,
+			encryptionKeys.publicKey,
+		);
+		relayWs.send(JSON.stringify({ type: "message", payload: encryptedPayload }));
+		log?.("[Bridge] Key rotation initiated");
+
+		rotationTimeoutTimer = setTimeout(() => {
+			log?.("[Bridge] Key rotation timed out, reverting");
+			rotationPendingKeys = undefined;
+			rotationTimeoutTimer = undefined;
+		}, ROTATION_TIMEOUT_MS);
+	}
+
+	function handleRotateAck(ack: EncryptionRotateAck): void {
+		if (typeof ack.publicKey !== "string") {
+			log?.("[Bridge] encryption_rotate_ack: missing or invalid publicKey");
+			return;
+		}
+		let peerKey: Uint8Array;
+		try {
+			peerKey = decodeBase64(ack.publicKey);
+		} catch {
+			log?.("[Bridge] encryption_rotate_ack: failed to decode publicKey");
+			return;
+		}
+		if (peerKey.length !== 32) {
+			log?.(`[Bridge] encryption_rotate_ack: invalid key length ${peerKey.length}`);
+			return;
+		}
+		if (!rotationPendingKeys) {
+			log?.("[Bridge] encryption_rotate_ack: no pending rotation, ignoring stale ack");
+			return;
+		}
+
+		clearRotationTimeout();
+		previousRemotePublicKey = remotePublicKey;
+		remotePublicKey = peerKey;
+		encryptionKeys = rotationPendingKeys;
+		encryptionPublicKeyBase64 = encodeBase64(rotationPendingKeys.publicKey);
+		rotationPendingKeys = undefined;
+		log?.("[Bridge] Key rotation complete");
+
+		if (rotationCleanupTimer) clearTimeout(rotationCleanupTimer);
+		rotationCleanupTimer = setTimeout(() => {
+			rotationCleanupTimer = undefined;
+			previousRemotePublicKey = undefined;
+		}, 60_000);
+
+		scheduleRotationTimer();
+	}
+
 	// Wire automatic decryption — closure checks current remotePublicKey at call time
 	const decryptEncryptedPayload =
 		decryptEncryptedPayloadOverride ??
@@ -774,7 +885,14 @@ export async function startRelayUplinkBridge(
 						throw new Error("Encryption keys not yet exchanged");
 					}
 					const senderPubKey = decodeBase64(payload.senderPublicKey);
-					if (!timingSafeEqual(Buffer.from(senderPubKey), Buffer.from(remotePublicKey))) {
+					const matchesCurrent = timingSafeEqual(
+						Buffer.from(senderPubKey),
+						Buffer.from(remotePublicKey),
+					);
+					const matchesPrevious = previousRemotePublicKey
+						? timingSafeEqual(Buffer.from(senderPubKey), Buffer.from(previousRemotePublicKey))
+						: false;
+					if (!matchesCurrent && !matchesPrevious) {
 						throw new Error("Sender public key does not match expected peer");
 					}
 					const plaintext = decrypt(payload, senderPubKey, encryptionKeys.secretKey);
@@ -883,9 +1001,17 @@ export async function startRelayUplinkBridge(
 					sendSessionList();
 					void sendDeviceInfoToMobile();
 
-					// Clear stale encryption state from previous pairing (key rotation)
+					// Clear stale encryption + rotation state from previous pairing
 					if (encryptionMode !== "off") {
 						remotePublicKey = undefined;
+						previousRemotePublicKey = undefined;
+						rotationPendingKeys = undefined;
+						clearRotationTimer();
+						clearRotationTimeout();
+						if (rotationCleanupTimer) {
+							clearTimeout(rotationCleanupTimer);
+							rotationCleanupTimer = undefined;
+						}
 						encryptionKeys = generateKeyPair();
 						encryptionPublicKeyBase64 = encodeBase64(encryptionKeys.publicKey);
 						log?.("[Bridge] Rotated encryption keypair for new pairing");
@@ -939,6 +1065,7 @@ export async function startRelayUplinkBridge(
 						}
 						remotePublicKey = peerKey;
 						log?.("[Bridge] E2E encryption activated (received encryption_accept)");
+						scheduleRotationTimer();
 						return;
 					}
 				}
@@ -960,6 +1087,23 @@ export async function startRelayUplinkBridge(
 					} catch {
 						dropMessage("encrypted_payload_decode_failed");
 						return;
+					}
+
+					// Check for rotation control messages after decryption
+					if (
+						typeof inboundPayload === "object" &&
+						inboundPayload !== null &&
+						"type" in inboundPayload
+					) {
+						const controlType = (inboundPayload as { type: string }).type;
+						if (controlType === "encryption_rotate_ack") {
+							handleRotateAck(inboundPayload as EncryptionRotateAck);
+							return;
+						}
+						if (controlType === "encryption_rotate") {
+							log?.("[Bridge] Ignoring encryption_rotate from mobile (bridge is sole initiator)");
+							return;
+						}
 					}
 				}
 
@@ -1825,6 +1969,12 @@ export async function startRelayUplinkBridge(
 		startSession,
 		refreshPairingCode,
 		stop: async () => {
+			clearRotationTimer();
+			clearRotationTimeout();
+			if (rotationCleanupTimer) {
+				clearTimeout(rotationCleanupTimer);
+				rotationCleanupTimer = undefined;
+			}
 			await uplinkClient.close();
 			if (relayWs.readyState === WebSocket.OPEN) {
 				relayWs.close();
