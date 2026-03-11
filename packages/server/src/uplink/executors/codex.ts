@@ -147,7 +147,13 @@ export class CodexExecutor extends BaseExecutor {
 		const maxTokens =
 			typeof options.maxTokens === "number" && options.maxTokens > 0 ? options.maxTokens : null;
 		const isGitRepo = await this.checkIsGitRepo(session.workspace.workingDir);
-		const args = this.buildExecArgs(options.initialPrompt, model, temperature, maxTokens, isGitRepo);
+		const args = this.buildExecArgs(
+			options.initialPrompt,
+			model,
+			temperature,
+			maxTokens,
+			isGitRepo,
+		);
 		const codexSession = this.createCodexSession(null, model, temperature, maxTokens);
 
 		this.codexSessions.set(session.id, codexSession);
@@ -323,7 +329,7 @@ export class CodexExecutor extends BaseExecutor {
 		model: string | null,
 		temperature: number | null = null,
 		maxTokens: number | null = null,
-		isGitRepo: boolean = true,
+		isGitRepo = true,
 	): string[] {
 		const args: string[] = [
 			"--ask-for-approval",
@@ -363,7 +369,7 @@ export class CodexExecutor extends BaseExecutor {
 		model: string | null,
 		temperature: number | null = null,
 		maxTokens: number | null = null,
-		isGitRepo: boolean = true,
+		isGitRepo = true,
 	): string[] {
 		const args: string[] = [
 			"--ask-for-approval",
