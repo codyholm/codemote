@@ -353,6 +353,68 @@ exit 0
 		activeSessionId = null;
 	});
 
+	it("passes --temperature and --max-tokens when provided and preserves them on resume", async () => {
+		const argsLogPath = join(testDir, "codex-args.log");
+		const tempMockPath = join(testDir, "mock-codex-temp");
+		const tempScript = `#!/bin/sh
+echo "$@" >> "${argsLogPath}"
+
+thread_id="mock-thread"
+previous=""
+for arg in "$@"; do
+	if [ "$previous" = "resume" ]; then
+		thread_id="$arg"
+		break
+	fi
+	previous="$arg"
+done
+
+echo '{"type":"thread.started","thread_id":"'"$thread_id"'"}'
+sleep 0.1
+echo '{"type":"session.id","session_id":"'"$thread_id"'"}'
+sleep 0.1
+echo '{"type":"turn.started"}'
+sleep 0.1
+echo '{"type":"turn.completed"}'
+exit 0
+`;
+		await writeFile(tempMockPath, tempScript);
+		await chmod(tempMockPath, 0o755);
+
+		activeExecutor = new CodexExecutor(workspaceManager, sessionManager, eventBus, {
+			codexPath: tempMockPath,
+		});
+
+		const result = await activeExecutor.startRun({
+			profile: "codex",
+			workspace: testDir,
+			initialPrompt: "Hello",
+			temperature: 0.5,
+			maxTokens: 4096,
+		});
+		activeSessionId = result.sessionId;
+
+		await waitFor(() => sessionManager.get(result.sessionId)?.runtimeSessionId === "mock-thread");
+		await waitFor(() => sessionManager.get(result.sessionId)?.status === "ended");
+		expect(sessionManager.get(result.sessionId)?.status).toBe("ended");
+
+		await activeExecutor.sendInput(result.sessionId, "Follow-up");
+		await waitFor(() => sessionManager.get(result.sessionId)?.status === "ended");
+
+		const argsLog = await readFile(argsLogPath, "utf8");
+		const lines = argsLog.split("\n").filter(Boolean);
+		expect(lines.length).toBeGreaterThanOrEqual(2);
+		expect(
+			lines.filter((line) => line.includes("--temperature 0.5")).length,
+		).toBeGreaterThanOrEqual(2);
+		expect(
+			lines.filter((line) => line.includes("--max-tokens 4096")).length,
+		).toBeGreaterThanOrEqual(2);
+		expect(argsLog).toContain("exec resume mock-thread --json");
+
+		activeSessionId = null;
+	});
+
 	it("preserves parentToolUseId metadata on structured events", async () => {
 		const parentMockPath = join(testDir, "mock-codex-parent");
 		const parentScript = `#!/bin/sh

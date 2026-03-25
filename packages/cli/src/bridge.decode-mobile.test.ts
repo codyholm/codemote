@@ -1,0 +1,98 @@
+import { describe, expect, it } from "vitest";
+import { decodeMobileInbound } from "./bridge.js";
+
+function asRecord(value: unknown): Record<string, unknown> {
+	return value as Record<string, unknown>;
+}
+
+describe("decodeMobileInbound", () => {
+	describe("new_session temperature validation", () => {
+		const base = { type: "new_session", runtime: "claude", prompt: "test" };
+
+		it("accepts valid temperature values", () => {
+			expect(decodeMobileInbound({ ...base, temperature: 0 })).toMatchObject({ temperature: 0 });
+			expect(decodeMobileInbound({ ...base, temperature: 1 })).toMatchObject({ temperature: 1 });
+			expect(decodeMobileInbound({ ...base, temperature: 2 })).toMatchObject({ temperature: 2 });
+			expect(decodeMobileInbound({ ...base, temperature: 0.7 })).toMatchObject({
+				temperature: 0.7,
+			});
+		});
+
+		it("rejects temperature above 2", () => {
+			const result = decodeMobileInbound({ ...base, temperature: 2.1 });
+			expect(result).not.toBeNull();
+			expect(asRecord(result)["temperature"]).toBeUndefined();
+		});
+
+		it("rejects negative temperature", () => {
+			const result = decodeMobileInbound({ ...base, temperature: -0.1 });
+			expect(result).not.toBeNull();
+			expect(asRecord(result)["temperature"]).toBeUndefined();
+		});
+
+		it("rejects NaN temperature", () => {
+			const result = decodeMobileInbound({ ...base, temperature: Number.NaN });
+			expect(result).not.toBeNull();
+			expect(asRecord(result)["temperature"]).toBeUndefined();
+		});
+
+		it("rejects Infinity temperature", () => {
+			const result = decodeMobileInbound({ ...base, temperature: Number.POSITIVE_INFINITY });
+			expect(result).not.toBeNull();
+			expect(asRecord(result)["temperature"]).toBeUndefined();
+		});
+
+		it("rejects non-number temperature", () => {
+			const result = decodeMobileInbound({ ...base, temperature: "0.5" });
+			expect(result).not.toBeNull();
+			expect(asRecord(result)["temperature"]).toBeUndefined();
+		});
+
+		it("omits temperature when not provided", () => {
+			const result = decodeMobileInbound(base);
+			expect(result).not.toBeNull();
+			expect(asRecord(result)["temperature"]).toBeUndefined();
+		});
+	});
+
+	describe("new_session maxTokens validation", () => {
+		const base = { type: "new_session", runtime: "claude", prompt: "test" };
+
+		it("accepts valid maxTokens values", () => {
+			expect(decodeMobileInbound({ ...base, maxTokens: 1 })).toMatchObject({ maxTokens: 1 });
+			expect(decodeMobileInbound({ ...base, maxTokens: 4096 })).toMatchObject({
+				maxTokens: 4096,
+			});
+		});
+
+		it("rejects zero maxTokens", () => {
+			const result = decodeMobileInbound({ ...base, maxTokens: 0 });
+			expect(result).not.toBeNull();
+			expect(asRecord(result)["maxTokens"]).toBeUndefined();
+		});
+
+		it("rejects negative maxTokens", () => {
+			const result = decodeMobileInbound({ ...base, maxTokens: -1 });
+			expect(result).not.toBeNull();
+			expect(asRecord(result)["maxTokens"]).toBeUndefined();
+		});
+
+		it("rejects non-integer maxTokens", () => {
+			const result = decodeMobileInbound({ ...base, maxTokens: 1.5 });
+			expect(result).not.toBeNull();
+			expect(asRecord(result)["maxTokens"]).toBeUndefined();
+		});
+
+		it("rejects non-number maxTokens", () => {
+			const result = decodeMobileInbound({ ...base, maxTokens: "4096" });
+			expect(result).not.toBeNull();
+			expect(asRecord(result)["maxTokens"]).toBeUndefined();
+		});
+
+		it("omits maxTokens when not provided", () => {
+			const result = decodeMobileInbound(base);
+			expect(result).not.toBeNull();
+			expect(asRecord(result)["maxTokens"]).toBeUndefined();
+		});
+	});
+});

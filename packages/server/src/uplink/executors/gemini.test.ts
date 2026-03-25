@@ -247,6 +247,35 @@ printf '{"type":"result","timestamp":"2026-01-01T00:00:02Z","status":"success"}\
 		activeSessionId = null;
 	});
 
+	it("passes --temperature and --max-tokens when provided and preserves them across turns", async () => {
+		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
+			geminiPath: mockGeminiPath,
+		});
+
+		const result = await activeExecutor.startRun({
+			profile: "gemini",
+			workspace: testDir,
+			initialPrompt: "Initial prompt",
+			temperature: 0.3,
+			maxTokens: 2048,
+		});
+		activeSessionId = result.sessionId;
+
+		await activeExecutor.sendInput(result.sessionId, "Follow-up prompt");
+
+		const argsLog = await readFile(argsLogPath, "utf8");
+		const lines = argsLog.split("\n").filter(Boolean);
+		expect(lines.length).toBeGreaterThanOrEqual(2);
+		expect(
+			lines.filter((line) => line.includes("--temperature 0.3")).length,
+		).toBeGreaterThanOrEqual(2);
+		expect(
+			lines.filter((line) => line.includes("--max-tokens 2048")).length,
+		).toBeGreaterThanOrEqual(2);
+
+		activeSessionId = null;
+	});
+
 	it("maps tool_use and tool_result events to session.tool_call and session.tool_result", async () => {
 		const toolMockPath = join(testDir, "mock-gemini-tool");
 		const toolMockScript = `#!/bin/bash

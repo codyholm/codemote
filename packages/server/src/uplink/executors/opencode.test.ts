@@ -185,6 +185,35 @@ exit 0
 		);
 	});
 
+	it("passes --temperature and --max-tokens when provided and preserves them across turns", async () => {
+		activeExecutor = new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
+			opencodePath: mockOpenCodePath,
+		});
+
+		const result = await activeExecutor.startRun({
+			profile: "opencode",
+			workspace: testDir,
+			initialPrompt: "initial-prompt",
+			temperature: 1.0,
+			maxTokens: 8192,
+		});
+		activeSessionId = result.sessionId;
+
+		await activeExecutor.sendInput(result.sessionId, "follow-up-prompt");
+
+		const argsLog = await readFile(argsLogPath, "utf8");
+		const lines = argsLog.split("\n").filter(Boolean);
+		expect(lines.length).toBeGreaterThanOrEqual(2);
+		expect(lines.filter((line) => line.includes("--temperature 1")).length).toBeGreaterThanOrEqual(
+			2,
+		);
+		expect(
+			lines.filter((line) => line.includes("--max-tokens 8192")).length,
+		).toBeGreaterThanOrEqual(2);
+
+		activeSessionId = null;
+	});
+
 	it("emits tool_call + tool_result and git.diff_updated for tool_use events", async () => {
 		activeExecutor = new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
 			opencodePath: mockOpenCodePath,

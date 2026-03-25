@@ -2134,7 +2134,8 @@ function decodeRelayInbound(raw: unknown): RelayInboundMessage | null {
 	return null;
 }
 
-function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
+/** Exported for testing only — not re-exported from index.ts. */
+export function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 	if (typeof payload !== "object" || payload === null) {
 		return null;
 	}
