@@ -9,7 +9,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
 import { type ServerHandle, startServer } from "./server.js";
 
-describe("Server Integration", () => {
+// Every test here starts a real relay + uplink + bridge: TLS cert work, Fastify
+// listening on several interfaces, then a full teardown. Individually they run in
+// roughly 2-5s, which sits close enough to vitest's 5000ms default that a loaded
+// full-suite run intermittently trips one — and not always the same one. The
+// suite-wide timeout reflects what these tests actually do. A retry wrapper was
+// considered and rejected: it would also mask a genuine hang.
+describe("Server Integration", { timeout: 30000 }, () => {
 	let server: ServerHandle | null = null;
 	const testPort = 18080; // Use high port to avoid conflicts
 
@@ -197,6 +203,7 @@ describe("Server Integration", () => {
 			server = null; // Prevent double cleanup
 		});
 
+		// Two full start/stop cycles rather than one, so this is the slowest test here.
 		it("should handle multiple start/stop cycles", async () => {
 			// Start first instance
 			server = await startServer({
