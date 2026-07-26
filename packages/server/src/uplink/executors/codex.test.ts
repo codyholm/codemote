@@ -12,7 +12,7 @@ async function waitFor(condition: () => boolean, timeoutMs = 5000, intervalMs = 
 	const start = Date.now();
 	while (!condition()) {
 		if (Date.now() - start > timeoutMs) {
-			throw new Error("Condition not met within timeout");
+			throw new Error(`Condition not met within ${timeoutMs}ms`);
 		}
 		await new Promise((r) => setTimeout(r, intervalMs));
 	}

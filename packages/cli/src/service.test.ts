@@ -266,4 +266,56 @@ describe("service", () => {
 		expect(status.logFile).toBe(paths.logFile);
 		expect(status.statusFile).toBe(paths.statusFile);
 	});
+
+	// Regression guard. `launchctl unload -w` writes a persistent disabled override that
+	// survives logout and reboot, so a stop used to mean the service never came back until
+	// someone ran start by hand — RunAtLoad and KeepAlive cannot recover from it. That took
+	// the service down silently in the field. Stopping must leave the agent enabled;
+	// permanently disabling it is `uninstall`.
+	it("stops the launch agent without writing a persistent disable flag", async () => {
+		const originalPlatform = process.platform;
+		Object.defineProperty(process, "platform", { value: "darwin" });
+
+		const spawnMock = vi.fn().mockImplementation(() => {
+			const child = new EventEmitter() as unknown as EventEmitter & {
+				stdout: EventEmitter;
+				stderr: EventEmitter;
+			};
+			child.stdout = new EventEmitter();
+			child.stderr = new EventEmitter();
+			queueMicrotask(() => {
+				child.emit("close", 0);
+			});
+			return child;
+		});
+
+		vi.resetModules();
+		vi.doMock("node:child_process", async () => {
+			const actual =
+				await vi.importActual<typeof import("node:child_process")>("node:child_process");
+			return { ...actual, spawn: spawnMock };
+		});
+
+		try {
+			const { stopService: stopServiceMac, resolveServicePaths: resolveServicePathsMac } =
+				await import("./service.js");
+			const macPaths = resolveServicePathsMac();
+
+			await stopServiceMac();
+
+			const launchctlArgs = spawnMock.mock.calls
+				.filter(([command]) => command === "launchctl")
+				.map(([, args]) => args as string[]);
+
+			expect(launchctlArgs).toContainEqual(["stop", "app.codemote.service"]);
+			expect(launchctlArgs).toContainEqual(["unload", macPaths.launchAgentPlist]);
+			for (const args of launchctlArgs) {
+				expect(args).not.toContain("-w");
+			}
+		} finally {
+			Object.defineProperty(process, "platform", { value: originalPlatform });
+			vi.resetModules();
+			vi.doUnmock("node:child_process");
+		}
+	});
 });

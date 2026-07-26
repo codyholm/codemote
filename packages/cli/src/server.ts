@@ -111,6 +111,9 @@ interface RelayStats {
 	version: string;
 }
 
+/** Notified when relay room membership changes. */
+type ConnectionsChangedHandler = (stats: { rooms: number; connections: number }) => void;
+
 /**
  * Start a combined relay + uplink server with PIN-based pairing
  *
@@ -252,10 +255,16 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 	let relay: Awaited<ReturnType<typeof createRelayServer>> | null = null;
 
+	// Assigned once the status writer below is ready. The relay can emit membership
+	// changes before that point; dropping those is safe because the initial status
+	// write records whatever the current state is.
+	let handleConnectionsChanged: ConnectionsChangedHandler | undefined;
+
 	if (localRelayEnabled) {
 		const relayConfig: Partial<RelayServerConfig> = {
 			port,
 			host: "0.0.0.0",
+			onConnectionsChanged: (stats) => handleConnectionsChanged?.(stats),
 			...(pairingStorePath ? { pairingStorePath } : {}),
 			...(tlsInfo ? { tls: { keyPath: tlsInfo.keyPath, certPath: tlsInfo.certPath } } : {}),
 		};
@@ -429,65 +438,19 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		...(relayTlsPin ? { tlsPin: relayTlsPin } : {}),
 	});
 
-	const fetchLocalRelayStats = async (): Promise<{
-		rooms: number;
-		connections: number;
-		version: string;
-	}> =>
-		new Promise((resolve, reject) => {
-			const request = (tlsDisabled ? http : https).request(
-				{
-					method: "GET",
-					host: "localhost",
-					port,
-					path: "/health",
-					...(relayCertPem ? { ca: relayCertPem, servername: "localhost" } : {}),
-				},
-				(res) => {
-					if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-						reject(new Error(`Health check failed: ${res.statusCode ?? "unknown"}`));
-						return;
-					}
-
-					let body = "";
-					res.setEncoding("utf8");
-					res.on("data", (chunk) => {
-						body += chunk;
-					});
-					res.on("end", () => {
-						try {
-							const parsed = JSON.parse(body) as {
-								rooms: number;
-								connections: number;
-								version: string;
-							};
-							resolve(parsed);
-						} catch (err) {
-							reject(err instanceof Error ? err : new Error(String(err)));
-						}
-					});
-				},
-			);
-			request.on("error", (err) => reject(err));
-			request.end();
-		});
-
-	const mobileConnectionPoll =
-		localRelayEnabled && statusFilePath
-			? setInterval(() => {
-					void fetchLocalRelayStats()
-						.then((stats) => {
-							const mobileConnected = stats.connections > 1;
-							if (statusState.mobileConnected !== mobileConnected) {
-								writeStatusSafely({ mobileConnected }, "mobile_connection_poll");
-							}
-						})
-						.catch(() => {
-							// Ignore transient local relay health failures.
-						});
-				}, 1000)
-			: null;
-	mobileConnectionPoll?.unref?.();
+	// Mobile connection state comes from relay membership events, not polling.
+	// Every join/leave funnels through RoomManager, so this is exact and costs nothing
+	// while idle. It previously issued an HTTP request to our own /health endpoint once
+	// per second to derive this single boolean.
+	if (localRelayEnabled && statusFilePath) {
+		handleConnectionsChanged = (stats) => {
+			// The uplink bridge occupies one connection, so >1 means a mobile is present.
+			const mobileConnected = stats.connections > 1;
+			if (statusState.mobileConnected !== mobileConnected) {
+				writeStatusSafely({ mobileConnected }, "relay_membership_change");
+			}
+		};
+	}
 
 	console.log("[Server] Pairing PIN ready (redacted)");
 
@@ -510,9 +473,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 			if (refreshSignalPath) {
 				unwatchFile(refreshSignalPath);
 			}
-			if (mobileConnectionPoll) {
-				clearInterval(mobileConnectionPoll);
-			}
+			handleConnectionsChanged = undefined;
 			await bridge.stop();
 			await Promise.all([relay?.stop(), uplink.stop()]);
 			await writeStatus({ running: false, stoppedAt: new Date().toISOString() });
@@ -528,18 +489,12 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 				};
 			}
 
-			try {
-				const data = await fetchLocalRelayStats();
-				return {
-					rooms: data.rooms,
-					connections: data.connections,
-					version: data.version,
-				};
-			} catch (error) {
-				throw new Error(
-					`Failed to get relay stats: ${error instanceof Error ? error.message : "unknown error"}`,
-				);
-			}
+			const data = relay.stats();
+			return {
+				rooms: data.rooms,
+				connections: data.connections,
+				version: data.version,
+			};
 		},
 
 		async regeneratePIN() {

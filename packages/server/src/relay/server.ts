@@ -6,7 +6,7 @@ import Fastify from "fastify";
 import { RELAY_VERSION } from "./index.js";
 import { registerWebSocketRoutes } from "./routes/ws.js";
 import { PairingCodeService } from "./services/codes.js";
-import { RoomManager } from "./services/rooms.js";
+import { RoomManager, type RoomStats } from "./services/rooms.js";
 import { type TrustedPairingRecord, TrustedPairingsStore } from "./services/trusted-pairings.js";
 
 export interface RelayServerTLSConfig {
@@ -19,6 +19,11 @@ export interface RelayServerTLSConfig {
 /**
  * Configuration for the relay server
  */
+/** Relay stats with the relay version attached, as reported by the server handle. */
+export interface RelayStatsSnapshot extends RoomStats {
+	version: string;
+}
+
 export interface RelayServerConfig {
 	/** Port to listen on (default: 8080) */
 	port: number;
@@ -28,6 +33,11 @@ export interface RelayServerConfig {
 	pairingStorePath?: string;
 	/** Optional TLS config (enables HTTPS/WSS) */
 	tls?: RelayServerTLSConfig;
+	/**
+	 * Called whenever room membership changes, with the resulting stats.
+	 * Lets callers track connection state from events instead of polling.
+	 */
+	onConnectionsChanged?: (stats: RoomStats) => void;
 }
 
 const DEFAULT_CONFIG: RelayServerConfig = {
@@ -79,7 +89,9 @@ export async function createRelayServer(config: Partial<RelayServerConfig> = {})
 
 	// Initialize services
 	const codes = new PairingCodeService();
-	const rooms = new RoomManager();
+	const rooms = new RoomManager(
+		cfg.onConnectionsChanged ? { onChange: cfg.onConnectionsChanged } : {},
+	);
 	const trustedPairingsEnabled = !["0", "false"].includes(
 		(process.env["CODEMOTE_TRUSTED_PAIRINGS"] ?? "").toLowerCase(),
 	);
@@ -100,8 +112,10 @@ export async function createRelayServer(config: Partial<RelayServerConfig> = {})
 		app.log.info("[relay] trusted-pair-store disabled");
 	}
 
-	// Health check endpoint
-	app.get("/health", async () => {
+	// Health check endpoint.
+	// logLevel: "silent" keeps liveness probes out of the request log — they are
+	// high-frequency and low-information, and logging them buries real events.
+	app.get("/health", { logLevel: "silent" }, async () => {
 		const stats = rooms.stats();
 		return {
 			status: "ok",
@@ -129,6 +143,8 @@ export async function createRelayServer(config: Partial<RelayServerConfig> = {})
 
 	return {
 		app,
+		/** Current room/connection counts plus relay version, read in-process. */
+		stats: (): RelayStatsSnapshot => ({ ...rooms.stats(), version: RELAY_VERSION }),
 		listTrustedDevices: (uplinkDeviceId: string): TrustedPairingRecord[] =>
 			trustedPairings.listForUplink(uplinkDeviceId),
 		revokeTrustedDevice: (uplinkDeviceId: string, mobileDeviceId: string): boolean =>

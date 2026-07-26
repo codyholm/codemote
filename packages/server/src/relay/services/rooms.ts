@@ -24,11 +24,38 @@ export interface RoomMember {
  * Rooms are identified by the uplink device ID. When a mobile pairs with an uplink,
  * it joins the uplink's room and messages are forwarded to other members in that room.
  */
+export interface RoomStats {
+	rooms: number;
+	connections: number;
+}
+
+export interface RoomManagerOptions {
+	/**
+	 * Called after membership changes. Every join/leave funnels through this class,
+	 * so this is sufficient to track connection count without polling.
+	 */
+	onChange?: (stats: RoomStats) => void;
+}
+
 export class RoomManager {
 	// roomId -> members (keyed by deviceId)
 	private readonly rooms = new Map<string, Map<string, RoomMember>>();
 	// deviceId -> roomId (for quick lookup)
 	private readonly deviceToRoom = new Map<string, string>();
+	private readonly onChange: ((stats: RoomStats) => void) | undefined;
+
+	constructor(options: RoomManagerOptions = {}) {
+		this.onChange = options.onChange;
+	}
+
+	private notifyChange(): void {
+		if (!this.onChange) return;
+		try {
+			this.onChange(this.stats());
+		} catch {
+			// A listener must never break room membership handling.
+		}
+	}
 
 	/**
 	 * Create or join a room.
@@ -60,6 +87,7 @@ export class RoomManager {
 		logDebug(
 			`[Room ${roomId.slice(0, 8)}...] ${member.type} joined (${member.deviceId.slice(0, 8)}...)`,
 		);
+		this.notifyChange();
 	}
 
 	/**
@@ -85,6 +113,7 @@ export class RoomManager {
 
 		this.deviceToRoom.delete(deviceId);
 		logDebug(`[Room ${roomId.slice(0, 8)}...] Member left (${deviceId.slice(0, 8)}...)`);
+		this.notifyChange();
 	}
 
 	/**

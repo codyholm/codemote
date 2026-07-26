@@ -281,4 +281,83 @@ describe("RoomManager", () => {
 			expect(manager.getRoomId("pk_known")).toBe("room-xyz");
 		});
 	});
+
+	// Callers rely on these notifications to track connection state instead of
+	// polling, so a missed or spurious fire shows up as a wrong "mobile connected"
+	// indicator that never self-corrects.
+	describe("onChange notifications", () => {
+		it("fires on join with the resulting stats", () => {
+			const onChange = vi.fn();
+			const watched = new RoomManager({ onChange });
+
+			watched.join("room-1", { ws: createMockWebSocket(), deviceId: "uplink-1", type: "uplink" });
+			expect(onChange).toHaveBeenCalledTimes(1);
+			expect(onChange).toHaveBeenLastCalledWith({ rooms: 1, connections: 1 });
+
+			watched.join("room-1", { ws: createMockWebSocket(), deviceId: "mobile-1", type: "mobile" });
+			expect(onChange).toHaveBeenCalledTimes(2);
+			expect(onChange).toHaveBeenLastCalledWith({ rooms: 1, connections: 2 });
+		});
+
+		it("fires on leave with the resulting stats", () => {
+			const onChange = vi.fn();
+			const watched = new RoomManager({ onChange });
+			watched.join("room-1", { ws: createMockWebSocket(), deviceId: "uplink-1", type: "uplink" });
+			watched.join("room-1", { ws: createMockWebSocket(), deviceId: "mobile-1", type: "mobile" });
+			onChange.mockClear();
+
+			watched.leave("mobile-1");
+			expect(onChange).toHaveBeenCalledTimes(1);
+			expect(onChange).toHaveBeenLastCalledWith({ rooms: 1, connections: 1 });
+
+			// Emptying the room drops it entirely.
+			watched.leave("uplink-1");
+			expect(onChange).toHaveBeenLastCalledWith({ rooms: 0, connections: 0 });
+		});
+
+		it("does not fire when a stale socket's close callback arrives late", () => {
+			const onChange = vi.fn();
+			const watched = new RoomManager({ onChange });
+			const staleWs = createMockWebSocket();
+			watched.join("room-1", { ws: staleWs, deviceId: "mobile-1", type: "mobile" });
+
+			// Reconnect replaces the membership with a live socket.
+			const liveWs = createMockWebSocket();
+			watched.join("room-1", { ws: liveWs, deviceId: "mobile-1", type: "mobile" });
+			onChange.mockClear();
+
+			// The old socket's close handler fires afterwards. The device is still
+			// connected via liveWs, so this must not report a disconnect.
+			watched.leave("mobile-1", staleWs);
+			expect(onChange).not.toHaveBeenCalled();
+			expect(watched.stats()).toEqual({ rooms: 1, connections: 1 });
+		});
+
+		it("does not fire when leaving a device that was never in a room", () => {
+			const onChange = vi.fn();
+			const watched = new RoomManager({ onChange });
+
+			watched.leave("never-joined");
+			expect(onChange).not.toHaveBeenCalled();
+		});
+
+		it("keeps room state intact when a listener throws", () => {
+			const onChange = vi.fn(() => {
+				throw new Error("listener blew up");
+			});
+			const watched = new RoomManager({ onChange });
+
+			expect(() =>
+				watched.join("room-1", {
+					ws: createMockWebSocket(),
+					deviceId: "uplink-1",
+					type: "uplink",
+				}),
+			).not.toThrow();
+			expect(watched.stats()).toEqual({ rooms: 1, connections: 1 });
+
+			expect(() => watched.leave("uplink-1")).not.toThrow();
+			expect(watched.stats()).toEqual({ rooms: 0, connections: 0 });
+		});
+	});
 });
