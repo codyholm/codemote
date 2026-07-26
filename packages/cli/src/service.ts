@@ -117,8 +117,14 @@ export async function stopService(): Promise<void> {
 				["stop", DARWIN_LABEL],
 				["no such process", "could not find service"],
 			);
+			// Unload without -w. The -w flag writes a persistent "disabled" override,
+			// which would survive logout and reboot and defeat RunAtLoad/KeepAlive —
+			// so a stop would silently mean "never come back" until someone ran start
+			// by hand. Plain unload stops the agent for this session while leaving it
+			// enabled, so it returns at next login or reboot. Permanently disabling is
+			// `uninstall`, which removes the plist outright.
 			await runLaunchctlCommand(
-				["unload", "-w", paths.launchAgentPlist],
+				["unload", paths.launchAgentPlist],
 				[
 					"no such process",
 					"could not find service",
