@@ -98,8 +98,8 @@ describe("UplinkServer list_directory", () => {
 			ws.send(JSON.stringify({ type: "list_directory", payload: { path: tempDir } }));
 			const msg = await msgPromise;
 
-			expect(msg.type).toBe("directory_listing");
-			const payload = msg.payload as {
+			expect(msg["type"]).toBe("directory_listing");
+			const payload = msg["payload"] as {
 				path: string;
 				entries: Array<{ name: string; isDirectory: boolean; isGitRepo: boolean }>;
 			};
@@ -113,10 +113,16 @@ describe("UplinkServer list_directory", () => {
 			expect(names).toContain("my-git-project");
 			expect(names).toContain("regular-dir");
 
-			// Git repo should come first
-			expect(payload.entries[0].name).toBe("my-git-project");
-			expect(payload.entries[0].isGitRepo).toBe(true);
-			expect(payload.entries[0].isDirectory).toBe(true);
+			// Git repo should come first. The fixture controls the directories but the
+			// server produces the array, so name an empty listing rather than let a
+			// regression surface as an unrelated TypeError on a missing element.
+			const [firstEntry] = payload.entries;
+			if (!firstEntry) {
+				throw new Error("directory listing returned no entries");
+			}
+			expect(firstEntry.name).toBe("my-git-project");
+			expect(firstEntry.isGitRepo).toBe(true);
+			expect(firstEntry.isDirectory).toBe(true);
 
 			// Regular dir should not be a git repo
 			const regularEntry = payload.entries.find((e) => e.name === "regular-dir");
@@ -134,8 +140,8 @@ describe("UplinkServer list_directory", () => {
 			ws.send(JSON.stringify({ type: "list_directory", payload: {} }));
 			const msg = await msgPromise;
 
-			expect(msg.type).toBe("directory_listing");
-			const payload = msg.payload as { path: string; entries: unknown[] };
+			expect(msg["type"]).toBe("directory_listing");
+			const payload = msg["payload"] as { path: string; entries: unknown[] };
 
 			// Should resolve to process.cwd() (server WorkingDirectory)
 			expect(payload.path).toBe(process.cwd());
@@ -165,9 +171,9 @@ describe("UplinkServer list_directory", () => {
 			const msgPromise = waitForMessage(ws);
 			ws.send(JSON.stringify({ type: "list_directory", payload: { path: bigDir } }));
 			const msg = await msgPromise;
-			expect(msg.type).toBe("directory_listing");
+			expect(msg["type"]).toBe("directory_listing");
 
-			const payload = msg.payload as {
+			const payload = msg["payload"] as {
 				path: string;
 				entries: Array<{ name: string; isDirectory: boolean; isGitRepo: boolean }>;
 			};
@@ -196,8 +202,8 @@ describe("UplinkServer list_directory", () => {
 			);
 			const msg = await msgPromise;
 
-			expect(msg.type).toBe("error");
-			const payload = msg.payload as { message: string; code: string };
+			expect(msg["type"]).toBe("error");
+			const payload = msg["payload"] as { message: string; code: string };
 			expect(payload.code).toBe("COMMAND_FAILED");
 		} finally {
 			ws.close();

@@ -30,7 +30,6 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 		relayServer = await createRelayServer({
 			port: relayPort,
 			host: "127.0.0.1",
-			dbPath: ":memory:",
 		});
 		await relayServer.start();
 
