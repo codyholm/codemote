@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { SessionManager } from "./session";
 import type { Workspace } from "./types";
 
@@ -116,5 +116,108 @@ describe("SessionManager", () => {
 		manager.setRuntimeSessionId(session.id, "claude-session-123");
 
 		expect(manager.get(session.id)?.runtimeSessionId).toBe("claude-session-123");
+	});
+
+	// Fake timers because the real clock can return the same millisecond twice, which
+	// would let both assertions below pass against a broken implementation.
+	it("advances statusChangedAt on a real status transition", () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(1_000);
+			const manager = new SessionManager();
+			const session = manager.create("claude", mockWorkspace);
+			expect(session.statusChangedAt).toBe(1_000);
+
+			vi.setSystemTime(5_000);
+			manager.updateStatus(session.id, "idle");
+
+			expect(manager.get(session.id)?.statusChangedAt).toBe(5_000);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("leaves statusChangedAt alone when the same status is written again", () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(1_000);
+			const manager = new SessionManager();
+			const session = manager.create("claude", mockWorkspace);
+			manager.updateStatus(session.id, "running");
+
+			// Codex re-emits "running" on every turn; that is not a transition.
+			vi.setSystemTime(9_000);
+			manager.updateStatus(session.id, "running");
+
+			const updated = manager.get(session.id);
+			expect(updated?.statusChangedAt).toBe(1_000);
+			// lastActivityAt still moves - only the transition key is guarded.
+			expect(updated?.lastActivityAt).toBe(9_000);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("records attention and exposes it on get", () => {
+		const manager = new SessionManager();
+		const session = manager.create("claude", mockWorkspace);
+
+		manager.setAttention(session.id, "permission_required", "Write /etc/hosts?");
+
+		const attention = manager.get(session.id)?.attention;
+		expect(attention?.reason).toBe("permission_required");
+		expect(attention?.description).toBe("Write /etc/hosts?");
+		expect(attention?.since).toBeGreaterThan(0);
+	});
+
+	it("clears attention when status becomes idle", () => {
+		const manager = new SessionManager();
+		const session = manager.create("claude", mockWorkspace);
+
+		manager.setAttention(session.id, "permission_required", "Write /etc/hosts?");
+		manager.updateStatus(session.id, "idle");
+
+		expect(manager.get(session.id)?.attention).toBeUndefined();
+	});
+
+	it("clears attention when status becomes ended, and still sets endedAt", () => {
+		const manager = new SessionManager();
+		const session = manager.create("claude", mockWorkspace);
+
+		manager.setAttention(session.id, "approval_required", "Run the migration?");
+		manager.updateStatus(session.id, "ended");
+
+		const updated = manager.get(session.id);
+		expect(updated?.attention).toBeUndefined();
+		expect(updated?.endedAt).not.toBeNull();
+	});
+
+	it("keeps attention when status becomes running", () => {
+		const manager = new SessionManager();
+		const session = manager.create("claude", mockWorkspace);
+
+		manager.setAttention(session.id, "permission_required", "Write /etc/hosts?");
+		manager.updateStatus(session.id, "running");
+
+		expect(manager.get(session.id)?.attention?.reason).toBe("permission_required");
+	});
+
+	it("ignores attention set on a terminal session, so a resume cannot resurface it", () => {
+		const manager = new SessionManager();
+		const session = manager.create("claude", mockWorkspace);
+
+		manager.updateStatus(session.id, "ended");
+		manager.setAttention(session.id, "approval_required", "Run the migration?");
+		expect(manager.get(session.id)?.attention).toBeUndefined();
+
+		// Resuming does not clear attention, so anything stored above would surface here.
+		manager.updateStatus(session.id, "running");
+		expect(manager.get(session.id)?.attention).toBeUndefined();
+	});
+
+	it("does not throw when clearing attention on an unknown session", () => {
+		const manager = new SessionManager();
+
+		expect(() => manager.clearAttention("no-such-session")).not.toThrow();
 	});
 });

@@ -24,6 +24,7 @@ export class SessionManager {
 			startedAt: Date.now(),
 			endedAt: null,
 			lastActivityAt: Date.now(),
+			statusChangedAt: Date.now(),
 		};
 
 		this.sessions.set(id, session);
@@ -44,8 +45,22 @@ export class SessionManager {
 		const session = this.sessions.get(sessionId);
 		if (!session) return;
 
+		// Guarded: codex re-emits "running" on every turn, so an unguarded write would
+		// make this move without a transition and destroy its value as a transition key.
+		if (status !== session.status) {
+			session.statusChangedAt = Date.now();
+		}
+
 		session.status = status;
 		session.lastActivityAt = Date.now();
+
+		// A runtime cannot finish a turn while blocked on a decision, so reaching
+		// idle proves the request was resolved; a terminal session has none left
+		// outstanding. Clearing here rather than at the emit site makes it
+		// unbypassable, and it must precede the terminal early return below.
+		if (status === "idle" || status === "ended" || status === "error") {
+			session.attention = undefined;
+		}
 
 		if (status === "ended" || status === "error") {
 			session.endedAt = Date.now();
@@ -66,6 +81,31 @@ export class SessionManager {
 		if (!session) return;
 		session.runtimeSessionId = runtimeSessionId;
 		session.lastActivityAt = Date.now();
+	}
+
+	/**
+	 * Record an outstanding decision that is stopping this session.
+	 */
+	setAttention(sessionId: string, reason: string, description: string): void {
+		const session = this.sessions.get(sessionId);
+		if (!session) return;
+		// A terminal session has no decision to make. The classifier masks a pending
+		// request while ended/error, but updateStatus does not clear on "running", so
+		// storing one here would resurface as a false approval when the session resumes.
+		if (session.status === "ended" || session.status === "error") return;
+
+		const now = Date.now();
+		session.attention = { reason, description, since: now };
+		session.lastActivityAt = now;
+	}
+
+	/**
+	 * Drop the outstanding decision, whether or not one was recorded.
+	 */
+	clearAttention(sessionId: string): void {
+		const session = this.sessions.get(sessionId);
+		if (!session) return;
+		session.attention = undefined;
 	}
 
 	/**

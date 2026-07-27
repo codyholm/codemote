@@ -49,6 +49,7 @@ describe("evidence/collector", () => {
 			startedAt: Date.now(),
 			endedAt: null,
 			lastActivityAt: Date.now(),
+			statusChangedAt: Date.now(),
 		};
 
 		const artifacts = await collector.collect(session);

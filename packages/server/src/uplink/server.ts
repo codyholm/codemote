@@ -17,10 +17,12 @@ import {
 } from "./executors/index.js";
 import { MockExecutor } from "./mock-executor.js";
 import { discoverOpenCodeModels } from "./opencode-models.js";
+import { buildProjectState, projectStateSignature } from "./projectState.js";
 import { probeInstalledRuntimes } from "./runtime-probe.js";
 import { SessionManager } from "./session.js";
 import type {
 	DirectoryEntry,
+	ProjectStateAggregate,
 	Session,
 	UplinkCommand,
 	UplinkConfig,
@@ -42,6 +44,7 @@ export class UplinkServer {
 	private availableRuntimes: RuntimeType[] = [];
 	private dynamicModels = new Map<RuntimeType, ModelInfo[]>();
 	private clients = new Set<WebSocket>();
+	private lastProjectStateSignature: string | null = null;
 	private static readonly LIST_DIRECTORY_STAT_CONCURRENCY = 50;
 
 	constructor(config: Partial<UplinkConfig> = {}) {
@@ -57,6 +60,13 @@ export class UplinkServer {
 
 		// Subscribe to all events and broadcast to clients
 		this.eventBus.subscribe((event) => this.broadcast({ type: "event", payload: event }));
+
+		// Only these two event types can change the aggregate. session.output fires
+		// per token, and session.message / .tool_call / .tool_result / git.diff_updated
+		// move nothing the aggregate carries. Subscribing per type rather than
+		// filtering inside a global handler keeps the per-token flood away entirely.
+		this.eventBus.subscribeType("session.status", () => this.publishProjectState());
+		this.eventBus.subscribeType("attention.required", () => this.publishProjectState());
 	}
 
 	/**
@@ -254,6 +264,9 @@ export class UplinkServer {
 			case "list_sessions":
 				return { type: "sessions", payload: this.sessionManager.list() };
 
+			case "get_project_state":
+				return { type: "project_state", payload: this.currentProjectState() };
+
 			case "list_runtimes":
 				return { type: "runtime_list", payload: { runtimes: this.availableRuntimes } };
 
@@ -278,6 +291,10 @@ export class UplinkServer {
 				const executor = this.executors.get(session.runtime);
 				if (!executor) throw new Error("Executor not found");
 				await executor.sendInput(command.payload.sessionId, command.payload.input);
+				// clearAttention fires inside sendInput and emits no event of its own,
+				// so without this an answered approval would keep reading as blocked
+				// until the turn ended.
+				this.publishProjectState();
 				return { type: "input_sent", payload: { sessionId: command.payload.sessionId } };
 			}
 
@@ -452,6 +469,27 @@ export class UplinkServer {
 
 		await Promise.all(workers);
 		return results;
+	}
+
+	private currentProjectState(): ProjectStateAggregate {
+		return buildProjectState(this.sessionManager.list(), Date.now());
+	}
+
+	/**
+	 * Broadcast the aggregate, but only when it actually changed.
+	 *
+	 * The comparison is over the signature, not the snapshot: updateStatus writes
+	 * lastActivityAt unconditionally and the codex executor re-emits "running" on
+	 * every turn, so a snapshot comparison would differ on precisely the no-op write
+	 * this exists to suppress.
+	 */
+	private publishProjectState(): void {
+		const state = this.currentProjectState();
+		const signature = projectStateSignature(state);
+		if (signature === this.lastProjectStateSignature) return;
+
+		this.lastProjectStateSignature = signature;
+		this.broadcast({ type: "project_state_push", payload: state });
 	}
 
 	private broadcast(response: UplinkResponse): void {

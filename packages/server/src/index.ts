@@ -38,6 +38,8 @@ export type { SmokeTestConfig, SmokeTestResult } from "./uplink/smoke/index.js";
 // ── Types (re-exported from uplink/types + common) ─────────────
 export type {
 	ModelInfo,
+	PendingAttention,
+	ProjectStateAggregate,
 	RuntimeType,
 	SessionStatus,
 	StreamEvent,

@@ -20,6 +20,7 @@ import { validateEncryptedPayload } from "./validateEncryptedPayload.js";
 
 import type {
 	ModelInfo,
+	ProjectStateAggregate,
 	RuntimeType,
 	SessionStatus,
 	StreamEvent,
@@ -203,6 +204,15 @@ interface ListRuntimesMessage {
 	type: "list_runtimes";
 }
 
+interface GetProjectStateMessage {
+	type: "get_project_state";
+}
+
+interface ProjectStateMessage {
+	type: "project_state";
+	state: ProjectStateAggregate;
+}
+
 type DiffScope = "staged" | "unstaged" | "all";
 
 interface GetDiffMessage {
@@ -296,6 +306,7 @@ type MobileInboundMessage =
 	| NewSessionMessage
 	| ListModelsMessage
 	| ListRuntimesMessage
+	| GetProjectStateMessage
 	| GetDiffMessage
 	| RequestDeviceInfoMessage
 	| ListDirectoryMessage
@@ -322,6 +333,7 @@ type MobileOutboundMessage =
 	| GitPushResultMessage
 	| GitWorktreeResultMessage
 	| RuntimeListMessage
+	| ProjectStateMessage
 	| GitPRResultMessage;
 
 const AUTO_RESUME_RUNTIMES: ReadonlySet<RuntimeType> = new Set(["claude", "opencode"]);
@@ -362,6 +374,7 @@ export interface RelayUplinkBridgeConfig {
 		runtime: RuntimeType;
 		status: SessionStatus;
 	}) => void;
+	onProjectState?: (state: ProjectStateAggregate) => void;
 	log?: (message: string) => void;
 }
 
@@ -395,6 +408,8 @@ class UplinkWsClient {
 	constructor(
 		private readonly ws: WebSocket,
 		private readonly onEvent: (event: StreamEvent) => void,
+		private readonly onProjectState?: (state: ProjectStateAggregate) => void,
+		private readonly log?: (message: string) => void,
 	) {
 		ws.on("message", (data: WebSocket.RawData) => {
 			this.handleMessage(data);
@@ -412,10 +427,12 @@ class UplinkWsClient {
 	static async connect(
 		uplinkUrl: string,
 		onEvent: (event: StreamEvent) => void,
+		onProjectState?: (state: ProjectStateAggregate) => void,
+		log?: (message: string) => void,
 	): Promise<UplinkWsClient> {
 		const ws = new WebSocket(uplinkUrl);
 		await waitForOpen(ws);
-		return new UplinkWsClient(ws, onEvent);
+		return new UplinkWsClient(ws, onEvent, onProjectState, log);
 	}
 
 	async startRun(
@@ -474,6 +491,14 @@ class UplinkWsClient {
 		return this.sendAndWait({
 			type: "list_sessions",
 		});
+	}
+
+	async getProjectState() {
+		// Bypasses the serialized command queue. This is a pure read with no ordering
+		// dependency on any other command, and it runs on the pair path - queued, a
+		// slow or unanswered state read would stall every user action behind it for
+		// the full command timeout.
+		return this.sendAndWait({ type: "get_project_state" }, { bypassQueue: true });
 	}
 
 	async listModels(profile: RuntimeType) {
@@ -547,6 +572,27 @@ class UplinkWsClient {
 
 		if (msg.type === "event") {
 			this.onEvent(msg.payload);
+			return;
+		}
+
+		// Must short-circuit before any correlation. Every other type falls through to
+		// the pending-request matcher below, which - for a message with no requestId -
+		// matches on expectedType alone. An unsolicited broadcast reaching that code
+		// would resolve some other in-flight request with the wrong message, and the
+		// genuine response would then be dropped as an unknown requestId.
+		if (msg.type === "project_state_push") {
+			// onProjectState is a public config callback supplied by a consumer, so a
+			// throw is not hypothetical; unguarded it would escape handleMessage into
+			// the ws EventEmitter. onEvent is insulated by its own `void handle...()`.
+			try {
+				this.onProjectState?.(msg.payload);
+			} catch (error) {
+				this.log?.(
+					`[Bridge] project_state_push handler threw: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+			}
 			return;
 		}
 
@@ -685,6 +731,8 @@ function expectedResponseType(commandType: UplinkCommand["type"]): UplinkRespons
 			return "pong";
 		case "list_sessions":
 			return "sessions";
+		case "get_project_state":
+			return "project_state";
 		case "list_models":
 			return "model_list";
 		case "list_runtimes":
@@ -762,6 +810,7 @@ export async function startRelayUplinkBridge(
 		onMobilePaired,
 		onMobileDisconnected,
 		onSessionStatus,
+		onProjectState,
 		log,
 	} = config;
 
@@ -921,9 +970,30 @@ export async function startRelayUplinkBridge(
 	onPairingCode?.(pairingCode);
 	log?.("[Bridge] Registered with relay (pairing code redacted)");
 
-	const uplinkClient = await UplinkWsClient.connect(uplinkUrl, (event) => {
-		void handleUplinkEvent(event);
-	});
+	const uplinkClient = await UplinkWsClient.connect(
+		uplinkUrl,
+		(event) => {
+			void handleUplinkEvent(event);
+		},
+		(state) => {
+			// The consumer callback is an observer; forwarding to mobile is the product
+			// behavior. Guarding it separately keeps a broken consumer from silently
+			// starving the phone of state - the outer guard in handleMessage catches the
+			// throw but would skip the send with it.
+			try {
+				onProjectState?.(state);
+			} catch (error) {
+				log?.(
+					`[Bridge] onProjectState consumer threw: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+			}
+			// sendToMobile already no-ops when no mobile is paired.
+			sendToMobile({ type: "project_state", state });
+		},
+		log,
+	);
 	await syncSessionsFromUplink();
 
 	relayWs.on("message", (data: WebSocket.RawData) => {
@@ -1006,6 +1076,10 @@ export async function startRelayUplinkBridge(
 					await syncSessionsFromUplink();
 					sendSessionList();
 					void sendDeviceInfoToMobile();
+					// The push is change-detected against a server-global signature, so a
+					// mobile pairing mid-life would otherwise see nothing until the next
+					// state change somewhere. REQ-15 is "reflects real state on open".
+					void handleGetProjectState();
 
 					// Clear stale encryption + rotation state from previous pairing
 					if (encryptionMode !== "off") {
@@ -1165,6 +1239,9 @@ export async function startRelayUplinkBridge(
 				return;
 			case "list_runtimes":
 				await handleListRuntimes();
+				return;
+			case "get_project_state":
+				await handleGetProjectState();
 				return;
 			case "list_directory":
 				await handleListDirectory(message);
@@ -1642,6 +1719,27 @@ export async function startRelayUplinkBridge(
 				type: "runtime_list",
 				runtimes: [],
 			});
+		}
+	}
+
+	async function handleGetProjectState(): Promise<void> {
+		try {
+			const response = await uplinkClient.getProjectState();
+			if (response.type !== "project_state") {
+				throw new Error("Unexpected get_project_state response");
+			}
+
+			sendToMobile({ type: "project_state", state: response.payload });
+		} catch (error) {
+			// Deliberately no fallback message, unlike list_runtimes which answers with
+			// an empty list. An empty aggregate is not a neutral default here: it reads
+			// as "no projects, nothing needs you", which would make the assistant report
+			// all-clear and suppress notifications while the real state is unknown.
+			// Staying silent lets the caller's request time out and surface a failure
+			// instead of being told something false.
+			log?.(
+				`[Bridge] Failed to get project state: ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
 	}
 
@@ -2244,6 +2342,10 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 
 	if (type === "list_runtimes") {
 		return { type: "list_runtimes" };
+	}
+
+	if (type === "get_project_state") {
+		return { type: "get_project_state" };
 	}
 
 	if (type === "list_directory") {

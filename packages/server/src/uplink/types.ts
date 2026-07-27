@@ -1,5 +1,7 @@
 import type {
 	ModelInfo,
+	PendingAttention,
+	ProjectStateAggregate,
 	RunOptions,
 	RunResult,
 	RuntimeType,
@@ -8,7 +10,16 @@ import type {
 } from "@codemote/common";
 
 // Re-export common types
-export type { ModelInfo, RunOptions, RunResult, RuntimeType, SessionStatus, StreamEvent };
+export type {
+	ModelInfo,
+	PendingAttention,
+	ProjectStateAggregate,
+	RunOptions,
+	RunResult,
+	RuntimeType,
+	SessionStatus,
+	StreamEvent,
+};
 
 /**
  * Workspace configuration for a session runtime.
@@ -64,6 +75,12 @@ export interface Session {
 	endedAt: number | null;
 	/** Last activity timestamp */
 	lastActivityAt: number;
+	/** When `status` last actually changed, as opposed to was re-written. */
+	statusChangedAt: number;
+	/** Outstanding decision blocking this session. Cleared when answered or on a
+	 * terminal/idle transition. Explicitly `| undefined` so the clear can assign
+	 * rather than `delete`, which Biome's noDelete rule rejects. */
+	attention?: PendingAttention | undefined;
 }
 
 /**
@@ -106,6 +123,7 @@ export type UplinkCommand =
 			payload: { sessionId: string; title?: string; body?: string };
 	  } & RequestEnvelope)
 	| ({ type: "list_sessions" } & RequestEnvelope)
+	| ({ type: "get_project_state" } & RequestEnvelope)
 	| ({ type: "list_models"; payload: { profile: RuntimeType } } & RequestEnvelope)
 	| ({ type: "list_directory"; payload: { path?: string } } & RequestEnvelope)
 	| ({ type: "list_runtimes" } & RequestEnvelope)
@@ -132,6 +150,12 @@ export type UplinkResponse =
 	  } & RequestEnvelope)
 	| ({ type: "git_pr_result"; payload: { sessionId: string; url: string } } & RequestEnvelope)
 	| ({ type: "sessions"; payload: Session[] } & RequestEnvelope)
+	| ({ type: "project_state"; payload: ProjectStateAggregate } & RequestEnvelope)
+	// Deliberately a different type string from "project_state". The bridge falls
+	// back to matching an uncorrelated message against a pending request's expected
+	// response type, so an unsolicited broadcast sharing that string would resolve
+	// the wrong waiter and the real reply would then be dropped.
+	| ({ type: "project_state_push"; payload: ProjectStateAggregate } & RequestEnvelope)
 	| ({
 			type: "model_list";
 			payload: { runtime: RuntimeType; models: ModelInfo[] };

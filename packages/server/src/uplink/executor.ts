@@ -8,11 +8,42 @@ import type {
 	ToolCallPayload,
 	ToolResultPayload,
 } from "@codemote/common";
-import { SessionNotActiveError, SessionNotFoundError } from "@codemote/common";
+import {
+	ATTENTION_DESCRIPTION_MAX,
+	SessionNotActiveError,
+	SessionNotFoundError,
+} from "@codemote/common";
 import { type EventBus, createEvent } from "./events.js";
 import type { SessionManager } from "./session.js";
 import type { Session, WorkspaceConfig } from "./types.js";
 import type { WorkspaceManager } from "./workspace.js";
+
+/**
+ * One line an assistant can speak verbatim, taken from what the executors already
+ * pass. Reads the existing `details` shapes rather than asking executors to supply
+ * anything new, and falls back to the reason so the line is never empty.
+ */
+function describeAttention(reason: string, details?: unknown): string {
+	if (typeof details === "object" && details !== null) {
+		const record = details as Record<string, unknown>;
+		if (typeof record["description"] === "string") return truncate(record["description"]);
+		if (typeof record["action"] === "string") return truncate(record["action"]);
+		// Claude's permission_request sends { tool, description, args } and omits
+		// description for some tools; without this the line degrades to the bare
+		// reason while the tool name sits unused.
+		if (typeof record["tool"] === "string") return truncate(record["tool"]);
+	}
+	return truncate(reason);
+}
+
+/**
+ * The runtimes control this string's length - a Bash permission request carries the
+ * command - and it is the only unbounded field inside the aggregate's count caps.
+ */
+function truncate(text: string): string {
+	if (text.length <= ATTENTION_DESCRIPTION_MAX) return text;
+	return `${text.slice(0, ATTENTION_DESCRIPTION_MAX - 1)}…`;
+}
 
 /**
  * Abstract base class for runtime executors
@@ -87,6 +118,15 @@ export abstract class BaseExecutor {
 
 		this.sessionManager.touch(sessionId);
 		await this.doSendInput(session, input);
+		// Sending input is the answer to a pending request: the bridge's approval
+		// response arrives here as "y" or "n". No runtime emits a resolution event,
+		// so this is the only signal that the decision was made.
+		//
+		// Cleared only after the input actually landed. If doSendInput throws - a dead
+		// child's stdin, say - the caller propagates and never republishes, so clearing
+		// first would erase the approval from the state with nothing to restore it. A
+		// duplicate blocked push on retry is the better failure.
+		this.sessionManager.clearAttention(sessionId);
 	}
 
 	/**
@@ -141,6 +181,9 @@ export abstract class BaseExecutor {
 	 * Emit an attention required event
 	 */
 	protected emitAttention(sessionId: string, reason: string, details?: unknown): void {
+		this.sessionManager.setAttention(sessionId, reason, describeAttention(reason, details));
+		// The payload stays exactly as it was: bridge.ts reads payload.details?.action
+		// and payload.details?.description to build its approval request.
 		this.eventBus.emit(createEvent("attention.required", sessionId, { reason, details }));
 	}
 

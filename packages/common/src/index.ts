@@ -158,3 +158,20 @@ export interface RunResult {
 
 // Config types
 export type { CodemoteConfig, RuntimeSettings } from "./config.js";
+
+// Project state aggregate types
+export type {
+	PendingAttention,
+	ProjectSessionState,
+	ProjectState,
+	ProjectStateAggregate,
+	SessionAttentionState,
+} from "./projectState.js";
+export {
+	ATTENTION_DESCRIPTION_MAX,
+	ATTENTION_RANK,
+	PROJECT_STATE_MAX_BYTES,
+	PROJECT_STATE_MAX_PROJECTS,
+	PROJECT_STATE_MAX_SESSIONS,
+	attentionForSession,
+} from "./projectState.js";
