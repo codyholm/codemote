@@ -201,6 +201,17 @@ export class ClaudeExecutor extends BaseExecutor {
 
 		claudeSession.process = proc;
 
+		// A claude CLI that dies before our prompt write lands (bad flags, missing auth,
+		// immediate crash) closes the read end of the stdin pipe, and libuv reports that
+		// as an 'error' on the stream. Without a listener Node promotes it to an uncaught
+		// exception and takes the whole uplink process down. One stream-level listener
+		// also covers doSendInput() writes and doStop()'s end(). Deliberately does not
+		// touch session state: stdin can close while stdout is still streaming, and the
+		// 'exit'/'error' handlers below own the lifecycle.
+		proc.stdin.on("error", (error) => {
+			logClaudeDebug(`[Claude stdin] ${session.id.slice(0, 8)}...: ${error.message}`);
+		});
+
 		// Handle output (stdout + stderr).
 		proc.stdout.on("data", (chunk) => {
 			const data = chunk.toString("utf8");

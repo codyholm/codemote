@@ -526,4 +526,55 @@ echo '{"type":"turn.completed"}'
 		// Mark as cleaned up
 		activeSessionId = null;
 	});
+
+	it("survives sending input to a codex process that closed its stdin", async () => {
+		// Closes the read end of its stdin, then execs sleep so no shell-held duplicate of
+		// that fd survives, while staying alive and mid-turn so doSendInput still writes.
+		const closedStdinMockPath = join(testDir, "mock-codex-closed-stdin");
+		const closedStdinScript = `#!/bin/sh
+exec 0<&-
+echo '{"type":"thread.started","thread_id":"mock-thread"}'
+exec sleep 30
+`;
+		await writeFile(closedStdinMockPath, closedStdinScript);
+		await chmod(closedStdinMockPath, 0o755);
+
+		activeExecutor = new CodexExecutor(workspaceManager, sessionManager, eventBus, {
+			codexPath: closedStdinMockPath,
+		});
+
+		const uncaught: unknown[] = [];
+		const collect = (error: unknown): void => {
+			uncaught.push(error);
+		};
+		process.on("uncaughtException", collect);
+		process.on("unhandledRejection", collect);
+
+		try {
+			const result = await activeExecutor.startRun({
+				profile: "codex",
+				workspace: testDir,
+				initialPrompt: "Hello",
+			});
+			activeSessionId = result.sessionId;
+
+			await waitFor(() => sessionManager.get(result.sessionId)?.status === "running");
+
+			// Input has to exceed the stdin socket buffer. Anything that fits is absorbed
+			// and silently discarded; only the overflow reaches the stream as EPIPE. 64 KiB
+			// is well inside the relay's 256 KB payload cap, so it is a reachable input.
+			await activeExecutor.sendInput(result.sessionId, "x".repeat(64 * 1024));
+
+			// The write fails asynchronously; give the stream error a chance to land.
+			await new Promise((r) => setTimeout(r, 500));
+
+			expect(uncaught).toEqual([]);
+			// The guard must absorb the stream error without touching session state: the
+			// child is still alive, so the turn is still running.
+			expect(sessionManager.get(result.sessionId)?.status).toBe("running");
+		} finally {
+			process.off("uncaughtException", collect);
+			process.off("unhandledRejection", collect);
+		}
+	});
 });

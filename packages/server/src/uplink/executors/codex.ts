@@ -409,6 +409,17 @@ export class CodexExecutor extends BaseExecutor {
 	): void {
 		codexSession.process = proc;
 
+		// A codex process that has closed the read end of its stdin — exited after its
+		// turn, or crashed mid-run — makes the next doSendInput() write fail with EPIPE.
+		// Node emits that on the stream, and with no listener it becomes an uncaught
+		// exception that kills the whole uplink process. Deliberately does not touch
+		// session state; the exit/error handlers below own the lifecycle.
+		if (proc.stdin) {
+			proc.stdin.on("error", () => {
+				// Nothing to surface here: a dead process is already reported by exit/error.
+			});
+		}
+
 		// JSONL events are emitted on stdout in modern Codex builds.
 		if (proc.stdout) {
 			const stdoutReader = createInterface({ input: proc.stdout });

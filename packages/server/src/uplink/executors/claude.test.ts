@@ -298,4 +298,54 @@ echo '{"type":"end"}'
 		// Mark as cleaned up
 		activeSessionId = null;
 	});
+
+	it("survives a claude CLI that exits before the initial prompt write lands", async () => {
+		// Closes its stdin and exits without reading. Paired with a prompt larger than the
+		// OS pipe buffer, the initial write is guaranteed to still be in flight when the
+		// read end goes away, so the write fails with EPIPE.
+		const earlyExitMockPath = join(testDir, "mock-claude-early-exit");
+		const earlyExitScript = `#!/bin/sh
+exec 0<&-
+printf '%s\\n' '{"type":"session_start","session_id":"mock-session"}'
+exit 0
+`;
+		await writeFile(earlyExitMockPath, earlyExitScript);
+		await chmod(earlyExitMockPath, 0o755);
+
+		activeExecutor = new ClaudeExecutor(workspaceManager, sessionManager, eventBus, {
+			claudePath: earlyExitMockPath,
+		});
+
+		const uncaught: unknown[] = [];
+		const collect = (error: unknown): void => {
+			uncaught.push(error);
+		};
+		process.on("uncaughtException", collect);
+		process.on("unhandledRejection", collect);
+
+		try {
+			const result = await activeExecutor.startRun({
+				profile: "claude",
+				workspace: testDir,
+				initialPrompt: "x".repeat(1024 * 1024),
+			});
+			activeSessionId = result.sessionId;
+
+			await waitFor(() => {
+				const status = sessionManager.get(result.sessionId)?.status;
+				return status === "ended" || status === "error";
+			});
+
+			// The stdin failure can surface a tick or two after exit; let it land.
+			await new Promise((r) => setTimeout(r, 200));
+
+			expect(uncaught).toEqual([]);
+			expect(["ended", "error"]).toContain(sessionManager.get(result.sessionId)?.status);
+
+			activeSessionId = null;
+		} finally {
+			process.off("uncaughtException", collect);
+			process.off("unhandledRejection", collect);
+		}
+	});
 });
