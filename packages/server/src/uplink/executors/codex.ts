@@ -24,6 +24,12 @@ export interface CodexConfig {
 	approvalPolicy: "untrusted" | "on-failure" | "on-request" | "never";
 	/** Output schema file path for validation (optional) */
 	outputSchema: string | null;
+	/**
+	 * How long an input write may stay unflushed before the session's input channel
+	 * is declared dead. A codex process that stops draining stdin would otherwise
+	 * park the write forever.
+	 */
+	stdinWriteTimeoutMs: number;
 }
 
 const DEFAULT_CODEX_CONFIG: CodexConfig = {
@@ -31,6 +37,7 @@ const DEFAULT_CODEX_CONFIG: CodexConfig = {
 	sandbox: "workspace-write",
 	approvalPolicy: "on-request",
 	outputSchema: null,
+	stdinWriteTimeoutMs: 30_000,
 };
 
 /**
@@ -210,12 +217,53 @@ export class CodexExecutor extends BaseExecutor {
 			throw new Error("Codex session not running");
 		}
 
-		if (!codexSession.process.stdin) {
+		const stdin = codexSession.process.stdin;
+		if (!stdin) {
 			throw new Error("Codex process stdin not available");
 		}
 
-		// Write input with newline
-		codexSession.process.stdin.write(`${input}\n`);
+		const timeoutMs = this.config.stdinWriteTimeoutMs;
+		// Wait for the write to actually reach the OS rather than firing and forgetting.
+		// If stdin is dead — codex exited or closed the pipe while the session is still
+		// tracked as running — the write fails here, and the caller needs to hear about
+		// it. Acking an input the runtime never received is worse than reporting the
+		// failure: the user sits waiting for a reply to a prompt that was dropped.
+		//
+		// A codex process that stops draining stdin fails neither way, so the wait is
+		// bounded. Destroying the stream at the deadline is what keeps the report honest:
+		// the terminating newline is the last byte written, so a callback that has not
+		// fired means the newline never reached the kernel and codex cannot have parsed
+		// a message. Only an unparseable fragment is discarded. Without the destroy, a
+		// wedged child that later drains stdin would deliver an input the client was
+		// already told had failed, duplicating it if the user retried. It also makes
+		// every later send fail fast instead of stacking up behind the stall.
+		await new Promise<void>((resolve, reject) => {
+			let settled = false;
+
+			const timer = setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				stdin.destroy();
+				reject(
+					new Error(
+						`Codex session input could not be delivered: write did not flush within ${timeoutMs}ms`,
+					),
+				);
+			}, timeoutMs);
+
+			stdin.write(`${input}\n`, (error) => {
+				// Destroying the stream above fires this callback with ERR_STREAM_DESTROYED;
+				// the send is already settled, so it must not settle again.
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				if (error) {
+					reject(new Error(`Codex session input could not be delivered: ${error.message}`));
+					return;
+				}
+				resolve();
+			});
+		});
 	}
 
 	/**

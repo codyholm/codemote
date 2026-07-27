@@ -527,7 +527,7 @@ echo '{"type":"turn.completed"}'
 		activeSessionId = null;
 	});
 
-	it("survives sending input to a codex process that closed its stdin", async () => {
+	it("reports undelivered input while surviving a codex process that closed its stdin", async () => {
 		// Closes the read end of its stdin, then execs sleep so no shell-held duplicate of
 		// that fd survives, while staying alive and mid-turn so doSendInput still writes.
 		const closedStdinMockPath = join(testDir, "mock-codex-closed-stdin");
@@ -563,14 +563,67 @@ exec sleep 30
 			// Input has to exceed the stdin socket buffer. Anything that fits is absorbed
 			// and silently discarded; only the overflow reaches the stream as EPIPE. 64 KiB
 			// is well inside the relay's 256 KB payload cap, so it is a reachable input.
-			await activeExecutor.sendInput(result.sessionId, "x".repeat(64 * 1024));
+			// The send must report the failure rather than let the server ack input_sent.
+			await expect(
+				activeExecutor.sendInput(result.sessionId, "x".repeat(64 * 1024)),
+			).rejects.toThrow(/could not be delivered/);
 
 			// The write fails asynchronously; give the stream error a chance to land.
 			await new Promise((r) => setTimeout(r, 500));
 
 			expect(uncaught).toEqual([]);
-			// The guard must absorb the stream error without touching session state: the
-			// child is still alive, so the turn is still running.
+			// The guard must absorb the stream error without touching session state. The
+			// child is alive and mid-turn, so "running" is truthful — the failure belongs
+			// to the input attempt, not to the session.
+			expect(sessionManager.get(result.sessionId)?.status).toBe("running");
+		} finally {
+			process.off("uncaughtException", collect);
+			process.off("unhandledRejection", collect);
+		}
+	});
+
+	it("gives up on an input write that never flushes", async () => {
+		// Leaves stdin OPEN but never reads it, so an over-buffer write neither flushes
+		// nor fails — it just parks. Without a bound the send would hang forever.
+		const wedgedMockPath = join(testDir, "mock-codex-wedged-stdin");
+		const wedgedScript = `#!/bin/sh
+echo '{"type":"thread.started","thread_id":"mock-thread"}'
+exec sleep 30
+`;
+		await writeFile(wedgedMockPath, wedgedScript);
+		await chmod(wedgedMockPath, 0o755);
+
+		activeExecutor = new CodexExecutor(workspaceManager, sessionManager, eventBus, {
+			codexPath: wedgedMockPath,
+			stdinWriteTimeoutMs: 500,
+		});
+
+		const uncaught: unknown[] = [];
+		const collect = (error: unknown): void => {
+			uncaught.push(error);
+		};
+		process.on("uncaughtException", collect);
+		process.on("unhandledRejection", collect);
+
+		try {
+			const result = await activeExecutor.startRun({
+				profile: "codex",
+				workspace: testDir,
+				initialPrompt: "Hello",
+			});
+			activeSessionId = result.sessionId;
+
+			await waitFor(() => sessionManager.get(result.sessionId)?.status === "running");
+
+			await expect(
+				activeExecutor.sendInput(result.sessionId, "x".repeat(4 * 1024 * 1024)),
+			).rejects.toThrow(/could not be delivered: write did not flush within 500ms/);
+
+			// The destroy fires the parked write callback; it must not settle a second time.
+			await new Promise((r) => setTimeout(r, 200));
+
+			expect(uncaught).toEqual([]);
+			// The stall belongs to the input attempt, not to the session.
 			expect(sessionManager.get(result.sessionId)?.status).toBe("running");
 		} finally {
 			process.off("uncaughtException", collect);

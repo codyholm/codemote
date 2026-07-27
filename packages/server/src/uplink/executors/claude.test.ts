@@ -348,4 +348,112 @@ exit 0
 			process.off("unhandledRejection", collect);
 		}
 	});
+
+	it("reports a follow-up prompt that could not be delivered instead of acking it", async () => {
+		// Finishes a turn (session reaches idle) but drops the read end of its stdin, then
+		// execs sleep so no shell-held duplicate of that fd survives. The session is still
+		// live and accepting input as far as the executor is concerned.
+		const deadStdinMockPath = join(testDir, "mock-claude-dead-stdin");
+		const deadStdinScript = `#!/bin/sh
+exec 0<&-
+printf '%s\\n' '{"type":"session_start","session_id":"mock-session"}'
+printf '%s\\n' '{"type":"result","session_id":"mock-session","result":"first turn done"}'
+exec sleep 30
+`;
+		await writeFile(deadStdinMockPath, deadStdinScript);
+		await chmod(deadStdinMockPath, 0o755);
+
+		activeExecutor = new ClaudeExecutor(workspaceManager, sessionManager, eventBus, {
+			claudePath: deadStdinMockPath,
+		});
+
+		const uncaught: unknown[] = [];
+		const collect = (error: unknown): void => {
+			uncaught.push(error);
+		};
+		process.on("uncaughtException", collect);
+		process.on("unhandledRejection", collect);
+
+		try {
+			const result = await activeExecutor.startRun({
+				profile: "claude",
+				workspace: testDir,
+				initialPrompt: "Hello",
+			});
+			activeSessionId = result.sessionId;
+
+			await waitFor(() => sessionManager.get(result.sessionId)?.status === "idle");
+			expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
+
+			// Must exceed the stdin socket buffer: a write that fits is absorbed by the OS
+			// and reported as delivered even though nothing will ever read it. Node's
+			// stdio "pipes" are Unix socketpairs, and Linux defaults that buffer to
+			// roughly 208 KB against macOS's far smaller one, so the payload has to clear
+			// the larger of the two or this passes on macOS and fails on Linux.
+			await expect(
+				activeExecutor.sendInput(result.sessionId, "x".repeat(4 * 1024 * 1024)),
+			).rejects.toThrow(/could not be delivered/);
+
+			await new Promise((r) => setTimeout(r, 200));
+
+			// A dropped prompt must not leave the session looking like a turn in progress.
+			expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
+			// And the crash guard from the EPIPE fix must still hold.
+			expect(uncaught).toEqual([]);
+		} finally {
+			process.off("uncaughtException", collect);
+			process.off("unhandledRejection", collect);
+		}
+	});
+
+	it("gives up on a prompt write that never flushes", async () => {
+		// Leaves stdin OPEN but never reads it, so an over-buffer write neither flushes
+		// nor fails — it just parks. Without a bound the send would hang forever.
+		const wedgedMockPath = join(testDir, "mock-claude-wedged-stdin");
+		const wedgedScript = `#!/bin/sh
+printf '%s\\n' '{"type":"session_start","session_id":"mock-session"}'
+printf '%s\\n' '{"type":"result","session_id":"mock-session","result":"first turn done"}'
+exec sleep 30
+`;
+		await writeFile(wedgedMockPath, wedgedScript);
+		await chmod(wedgedMockPath, 0o755);
+
+		activeExecutor = new ClaudeExecutor(workspaceManager, sessionManager, eventBus, {
+			claudePath: wedgedMockPath,
+			stdinWriteTimeoutMs: 500,
+		});
+
+		const uncaught: unknown[] = [];
+		const collect = (error: unknown): void => {
+			uncaught.push(error);
+		};
+		process.on("uncaughtException", collect);
+		process.on("unhandledRejection", collect);
+
+		try {
+			const result = await activeExecutor.startRun({
+				profile: "claude",
+				workspace: testDir,
+				initialPrompt: "Hello",
+			});
+			activeSessionId = result.sessionId;
+
+			await waitFor(() => sessionManager.get(result.sessionId)?.status === "idle");
+			expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
+
+			await expect(
+				activeExecutor.sendInput(result.sessionId, "x".repeat(4 * 1024 * 1024)),
+			).rejects.toThrow(/could not be delivered: write did not flush within 500ms/);
+
+			// The destroy fires the parked write callback; it must not settle a second time.
+			await new Promise((r) => setTimeout(r, 200));
+
+			expect(uncaught).toEqual([]);
+			// The stall belongs to the input attempt, not to the session.
+			expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
+		} finally {
+			process.off("uncaughtException", collect);
+			process.off("unhandledRejection", collect);
+		}
+	});
 });
