@@ -282,6 +282,52 @@ exit 0`,
 			expect(response.status).toBe(400);
 		});
 
+		it("answers 400 unreadable_audio when whisper could not read the bytes", async () => {
+			const server = await startServer({
+				whisperBin: await writeStub(
+					"whisper-unreadable",
+					`printf "error: failed to read audio file 'in.wav'\\n" >&2\nexit 0`,
+				),
+			});
+
+			const response = await fetch(`${server.url}/transcribe`, {
+				method: "POST",
+				headers: { "content-type": "audio/wav" },
+				body: new Uint8Array(makeWav(2400)),
+			});
+
+			expect(response.status).toBe(400);
+			const payload = (await response.json()) as {
+				error: { code: string; message: string; detail: string };
+			};
+			expect(payload.error.code).toBe("unreadable_audio");
+			expect(payload.error.message).toContain("wav, mp3, ogg and flac");
+			expect(payload.error.detail).toContain("failed to read audio file");
+		});
+
+		it("answers 400 invalid_request when whisper does not know the language", async () => {
+			// The language passes /^[a-z]{2}$/ but whisper knows only its own list,
+			// and rejects the rest at exit 0. Blaming the audio would be wrong.
+			const server = await startServer({
+				whisperBin: await writeStub(
+					"whisper-language",
+					`printf "error: unknown language 'jp'\\n" >&2\nprintf ' fine recording\\n'\nexit 0`,
+				),
+			});
+
+			const response = await fetch(`${server.url}/transcribe?language=jp`, {
+				method: "POST",
+				headers: { "content-type": "audio/wav" },
+				body: new Uint8Array(makeWav(2400)),
+			});
+
+			expect(response.status).toBe(400);
+			const payload = (await response.json()) as { error: { code: string; message: string } };
+			expect(payload.error.code).toBe("invalid_request");
+			expect(payload.error.message).toContain('"jp"');
+			expect(payload.error.message).not.toContain("m4a");
+		});
+
 		it("rejects an unsupported content type with 415", async () => {
 			const server = await startServer();
 

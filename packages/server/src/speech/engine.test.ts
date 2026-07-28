@@ -1,8 +1,11 @@
+import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
+import spawn from "cross-spawn";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SpeechEngines } from "./engine.js";
+import { SpeechEngines, killTree } from "./engine.js";
 import { DEFAULT_SPEECH_CONFIG, type SpeechConfig, type SpeechErrorCode } from "./types.js";
 import { SpeechError } from "./types.js";
 
@@ -33,6 +36,55 @@ async function exists(path: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
+}
+
+const execFileAsync = promisify(execFile);
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Bounded poll for a pid file. Generously bounded: nothing is killing its writer. */
+async function waitForPid(path: string): Promise<number> {
+	for (let i = 0; i < 200; i++) {
+		try {
+			const pid = Number((await readFile(path, "utf8")).trim());
+			if (Number.isInteger(pid) && pid > 0) return pid;
+		} catch {
+			// not written yet
+		}
+		await sleep(25);
+	}
+	throw new Error(`no pid was recorded at ${path} within 5s`);
+}
+
+/**
+ * `ps` state rather than `process.kill(pid, 0)`, which succeeds for a zombie.
+ *
+ * The group kill takes the wrapper down along with its child, so the child is
+ * orphaned and reparented to PID 1. Where PID 1 does not reap promptly — the
+ * normal case in a minimal container — it lingers as a zombie. A zombie has
+ * terminated and holds nothing but a process-table slot, which satisfies "the
+ * grandchild was killed". `state=` prints nothing when no process matches, and
+ * a leading `Z` for a terminated one; both are dead.
+ */
+async function isDead(pid: number): Promise<boolean> {
+	try {
+		const { stdout } = await execFileAsync("ps", ["-o", "state=", "-p", String(pid)]);
+		const state = stdout.trim();
+		return state === "" || state.startsWith("Z");
+	} catch {
+		// ps exits non-zero when the pid matches nothing.
+		return true;
+	}
+}
+
+async function waitUntilDead(pid: number): Promise<boolean> {
+	for (let i = 0; i < 100; i++) {
+		if (await isDead(pid)) return true;
+		await sleep(20);
+	}
+	return false;
 }
 
 async function expectSpeechError(
@@ -205,36 +257,64 @@ exit 1`,
 			expect(await exists(marker)).toBe(false);
 		});
 
+		it("spawns the engine as its own process-group leader", async () => {
+			// killTree signals the negative pid, which reaches the whole tree only
+			// while the child leads its own group. Dropping `detached` from runChild
+			// would leave the tree-kill test green — it spawns its own child — and
+			// silently break the production path, so pin group leadership here.
+			const groupLog = join(testDir, "group.log");
+			const kokoroBin = await writeStub(
+				"group-reporter",
+				`ps -o pgid= -p $$ > "${groupLog}"
+printf '%s' $$ >> "${groupLog}"
+${kokoroStub(fixtureWav)}`,
+			);
+			const engines = new SpeechEngines(config({ kokoroBin }));
+
+			await engines.synthesize({ text: "hello" });
+
+			const [pgidLine, pidLine] = (await readFile(groupLog, "utf8")).split("\n");
+			const pgid = Number(pgidLine?.trim());
+			const pid = Number(pidLine?.trim());
+			expect(Number.isInteger(pid)).toBe(true);
+			expect(pgid).toBe(pid);
+		});
+
 		it("kills the whole process tree, not just the wrapper it spawned", async () => {
 			// A configured engine path is often a wrapper script. Killing only the
 			// wrapper reports a kill that did not happen and leaves the real work
 			// running while the concurrency slot is released.
+			//
+			// killTree is called directly rather than reached through a deadline:
+			// racing the wrapper's startup against a wall-clock timeout made this
+			// test fail on its own precondition under suite parallelism, which
+			// proves nothing about the kill. runChild spawns detached for exactly
+			// the reason reproduced here, so the spawn below mirrors it.
 			const grandchildPid = join(testDir, "grandchild.pid");
-			const kokoroBin = await writeStub(
+			const wrapper = await writeStub(
 				"wrapper",
 				`sleep 300 &
 printf '%s' "$!" > "${grandchildPid}"
 wait`,
 			);
-			// Generous deadline on purpose: the wrapper has to actually start and
-			// record its grandchild before the kill, or the test proves nothing.
-			const engines = new SpeechEngines(config({ kokoroBin, synthesizeTimeoutMs: 2000 }));
+			const child = spawn(wrapper, [], { stdio: "ignore", detached: true });
+			child.on("error", () => undefined);
 
-			await expectSpeechError(engines.synthesize({ text: "hello" }), "engine_timeout");
+			try {
+				// Nothing is killing the wrapper yet, so this cannot race.
+				const pid = await waitForPid(grandchildPid);
 
-			expect(await exists(grandchildPid)).toBe(true);
-			const pid = Number(await readFile(grandchildPid, "utf8"));
-			expect(Number.isInteger(pid)).toBe(true);
-			let alive = true;
-			for (let i = 0; i < 30 && alive; i++) {
-				try {
-					process.kill(pid, 0);
-					await new Promise((resolve) => setTimeout(resolve, 100));
-				} catch {
-					alive = false;
+				killTree(child, "SIGTERM");
+
+				expect(await waitUntilDead(pid)).toBe(true);
+			} finally {
+				// Backstop for an early throw. Guarded because killTree signals a
+				// process group by number: once the wrapper has exited and been
+				// reaped, that number can belong to somebody else.
+				if (child.exitCode === null && child.signalCode === null) {
+					killTree(child, "SIGKILL");
 				}
 			}
-			expect(alive).toBe(false);
 		});
 
 		it("does not settle until a child that ignores SIGTERM is actually dead", async () => {
@@ -360,6 +440,86 @@ exit 3`,
 			expect(error.message).toContain("exited with code 3");
 			expect(error.detail).toContain("failed to initialize whisper context");
 			expect(error.detail).not.toContain("vad options documentation");
+		});
+
+		it("reports a zero exit with an error line as unreadable audio, not silence", async () => {
+			// whisper exits zero for a file it could not read at all, so without this
+			// a corrupt or m4a upload is indistinguishable from a silent recording.
+			const whisperBin = await writeStub(
+				"whisper",
+				`printf "error: failed to read audio file 'in.wav'\\n" >&2
+exit 0`,
+			);
+			const engines = new SpeechEngines(config({ whisperBin }));
+
+			const error = await expectSpeechError(engines.transcribe(makeWav(2400)), "unreadable_audio");
+			expect(error.statusCode).toBe(400);
+			expect(error.message).toContain("wav, mp3, ogg and flac");
+			expect(error.message).toContain("m4a");
+			expect(error.detail).toContain("failed to read audio file 'in.wav'");
+		});
+
+		it("blames the language, not the audio, when whisper does not know the code", async () => {
+			// whisper rejects an unknown language at exit 0 too. Reporting that as
+			// unreadable audio tells the caller to re-encode a file that was fine,
+			// which is a retry loop with no exit.
+			const whisperBin = await writeStub(
+				"whisper",
+				`printf "error: unknown language 'jp'\\n" >&2
+printf ' this recording is perfectly fine\\n'
+exit 0`,
+			);
+			const engines = new SpeechEngines(config({ whisperBin }));
+
+			const error = await expectSpeechError(
+				engines.transcribe(makeWav(2400), "jp"),
+				"invalid_request",
+			);
+			expect(error.statusCode).toBe(400);
+			expect(error.message).toContain('"jp"');
+			expect(error.message).toContain("ja not jp");
+			expect(error.detail).toContain("unknown language 'jp'");
+		});
+
+		it("charges an unrecognised error line to the engine, not to the caller", async () => {
+			// Safe degradation: a phrasing whisper adds later must not be blamed on
+			// the caller's bytes, and must still never be reported as silence.
+			const whisperBin = await writeStub(
+				"whisper",
+				`printf 'error: something we have never seen\\n' >&2
+exit 0`,
+			);
+			const engines = new SpeechEngines(config({ whisperBin }));
+
+			const error = await expectSpeechError(engines.transcribe(makeWav(2400)), "engine_failed");
+			expect(error.statusCode).toBe(500);
+			expect(error.detail).toContain("something we have never seen");
+		});
+
+		it("treats a clean run with no output as silence, not a failure", async () => {
+			// The inverse defect: reporting an error for a legitimately silent
+			// recording breaks a working case.
+			const whisperBin = await writeStub("whisper", "exit 0");
+			const engines = new SpeechEngines(config({ whisperBin }));
+
+			const result = await engines.transcribe(makeWav(2400));
+
+			expect(result.text).toBe("");
+		});
+
+		it("does not mistake benign stderr chatter for an error", async () => {
+			const whisperBin = await writeStub(
+				"whisper",
+				`printf 'warning: model was trained elsewhere\\n' >&2
+printf 'whisper_print_timings: total = 0 errors\\n' >&2
+printf ' the build is green\\n'
+exit 0`,
+			);
+			const engines = new SpeechEngines(config({ whisperBin }));
+
+			const result = await engines.transcribe(makeWav(2400));
+
+			expect(result.text).toBe("the build is green");
 		});
 
 		it("detects a missing whisper model before spawning", async () => {

@@ -23,6 +23,11 @@ const LANGUAGE_PATTERN = /^[a-z]{2}$/;
 /** whisper emits these when it hears nothing; they are not transcript text. */
 const NON_SPEECH_MARKERS = /\[(BLANK_AUDIO|SILENCE|NO SPEECH|INAUDIBLE)\]/gi;
 
+/** whisper rejected the language, not the audio. */
+const UNKNOWN_LANGUAGE_ERROR = /^error: unknown language/i;
+/** whisper could not get at the audio at all. */
+const UNREADABLE_AUDIO_ERROR = /failed to (read|open|decode|retrieve)|input file not found/i;
+
 export interface SynthesizeOptions {
 	text: string;
 	voice?: string;
@@ -96,11 +101,44 @@ function probePath(name: string, timeoutMs: number): Promise<string | null> {
  * the lines the engine marked as errors; fall back to the tail only when there
  * are none.
  */
-function extractDetail(stderr: string, exitCode: number | null): string {
-	const errorLines = stderr
+function engineErrorLines(stderr: string): string[] {
+	return stderr
 		.split("\n")
 		.map((line) => line.trim())
 		.filter((line) => /^error:/i.test(line));
+}
+
+/**
+ * Attributes an `error:` line whisper produced while still exiting zero.
+ *
+ * Every branch throws: an `error:` line means the run was not clean, so a
+ * transcript must never be returned — reporting a failure as silence is the
+ * defect this classification exists to prevent. Only the blame differs, and an
+ * unrecognised message is charged to the engine rather than to the caller's
+ * bytes, so a phrasing whisper adds later degrades into honest engine trouble
+ * instead of a wrong accusation.
+ */
+function classifyTranscribeError(errorLines: string[], language: string): SpeechError {
+	const detail = errorLines.join("\n").slice(-DETAIL_CAP_CHARS);
+	if (errorLines.some((line) => UNKNOWN_LANGUAGE_ERROR.test(line))) {
+		return new SpeechError(
+			"invalid_request",
+			`whisper-cli does not know the language "${language}"; it wants an ISO 639-1 code, which is often not the country code (ja not jp, zh not cn, ko not kr, da not dk, sv not se)`,
+			detail,
+		);
+	}
+	if (errorLines.some((line) => UNREADABLE_AUDIO_ERROR.test(line))) {
+		return new SpeechError(
+			"unreadable_audio",
+			"whisper-cli could not read the audio; supported formats are wav, mp3, ogg and flac, not m4a (which is what iOS records by default)",
+			detail,
+		);
+	}
+	return new SpeechError("engine_failed", "whisper-cli reported an error", detail);
+}
+
+function extractDetail(stderr: string, exitCode: number | null): string {
+	const errorLines = engineErrorLines(stderr);
 	const body = errorLines.length > 0 ? errorLines.join("\n") : stderr.trim();
 	const prefix = exitCode === null ? "" : `exit ${exitCode}\n`;
 	return `${prefix}${body}`.slice(-DETAIL_CAP_CHARS);
@@ -240,13 +278,14 @@ export class SpeechEngines {
 		const startedAt = Date.now();
 		try {
 			await writeFile(inPath, audio);
+			const requestedLanguage = language ?? "en";
 			const result = await runChild(
 				bin,
-				["-m", this.config.whisperModel, "-f", inPath, "-l", language ?? "en", "-nt", "-np"],
+				["-m", this.config.whisperModel, "-f", inPath, "-l", requestedLanguage, "-nt", "-np"],
 				{ timeoutMs: this.config.transcribeTimeoutMs },
 			);
-			// whisper fails with an empty stdout rather than an error on stdout, so
-			// the exit code is the only thing that separates "silence" from "broken".
+			// whisper reports failure with an empty stdout rather than an error on
+			// stdout, so silence and breakage look identical there.
 			if (result.code !== 0) {
 				throw new SpeechError(
 					"engine_failed",
@@ -254,7 +293,18 @@ export class SpeechEngines {
 					extractDetail(result.stderr, result.code),
 				);
 			}
-			// An empty transcript after a zero exit means silence, which is a
+			// It also exits zero for work it refused outright — audio it could not
+			// read, a language it does not know — so the exit code does not separate
+			// those from a clean run either. Its `error:` lines do: they appear only
+			// when something was rejected, and never on a clean run however quiet the
+			// audio. Empty stdout is not a discriminator — a valid but very short or
+			// garbage-payload clip is readable and legitimately transcribes to
+			// nothing — so classify the line rather than the emptiness.
+			const errorLines = engineErrorLines(result.stderr);
+			if (errorLines.length > 0) {
+				throw classifyTranscribeError(errorLines, requestedLanguage);
+			}
+			// An empty transcript after a clean run means silence, which is a
 			// legitimate result, not a failure.
 			const text = result.stdout.replace(NON_SPEECH_MARKERS, " ").replace(/\s+/g, " ").trim();
 			return { text, durationMs: Date.now() - startedAt };
@@ -463,8 +513,12 @@ function validateSynthesizeOptions(options: SynthesizeOptions): {
  * leaves the real workload running while the caller is told it was killed. On
  * POSIX the child leads its own process group (`detached`), so the negative pid
  * reaches the whole tree. The group may already be gone — ESRCH must not throw.
+ *
+ * Exported as a seam: reaching this through a wall-clock deadline means racing
+ * the shell's startup against the timeout, which is what made the tree-kill test
+ * flake under suite parallelism.
  */
-function killTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
+export function killTree(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
 	const pid = child.pid;
 	if (pid === undefined || isWindows()) {
 		try {

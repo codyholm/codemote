@@ -10,6 +10,7 @@ export type SpeechErrorCode =
 	| "engine_timeout"
 	| "engine_failed"
 	| "empty_output"
+	| "unreadable_audio"
 	| "playback_unsupported";
 
 const STATUS_BY_CODE: Record<SpeechErrorCode, number> = {
@@ -21,6 +22,9 @@ const STATUS_BY_CODE: Record<SpeechErrorCode, number> = {
 	engine_timeout: 504,
 	engine_failed: 500,
 	empty_output: 500,
+	// The caller's bytes are at fault, and identical bytes will always fail, so a
+	// 5xx would wrongly invite a retry.
+	unreadable_audio: 400,
 	playback_unsupported: 501,
 };
 
