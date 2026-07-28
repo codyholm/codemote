@@ -34,6 +34,7 @@ import {
 	stopService,
 	uninstallService,
 } from "./service.js";
+import { runSpeechSubcommand } from "./speech.js";
 import { ensureLocalTLS, fetchRelayTlsPin } from "./tls.js";
 import { renderUI, updateStatus } from "./ui.js";
 
@@ -128,6 +129,7 @@ Usage:
   codemote service install|start|stop|status|uninstall|logs [--remote <relay-url>]
   codemote cache refresh
   codemote config [list|get <key>|set <key> <value>|path]
+  codemote speech serve|status|say "<text>"
 
 Options:
   -h, --help     Show this help message
@@ -141,6 +143,12 @@ Environment:
   CODEMOTE_PAIRING_STORE_PATH  Override trusted pairing store JSON path
   CODEMOTE_REMOTE_RELAY_URL    Default hosted relay URL for --remote
   CODEMOTE_STATUS_FILE         Machine-readable status file path
+  CODEMOTE_SPEECH              Set to 0 to disable the local speech service
+  CODEMOTE_SPEECH_PORT         Speech service port (default: PORT + 2)
+  CODEMOTE_KOKORO_BIN          Path to kokoro-tts-tool (text to speech)
+  CODEMOTE_KOKORO_MODEL_DIR    Directory holding the Kokoro model files
+  CODEMOTE_WHISPER_BIN         Path to whisper-cli (speech to text)
+  CODEMOTE_WHISPER_MODEL       Path to the whisper .bin model
 
 ${pkg.homepage}`);
 }
@@ -561,6 +569,11 @@ async function run(): Promise<void> {
 
 	if (command === "config") {
 		await runConfigSubcommand(rawArgs.slice(1));
+		return;
+	}
+
+	if (command === "speech") {
+		await runSpeechSubcommand(rawArgs.slice(1));
 		return;
 	}
 

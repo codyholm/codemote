@@ -35,6 +35,26 @@ export { loadConfig, validateConfig } from "./uplink/config.js";
 export { SmokeTestHarness, runAllSmokeTests } from "./uplink/smoke/index.js";
 export type { SmokeTestConfig, SmokeTestResult } from "./uplink/smoke/index.js";
 
+// ── Speech exports ─────────────────────────────────────────────
+export {
+	createSpeechServer,
+	// Renamed at package level so a bare `isLoopbackHost` cannot be mistaken
+	// for uplink's identically named predicate.
+	isLoopbackHost as isSpeechLoopbackHost,
+	loadSpeechConfig,
+	speechEnabled,
+	speechPortOverride,
+	SpeechError,
+} from "./speech/index.js";
+export type {
+	EngineStatus,
+	SpeechConfig,
+	SpeechDiscoveryFile,
+	SpeechHealth,
+	SpeechServerHandle,
+	WavInfo,
+} from "./speech/index.js";
+
 // ── Types (re-exported from uplink/types + common) ─────────────
 export type {
 	ModelInfo,

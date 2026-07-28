@@ -41,10 +41,15 @@ import {
 	type RelayServerConfig,
 	type RuntimeType,
 	type SessionStatus,
+	type SpeechServerHandle,
 	type TrustedPairingRecord,
 	type UplinkConfig,
 	UplinkServer,
 	createRelayServer,
+	createSpeechServer,
+	loadSpeechConfig,
+	speechEnabled,
+	speechPortOverride,
 } from "@codemote/server";
 import { startRelayUplinkBridge } from "./bridge.js";
 import { ensureLocalTLS, fetchRelayTlsPin } from "./tls.js";
@@ -291,6 +296,28 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 	console.log(`[Server] Uplink started on port ${port + 1}`);
 
+	// Local speech service, loopback-only, on the next port after uplink.
+	// It is optional infrastructure: if it cannot start, the control plane must.
+	let speech: SpeechServerHandle | null = null;
+	if (speechEnabled()) {
+		const speechConfig = loadSpeechConfig();
+		// Only a valid override wins; an unusable one falls back to the relative
+		// port, not to the standalone default.
+		const speechPort = speechPortOverride() ?? port + 2;
+		try {
+			speech = createSpeechServer({ ...speechConfig, port: speechPort, host: "127.0.0.1" });
+			await speech.start();
+			console.log(`[Server] Speech service started on 127.0.0.1:${speech.port}`);
+		} catch (error) {
+			speech = null;
+			console.log(
+				`[Server] Speech service unavailable: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+
 	const statusState: {
 		running: boolean;
 		mode: "local" | "remote";
@@ -475,7 +502,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 			}
 			handleConnectionsChanged = undefined;
 			await bridge.stop();
-			await Promise.all([relay?.stop(), uplink.stop()]);
+			await Promise.all([relay?.stop(), uplink.stop(), speech?.stop()]);
 			await writeStatus({ running: false, stoppedAt: new Date().toISOString() });
 			console.log("[Server] Stopped");
 		},

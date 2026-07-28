@@ -5,7 +5,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
 import { type ServerHandle, startServer } from "./server.js";
 
@@ -18,12 +18,25 @@ import { type ServerHandle, startServer } from "./server.js";
 describe("Server Integration", { timeout: 30000 }, () => {
 	let server: ServerHandle | null = null;
 	const testPort = 18080; // Use high port to avoid conflicts
+	let speechDir: string;
+
+	// startServer also starts the speech service, which publishes its endpoint to
+	// ~/.codemote/speech.json and removes it on stop. Left unredirected, running
+	// this suite while `codemote` is up would overwrite and then delete the live
+	// file, and `codemote speech status` would report a running service as gone.
+	// Speech stays enabled here so the wiring is exercised; only the path moves.
+	beforeEach(async () => {
+		speechDir = await mkdtemp(join(tmpdir(), "server-test-speech-"));
+		vi.stubEnv("CODEMOTE_SPEECH_DISCOVERY_FILE", join(speechDir, "speech.json"));
+	});
 
 	afterEach(async () => {
 		if (server) {
 			await server.stop();
 			server = null;
 		}
+		vi.unstubAllEnvs();
+		await rm(speechDir, { recursive: true, force: true });
 	});
 
 	describe("startServer", () => {
