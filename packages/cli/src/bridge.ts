@@ -536,10 +536,13 @@ class UplinkWsClient {
 	}
 
 	async addProject(name: string, path: string) {
-		return this.sendAndWait({
-			type: "add_project",
-			payload: { name, path },
-		});
+		return this.sendAndWait(
+			{
+				type: "add_project",
+				payload: { name, path },
+			},
+			{ bypassQueue: true },
+		);
 	}
 
 	async listProjects() {
@@ -547,17 +550,23 @@ class UplinkWsClient {
 	}
 
 	async renameProject(path: string, name: string) {
-		return this.sendAndWait({
-			type: "rename_project",
-			payload: { path, name },
-		});
+		return this.sendAndWait(
+			{
+				type: "rename_project",
+				payload: { path, name },
+			},
+			{ bypassQueue: true },
+		);
 	}
 
 	async removeProject(path: string) {
-		return this.sendAndWait({
-			type: "remove_project",
-			payload: { path },
-		});
+		return this.sendAndWait(
+			{
+				type: "remove_project",
+				payload: { path },
+			},
+			{ bypassQueue: true },
+		);
 	}
 
 	async listModels(profile: RuntimeType) {
@@ -2484,7 +2493,7 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 		const name = (payload as { name?: unknown }).name;
 		const path = (payload as { path?: unknown }).path;
 		if (typeof name === "string" && typeof path === "string") {
-			return { type: "add_project", name: name.trim(), path: path.trim() };
+			return { type: "add_project", name: name.trim(), path };
 		}
 		return null;
 	}
@@ -2497,7 +2506,7 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 		const path = (payload as { path?: unknown }).path;
 		const name = (payload as { name?: unknown }).name;
 		if (typeof path === "string" && typeof name === "string") {
-			return { type: "rename_project", path: path.trim(), name: name.trim() };
+			return { type: "rename_project", path, name: name.trim() };
 		}
 		return null;
 	}
@@ -2505,7 +2514,7 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 	if (type === "remove_project") {
 		const path = (payload as { path?: unknown }).path;
 		if (typeof path === "string") {
-			return { type: "remove_project", path: path.trim() };
+			return { type: "remove_project", path };
 		}
 		return null;
 	}

@@ -46,11 +46,10 @@ function normalizePath(value: unknown): string {
 		throw new ProjectRegistryError("INVALID_PROJECT", "Project path must be an absolute path");
 	}
 
-	const trimmed = value.trim();
-	if (!isAbsolute(trimmed)) {
+	if (!isAbsolute(value)) {
 		throw new ProjectRegistryError("INVALID_PROJECT", "Project path must be an absolute path");
 	}
-	return resolve(trimmed);
+	return resolve(value);
 }
 
 function normalizeProject(value: unknown): RegisteredProject {
@@ -103,10 +102,13 @@ function parseRegistryFile(value: unknown): RegisteredProject[] {
  */
 export class ProjectRegistry {
 	private readonly filePath: string;
+	private readonly backupPath: string;
 	private projects: RegisteredProject[];
 
 	constructor(filePath: string) {
 		this.filePath = filePath;
+		this.backupPath = `${filePath}.bak`;
+		this.recoverInterruptedReplacement();
 		this.projects = this.load();
 	}
 
@@ -179,11 +181,22 @@ export class ProjectRegistry {
 		return parseRegistryFile(parsed);
 	}
 
+	private recoverInterruptedReplacement(): void {
+		if (existsSync(this.filePath) || !existsSync(this.backupPath)) return;
+
+		try {
+			renameSync(this.backupPath, this.filePath);
+		} catch {
+			throw new ProjectRegistryError("PROJECT_REGISTRY_IO", "Failed to recover project registry");
+		}
+	}
+
 	private persist(projects: RegisteredProject[]): void {
 		const file: ProjectRegistryFile = {
 			projects: projects.map((project) => ({ ...project })),
 		};
 		const tmpPath = `${this.filePath}.tmp`;
+		let backupCreated = false;
 
 		try {
 			const parent = dirname(this.filePath);
@@ -196,18 +209,36 @@ export class ProjectRegistry {
 			restrictFilePermissions(tmpPath);
 			chmodSync(tmpPath, 0o600);
 
-			// Match the existing persistence convention for Windows, where rename
-			// does not replace an existing file.
-			if (process.platform === "win32") {
-				try {
-					unlinkSync(this.filePath);
-				} catch {
-					// The target may not exist on the first mutation.
+			if (process.platform === "win32" && existsSync(this.filePath)) {
+				if (existsSync(this.backupPath)) {
+					unlinkSync(this.backupPath);
 				}
+				renameSync(this.filePath, this.backupPath);
+				backupCreated = true;
 			}
-			renameSync(tmpPath, this.filePath);
+
+			try {
+				renameSync(tmpPath, this.filePath);
+			} catch (error) {
+				if (backupCreated && !existsSync(this.filePath)) {
+					try {
+						renameSync(this.backupPath, this.filePath);
+					} catch {
+						// Leave the backup for constructor recovery on the next restart.
+					}
+				}
+				throw error;
+			}
 		} catch {
 			throw new ProjectRegistryError("PROJECT_REGISTRY_IO", "Failed to persist project registry");
+		}
+
+		if (backupCreated) {
+			try {
+				unlinkSync(this.backupPath);
+			} catch {
+				// The new target is authoritative; stale backup cleanup is best effort.
+			}
 		}
 	}
 }

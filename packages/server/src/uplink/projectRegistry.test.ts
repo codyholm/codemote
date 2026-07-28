@@ -73,6 +73,30 @@ describe("ProjectRegistry", () => {
 		}
 	});
 
+	it("preserves trailing-space path identity", () => {
+		const registry = new ProjectRegistry(registryPath);
+		const plainPath = join(fixtureDir, "projects", "spaced");
+		const trailingSpacePath = `${plainPath} `;
+
+		expect(registry.add("Trailing space", trailingSpacePath)).toEqual({
+			name: "Trailing space",
+			path: resolve(trailingSpacePath),
+		});
+		expect(registry.add("Plain", plainPath)).toEqual({
+			name: "Plain",
+			path: resolve(plainPath),
+		});
+
+		const projects = new ProjectRegistry(registryPath).list();
+		expect(projects).toHaveLength(2);
+		expect(projects).toEqual(
+			expect.arrayContaining([
+				{ name: "Trailing space", path: resolve(trailingSpacePath) },
+				{ name: "Plain", path: resolve(plainPath) },
+			]),
+		);
+	});
+
 	it("rejects duplicate normalized paths and invalid mutation input", async () => {
 		const registry = new ProjectRegistry(registryPath);
 		const projectPath = join(fixtureDir, "projects", "same");
@@ -147,6 +171,26 @@ describe("ProjectRegistry", () => {
 		expect(registry.list()).toEqual([{ name: "First", path: resolve(firstPath) }]);
 		expect(await readFile(registryPath, "utf8")).toBe(goodFile);
 		expect(new ProjectRegistry(registryPath).list()).toEqual(registry.list());
+	});
+
+	it("recovers the last good snapshot left by an interrupted Windows replacement", async () => {
+		const backupPath = `${registryPath}.bak`;
+		const tmpPath = `${registryPath}.tmp`;
+		const projectPath = join(fixtureDir, "projects", "last-good");
+		const lastGood = {
+			projects: [{ name: "Last good", path: projectPath }],
+		};
+
+		await mkdir(dirname(registryPath), { recursive: true });
+		await writeFile(backupPath, JSON.stringify(lastGood), "utf8");
+		await writeFile(tmpPath, JSON.stringify({ projects: [] }), "utf8");
+
+		const registry = new ProjectRegistry(registryPath);
+
+		expect(registry.list()).toEqual(lastGood.projects);
+		expect(JSON.parse(await readFile(registryPath, "utf8"))).toEqual(lastGood);
+		expect(existsSync(backupPath)).toBe(false);
+		expect(existsSync(tmpPath)).toBe(true);
 	});
 
 	it("persists complete add, rename, and remove results across instances", () => {

@@ -156,9 +156,10 @@ describe("bridge project state", { timeout: 30000 }, () => {
 	});
 
 	it("routes registry CRUD, list state, failures, and an interleaved push", async () => {
-		const projectPath = "/tmp/bridge-alpha";
-		const missingPath = "/tmp/bridge-missing";
+		const projectPath = "/tmp/bridge-alpha ";
+		const missingPath = "/tmp/bridge-missing ";
 		const commands: JsonRecord[] = [];
+		let removeCount = 0;
 
 		uplinkWss.on("connection", (socket) => {
 			socket.on("message", (raw) => {
@@ -219,8 +220,8 @@ describe("bridge project state", { timeout: 30000 }, () => {
 				}
 
 				if (type === "remove_project") {
-					const payload = command["payload"] as JsonRecord;
-					if (payload["path"] === missingPath) {
+					removeCount += 1;
+					if (removeCount === 2) {
 						socket.send(
 							JSON.stringify({
 								type: "error",
@@ -272,7 +273,7 @@ describe("bridge project state", { timeout: 30000 }, () => {
 					payload: {
 						type: "add_project",
 						name: "  Alpha  ",
-						path: `  ${projectPath}  `,
+						path: projectPath,
 					},
 				}),
 			);
@@ -328,7 +329,7 @@ describe("bridge project state", { timeout: 30000 }, () => {
 					type: "message",
 					payload: {
 						type: "rename_project",
-						path: ` ${projectPath} `,
+						path: projectPath,
 						name: " Beta ",
 					},
 				}),
@@ -356,7 +357,7 @@ describe("bridge project state", { timeout: 30000 }, () => {
 			mobileSocket.send(
 				JSON.stringify({
 					type: "message",
-					payload: { type: "remove_project", path: ` ${projectPath} ` },
+					payload: { type: "remove_project", path: projectPath },
 				}),
 			);
 			await waitForCondition(
@@ -386,7 +387,7 @@ describe("bridge project state", { timeout: 30000 }, () => {
 			mobileSocket.send(
 				JSON.stringify({
 					type: "message",
-					payload: { type: "remove_project", path: ` ${missingPath} ` },
+					payload: { type: "remove_project", path: missingPath },
 				}),
 			);
 			await waitForCondition(
@@ -452,20 +453,20 @@ describe("bridge project state", { timeout: 30000 }, () => {
 		}
 	});
 
-	it("validates and trims registry mobile messages", () => {
+	it("validates registry mobile messages while trimming only names", () => {
 		expect(
-			decodeMobileInbound({ type: "add_project", name: " Name ", path: " /tmp/project " }),
-		).toEqual({ type: "add_project", name: "Name", path: "/tmp/project" });
+			decodeMobileInbound({ type: "add_project", name: " Name ", path: "/tmp/project " }),
+		).toEqual({ type: "add_project", name: "Name", path: "/tmp/project " });
 		expect(
 			decodeMobileInbound({
 				type: "rename_project",
-				path: " /tmp/project ",
+				path: "/tmp/project ",
 				name: " Renamed ",
 			}),
-		).toEqual({ type: "rename_project", path: "/tmp/project", name: "Renamed" });
-		expect(decodeMobileInbound({ type: "remove_project", path: " /tmp/project " })).toEqual({
+		).toEqual({ type: "rename_project", path: "/tmp/project ", name: "Renamed" });
+		expect(decodeMobileInbound({ type: "remove_project", path: "/tmp/project " })).toEqual({
 			type: "remove_project",
-			path: "/tmp/project",
+			path: "/tmp/project ",
 		});
 		expect(decodeMobileInbound({ type: "list_projects" })).toEqual({ type: "list_projects" });
 
@@ -474,6 +475,133 @@ describe("bridge project state", { timeout: 30000 }, () => {
 			decodeMobileInbound({ type: "rename_project", path: "/tmp/project", name: false }),
 		).toBeNull();
 		expect(decodeMobileInbound({ type: "remove_project", path: null })).toBeNull();
+	});
+
+	it("starts a registry mutation while a long agent command remains unresolved", async () => {
+		const projectPath = "/tmp/independent-registry ";
+		const commands: JsonRecord[] = [];
+		let releaseStart: (() => void) | undefined;
+		let startReleased = false;
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				commands.push(command);
+
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+					return;
+				}
+
+				if (command["type"] === "get_project_state") {
+					socket.send(
+						JSON.stringify({
+							type: "project_state",
+							requestId: command["requestId"],
+							payload: aggregate(SOLICITED),
+						}),
+					);
+					return;
+				}
+
+				if (command["type"] === "start_run") {
+					releaseStart = () => {
+						startReleased = true;
+						socket.send(
+							JSON.stringify({
+								type: "run_started",
+								requestId: command["requestId"],
+								payload: { runId: "run-held", sessionId: "session-held" },
+							}),
+						);
+					};
+					return;
+				}
+
+				if (command["type"] === "add_project") {
+					socket.send(JSON.stringify({ type: "project_state_push", payload: aggregate(PUSHED) }));
+					socket.send(
+						JSON.stringify({
+							type: "project_registry_result",
+							requestId: command["requestId"],
+							payload: { operation: "add", path: projectPath, success: true },
+						}),
+					);
+				}
+			});
+		});
+
+		const relay = wireRelay(relayWss);
+		const observedPushes: number[] = [];
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+			onProjectState: (state) => observedPushes.push(state.sessionCount),
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			const toMobile: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const payload = mobilePayload(raw.toString());
+				if (payload) toMobile.push(payload);
+			});
+			await pairMobile(mobileSocket, bridge.pairingCode);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: {
+						type: "new_session",
+						runtime: "opencode",
+						prompt: "hold this run",
+					},
+				}),
+			);
+			await waitForCondition(
+				() => commands.some((command) => command["type"] === "start_run"),
+				15000,
+			);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "add_project", name: "Independent", path: projectPath },
+				}),
+			);
+
+			await waitForCondition(
+				() => commands.some((command) => command["type"] === "add_project"),
+				5000,
+			);
+			await waitForCondition(
+				() =>
+					toMobile.some(
+						(message) =>
+							message["type"] === "project_registry_result" && message["operation"] === "add",
+					),
+				5000,
+			);
+
+			expect(releaseStart).toBeDefined();
+			expect(startReleased).toBe(false);
+			expect(toMobile).toContainEqual({
+				type: "project_registry_result",
+				operation: "add",
+				path: projectPath,
+				success: true,
+			});
+			expect(observedPushes).toContain(PUSHED);
+		} finally {
+			releaseStart?.();
+			mobileSocket?.close();
+			await bridge.stop();
+			relay.dispose();
+		}
 	});
 
 	it("forwards an unsolicited push to a paired mobile", async () => {
