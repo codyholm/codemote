@@ -60,13 +60,23 @@ export interface ProjectSessionState {
 	statusChangedAt: number;
 }
 
+/** A user-named project persisted in the machine registry. */
+export interface RegisteredProject {
+	/** Trimmed non-empty display name. */
+	name: string;
+	/** Normalized absolute path used as the registry and session-grouping key. */
+	path: string;
+}
+
 export interface ProjectState {
 	/** Normalized absolute working directory. The only session-grouping identity
 	 * that survives a restart, since session and workspace ids are regenerated. */
 	id: string;
-	/** basename(id), for display. */
+	/** Persisted user name when registered; otherwise basename(id), for display. */
 	name: string;
 	path: string;
+	/** Whether this project comes from the persistent registry rather than sessions. */
+	registered: boolean;
 	/** The most urgent attention across this project's sessions, including any
 	 * omitted from `sessions` — a project must not look calm because its blocked
 	 * session was dropped. */

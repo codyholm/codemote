@@ -2,6 +2,7 @@ import type {
 	ModelInfo,
 	PendingAttention,
 	ProjectStateAggregate,
+	RegisteredProject,
 	RunOptions,
 	RunResult,
 	RuntimeType,
@@ -14,6 +15,7 @@ export type {
 	ModelInfo,
 	PendingAttention,
 	ProjectStateAggregate,
+	RegisteredProject,
 	RunOptions,
 	RunResult,
 	RuntimeType,
@@ -124,6 +126,10 @@ export type UplinkCommand =
 	  } & RequestEnvelope)
 	| ({ type: "list_sessions" } & RequestEnvelope)
 	| ({ type: "get_project_state" } & RequestEnvelope)
+	| ({ type: "add_project"; payload: { name: string; path: string } } & RequestEnvelope)
+	| ({ type: "list_projects" } & RequestEnvelope)
+	| ({ type: "rename_project"; payload: { path: string; name: string } } & RequestEnvelope)
+	| ({ type: "remove_project"; payload: { path: string } } & RequestEnvelope)
 	| ({ type: "list_models"; payload: { profile: RuntimeType } } & RequestEnvelope)
 	| ({ type: "list_directory"; payload: { path?: string } } & RequestEnvelope)
 	| ({ type: "list_runtimes" } & RequestEnvelope)
@@ -151,6 +157,14 @@ export type UplinkResponse =
 	| ({ type: "git_pr_result"; payload: { sessionId: string; url: string } } & RequestEnvelope)
 	| ({ type: "sessions"; payload: Session[] } & RequestEnvelope)
 	| ({ type: "project_state"; payload: ProjectStateAggregate } & RequestEnvelope)
+	| ({
+			type: "project_registry_result";
+			payload: {
+				operation: "add" | "rename" | "remove";
+				path: string;
+				success: true;
+			};
+	  } & RequestEnvelope)
 	// Deliberately a different type string from "project_state". The bridge falls
 	// back to matching an uncorrelated message against a pending request's expected
 	// response type, so an unsolicited broadcast sharing that string would resolve
@@ -215,6 +229,8 @@ export interface UplinkConfig {
 	host: string;
 	/** Repository root path */
 	repoPath: string;
+	/** Project registry file path override */
+	projectRegistryPath?: string;
 	/** Available runtime profiles */
 	runtimes: RuntimeType[];
 	/** Runtime-specific configurations */

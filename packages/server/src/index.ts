@@ -60,6 +60,7 @@ export type {
 	ModelInfo,
 	PendingAttention,
 	ProjectStateAggregate,
+	RegisteredProject,
 	RuntimeType,
 	SessionStatus,
 	StreamEvent,

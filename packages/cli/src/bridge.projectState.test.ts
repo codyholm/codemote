@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { ProjectStateAggregate } from "@codemote/common";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
-import { startRelayUplinkBridge } from "./bridge.js";
+import { decodeMobileInbound, startRelayUplinkBridge } from "./bridge.js";
 
 interface JsonRecord {
 	[key: string]: unknown;
@@ -27,6 +27,7 @@ function aggregate(sessionCount: number): ProjectStateAggregate {
 
 const PUSHED = 99;
 const SOLICITED = 7;
+const LISTED = 8;
 
 // These tests each start a real bridge against fake relay and uplink sockets, and
 // the bridge now issues its own get_project_state on pair, so a run has two
@@ -152,6 +153,327 @@ describe("bridge project state", { timeout: 30000 }, () => {
 			await bridge.stop();
 			relay.dispose();
 		}
+	});
+
+	it("routes registry CRUD, list state, failures, and an interleaved push", async () => {
+		const projectPath = "/tmp/bridge-alpha";
+		const missingPath = "/tmp/bridge-missing";
+		const commands: JsonRecord[] = [];
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				commands.push(command);
+				const type = command["type"];
+
+				if (type === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+					return;
+				}
+
+				if (type === "get_project_state") {
+					socket.send(
+						JSON.stringify({
+							type: "project_state",
+							requestId: command["requestId"],
+							payload: aggregate(SOLICITED),
+						}),
+					);
+					return;
+				}
+
+				if (type === "add_project") {
+					socket.send(JSON.stringify({ type: "project_state_push", payload: aggregate(PUSHED) }));
+					setTimeout(() => {
+						socket.send(
+							JSON.stringify({
+								type: "project_registry_result",
+								requestId: command["requestId"],
+								payload: { operation: "add", path: projectPath, success: true },
+							}),
+						);
+					}, 50);
+					return;
+				}
+
+				if (type === "list_projects") {
+					socket.send(
+						JSON.stringify({
+							type: "project_state",
+							requestId: command["requestId"],
+							payload: aggregate(LISTED),
+						}),
+					);
+					return;
+				}
+
+				if (type === "rename_project") {
+					socket.send(
+						JSON.stringify({
+							type: "project_registry_result",
+							requestId: command["requestId"],
+							payload: { operation: "rename", path: projectPath, success: true },
+						}),
+					);
+					return;
+				}
+
+				if (type === "remove_project") {
+					const payload = command["payload"] as JsonRecord;
+					if (payload["path"] === missingPath) {
+						socket.send(
+							JSON.stringify({
+								type: "error",
+								requestId: command["requestId"],
+								payload: {
+									message: `Project not found: ${missingPath}`,
+									code: "PROJECT_NOT_FOUND",
+								},
+							}),
+						);
+						return;
+					}
+					socket.send(
+						JSON.stringify({
+							type: "project_registry_result",
+							requestId: command["requestId"],
+							payload: { operation: "remove", path: projectPath, success: true },
+						}),
+					);
+				}
+			});
+		});
+
+		const relay = wireRelay(relayWss);
+		const observedPushes: number[] = [];
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+			onProjectState: (state) => observedPushes.push(state.sessionCount),
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			const toMobile: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const payload = mobilePayload(raw.toString());
+				if (payload) toMobile.push(payload);
+			});
+
+			await pairMobile(mobileSocket, bridge.pairingCode);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: {
+						type: "add_project",
+						name: "  Alpha  ",
+						path: `  ${projectPath}  `,
+					},
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					toMobile.some(
+						(message) =>
+							message["type"] === "project_registry_result" && message["operation"] === "add",
+					),
+				15000,
+			);
+			await waitForCondition(() => observedPushes.includes(PUSHED), 15000);
+
+			const pushIndex = toMobile.findIndex(
+				(message) =>
+					message["type"] === "project_state" &&
+					(message["state"] as ProjectStateAggregate).sessionCount === PUSHED,
+			);
+			const addIndex = toMobile.findIndex(
+				(message) =>
+					message["type"] === "project_registry_result" && message["operation"] === "add",
+			);
+			expect(pushIndex).toBeGreaterThanOrEqual(0);
+			expect(pushIndex).toBeLessThan(addIndex);
+			expect(toMobile[addIndex]).toEqual({
+				type: "project_registry_result",
+				operation: "add",
+				path: projectPath,
+				success: true,
+			});
+
+			mobileSocket.send(JSON.stringify({ type: "message", payload: { type: "list_projects" } }));
+			await waitForCondition(
+				() =>
+					toMobile.some(
+						(message) =>
+							message["type"] === "project_state" &&
+							(message["state"] as ProjectStateAggregate).sessionCount === LISTED,
+					),
+				15000,
+			);
+			expect(
+				toMobile.find(
+					(message) =>
+						message["type"] === "project_state" &&
+						(message["state"] as ProjectStateAggregate).sessionCount === LISTED,
+				),
+			).toEqual({ type: "project_state", state: aggregate(LISTED) });
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: {
+						type: "rename_project",
+						path: ` ${projectPath} `,
+						name: " Beta ",
+					},
+				}),
+			);
+			await waitForCondition(
+				() =>
+					toMobile.some(
+						(message) =>
+							message["type"] === "project_registry_result" && message["operation"] === "rename",
+					),
+				15000,
+			);
+			expect(
+				toMobile.find(
+					(message) =>
+						message["type"] === "project_registry_result" && message["operation"] === "rename",
+				),
+			).toEqual({
+				type: "project_registry_result",
+				operation: "rename",
+				path: projectPath,
+				success: true,
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "remove_project", path: ` ${projectPath} ` },
+				}),
+			);
+			await waitForCondition(
+				() =>
+					toMobile.some(
+						(message) =>
+							message["type"] === "project_registry_result" &&
+							message["operation"] === "remove" &&
+							message["success"] === true,
+					),
+				15000,
+			);
+			expect(
+				toMobile.find(
+					(message) =>
+						message["type"] === "project_registry_result" &&
+						message["operation"] === "remove" &&
+						message["success"] === true,
+				),
+			).toEqual({
+				type: "project_registry_result",
+				operation: "remove",
+				path: projectPath,
+				success: true,
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "remove_project", path: ` ${missingPath} ` },
+				}),
+			);
+			await waitForCondition(
+				() =>
+					toMobile.some(
+						(message) =>
+							message["type"] === "project_registry_result" &&
+							message["operation"] === "remove" &&
+							message["success"] === false,
+					),
+				15000,
+			);
+			expect(
+				toMobile.find(
+					(message) =>
+						message["type"] === "project_registry_result" &&
+						message["operation"] === "remove" &&
+						message["success"] === false,
+				),
+			).toEqual({
+				type: "project_registry_result",
+				operation: "remove",
+				path: missingPath,
+				success: false,
+				error: `Project not found: ${missingPath}`,
+			});
+
+			const registryCommands = commands.filter((command) =>
+				["add_project", "list_projects", "rename_project", "remove_project"].includes(
+					String(command["type"]),
+				),
+			);
+			expect(registryCommands).toEqual([
+				expect.objectContaining({
+					type: "add_project",
+					requestId: expect.any(String),
+					payload: { name: "Alpha", path: projectPath },
+				}),
+				expect.objectContaining({
+					type: "list_projects",
+					requestId: expect.any(String),
+				}),
+				expect.objectContaining({
+					type: "rename_project",
+					requestId: expect.any(String),
+					payload: { path: projectPath, name: "Beta" },
+				}),
+				expect.objectContaining({
+					type: "remove_project",
+					requestId: expect.any(String),
+					payload: { path: projectPath },
+				}),
+				expect.objectContaining({
+					type: "remove_project",
+					requestId: expect.any(String),
+					payload: { path: missingPath },
+				}),
+			]);
+		} finally {
+			mobileSocket?.close();
+			await bridge.stop();
+			relay.dispose();
+		}
+	});
+
+	it("validates and trims registry mobile messages", () => {
+		expect(
+			decodeMobileInbound({ type: "add_project", name: " Name ", path: " /tmp/project " }),
+		).toEqual({ type: "add_project", name: "Name", path: "/tmp/project" });
+		expect(
+			decodeMobileInbound({
+				type: "rename_project",
+				path: " /tmp/project ",
+				name: " Renamed ",
+			}),
+		).toEqual({ type: "rename_project", path: "/tmp/project", name: "Renamed" });
+		expect(decodeMobileInbound({ type: "remove_project", path: " /tmp/project " })).toEqual({
+			type: "remove_project",
+			path: "/tmp/project",
+		});
+		expect(decodeMobileInbound({ type: "list_projects" })).toEqual({ type: "list_projects" });
+
+		expect(decodeMobileInbound({ type: "add_project", name: 1, path: "/tmp/project" })).toBeNull();
+		expect(
+			decodeMobileInbound({ type: "rename_project", path: "/tmp/project", name: false }),
+		).toBeNull();
+		expect(decodeMobileInbound({ type: "remove_project", path: null })).toBeNull();
 	});
 
 	it("forwards an unsolicited push to a paired mobile", async () => {

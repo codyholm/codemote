@@ -3,6 +3,7 @@ import type {
 	ProjectSessionState,
 	ProjectState,
 	ProjectStateAggregate,
+	RegisteredProject,
 	SessionAttentionState,
 } from "@codemote/common";
 import {
@@ -17,6 +18,12 @@ import type { Session } from "./types.js";
 interface GroupedSession {
 	projectId: string;
 	state: ProjectSessionState;
+}
+
+interface ProjectGroup {
+	name: string;
+	registered: boolean;
+	sessions: GroupedSession[];
 }
 
 function compareSessions(a: GroupedSession, b: GroupedSession): number {
@@ -44,12 +51,16 @@ function compareStrings(a: string, b: string): number {
 }
 
 /**
- * Group sessions by project, classify each one, order both levels attention-first,
- * and bound the result so it always fits the transport.
+ * Combine registered projects with path-grouped sessions, classify each session,
+ * order both levels attention-first, and bound the result for transport.
  *
  * Pure: `now` is injected rather than read, so callers and tests get the same answer.
  */
-export function buildProjectState(sessions: Session[], now: number): ProjectStateAggregate {
+export function buildProjectState(
+	sessions: Session[],
+	registeredProjects: RegisteredProject[],
+	now: number,
+): ProjectStateAggregate {
 	const all: GroupedSession[] = sessions.map((session) => {
 		const attention = attentionForSession(session.status, session.attention !== undefined);
 		return {
@@ -80,29 +91,42 @@ export function buildProjectState(sessions: Session[], now: number): ProjectStat
 		all.slice(0, PROJECT_STATE_MAX_SESSIONS).map((entry) => entry.state.sessionId),
 	);
 
-	const groups = new Map<string, GroupedSession[]>();
+	const groups = new Map<string, ProjectGroup>();
+	for (const project of registeredProjects) {
+		const id = resolve(project.path);
+		groups.set(id, {
+			name: project.name,
+			registered: true,
+			sessions: [],
+		});
+	}
+
 	for (const entry of all) {
 		const group = groups.get(entry.projectId);
 		if (group) {
-			group.push(entry);
+			group.sessions.push(entry);
 			continue;
 		}
-		groups.set(entry.projectId, [entry]);
+		groups.set(entry.projectId, {
+			name: basename(entry.projectId) || entry.projectId,
+			registered: false,
+			sessions: [entry],
+		});
 	}
 
 	const projects: ProjectState[] = [];
 	for (const [id, group] of groups) {
 		// A stable filter of the already-sorted list preserves the global order.
-		const kept = group
+		const kept = group.sessions
 			.filter((entry) => keptIds.has(entry.state.sessionId))
 			.map((entry) => entry.state);
 
 		// Ranked over every session including the omitted ones: a project must not
 		// look calm because its blocked session fell outside the cap.
 		let worst: SessionAttentionState = "done";
-		let worstRank = Number.POSITIVE_INFINITY;
+		let worstRank = ATTENTION_RANK.done;
 		let lastActivityAt = 0;
-		for (const entry of group) {
+		for (const entry of group.sessions) {
 			if (entry.state.attentionRank < worstRank) {
 				worstRank = entry.state.attentionRank;
 				worst = entry.state.attention;
@@ -114,12 +138,13 @@ export function buildProjectState(sessions: Session[], now: number): ProjectStat
 
 		projects.push({
 			id,
-			name: basename(id) || id,
+			name: group.name,
 			path: id,
+			registered: group.registered,
 			attention: worst,
 			attentionRank: worstRank,
-			sessionCount: group.length,
-			sessionsOmitted: group.length - kept.length,
+			sessionCount: group.sessions.length,
+			sessionsOmitted: group.sessions.length - kept.length,
 			lastActivityAt,
 			sessions: kept,
 		});
@@ -130,7 +155,7 @@ export function buildProjectState(sessions: Session[], now: number): ProjectStat
 	const projectCount = projects.length;
 
 	// The count cap alone does not bound size: each project carries its full path
-	// twice plus a basename, and a path is bounded only by PATH_MAX. Admitting
+	// twice plus a display name, and a path is bounded only by PATH_MAX. Admitting
 	// projects against a running byte total keeps `truncated` honest for long paths
 	// too. Accumulated incrementally rather than by re-serializing the aggregate,
 	// because this runs on every status event.
@@ -184,9 +209,10 @@ export function buildProjectState(sessions: Session[], now: number): ProjectStat
  * write that changed nothing. Array order is derived from `lastActivityAt`, so
  * sorting by id here keeps an activity-only reordering invisible while a genuine
  * rank change still shows, because `attention` is included. `attentionRank`,
- * `name`, `path`, `runtime`, `startedAt` and `endedAt` are omitted as redundant or
- * immutable. `pending` is compared in full: a second request for the same session
- * is a genuinely new one.
+ * `path`, `runtime`, `startedAt` and `endedAt` are omitted as redundant or
+ * immutable. `name` and `registered` are included because a registry rename or
+ * membership change must wake consumers. `pending` is compared in full: a second
+ * request for the same session is a genuinely new one.
  *
  * `statusChangedAt` is excluded on purpose rather than by oversight: it moves only
  * when `status` moves, and `status` is already here, so including it could neither
@@ -205,6 +231,8 @@ export function projectStateSignature(state: ProjectStateAggregate): string {
 			.sort((a, b) => compareStrings(a.id, b.id))
 			.map((project) => ({
 				id: project.id,
+				name: project.name,
+				registered: project.registered,
 				attention: project.attention,
 				sessionCount: project.sessionCount,
 				sessionsOmitted: project.sessionsOmitted,

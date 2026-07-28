@@ -1,5 +1,7 @@
+import { resolve } from "node:path";
 import {
 	ATTENTION_DESCRIPTION_MAX,
+	ATTENTION_RANK,
 	PROJECT_STATE_MAX_BYTES,
 	PROJECT_STATE_MAX_PROJECTS,
 	PROJECT_STATE_MAX_SESSIONS,
@@ -38,7 +40,11 @@ function sessionIn(id: string, workingDir: string, overrides: Partial<Session> =
 
 describe("buildProjectState", () => {
 	it("classifies a session with a pending request as blocked", () => {
-		const agg = buildProjectState([makeSession({ status: "running", attention: PENDING })], NOW);
+		const agg = buildProjectState(
+			[makeSession({ status: "running", attention: PENDING })],
+			[],
+			NOW,
+		);
 
 		const session = agg.projects[0]?.sessions[0];
 		expect(session?.attention).toBe("blocked");
@@ -46,7 +52,7 @@ describe("buildProjectState", () => {
 	});
 
 	it("classifies an idle session as awaiting, with no pending request", () => {
-		const agg = buildProjectState([makeSession({ status: "idle" })], NOW);
+		const agg = buildProjectState([makeSession({ status: "idle" })], [], NOW);
 
 		const session = agg.projects[0]?.sessions[0];
 		expect(session?.attention).toBe("awaiting");
@@ -54,19 +60,23 @@ describe("buildProjectState", () => {
 	});
 
 	it("classifies an ended session as done", () => {
-		const agg = buildProjectState([makeSession({ status: "ended", endedAt: 2000 })], NOW);
+		const agg = buildProjectState([makeSession({ status: "ended", endedAt: 2000 })], [], NOW);
 
 		expect(agg.projects[0]?.sessions[0]?.attention).toBe("done");
 	});
 
 	it("classifies an errored session as failed", () => {
-		const agg = buildProjectState([makeSession({ status: "error", endedAt: 2000 })], NOW);
+		const agg = buildProjectState([makeSession({ status: "error", endedAt: 2000 })], [], NOW);
 
 		expect(agg.projects[0]?.sessions[0]?.attention).toBe("failed");
 	});
 
 	it("carries statusChangedAt through to the aggregate", () => {
-		const agg = buildProjectState([makeSession({ status: "idle", statusChangedAt: 4242 })], NOW);
+		const agg = buildProjectState(
+			[makeSession({ status: "idle", statusChangedAt: 4242 })],
+			[],
+			NOW,
+		);
 
 		expect(agg.projects[0]?.sessions[0]?.statusChangedAt).toBe(4242);
 	});
@@ -77,6 +87,7 @@ describe("buildProjectState", () => {
 				sessionIn("sess-working", "/tmp/calm", { lastActivityAt: 5000 }),
 				sessionIn("sess-blocked", "/tmp/stuck", { attention: PENDING, lastActivityAt: 1000 }),
 			],
+			[],
 			NOW,
 		);
 
@@ -93,6 +104,7 @@ describe("buildProjectState", () => {
 				sessionIn("sess-c", "/tmp/busy", { attention: PENDING }),
 				sessionIn("sess-d", "/tmp/calm"),
 			],
+			[],
 			NOW,
 		);
 
@@ -108,6 +120,7 @@ describe("buildProjectState", () => {
 				sessionIn("sess-a", "/tmp/mixed", { status: "running" }),
 				sessionIn("sess-b", "/tmp/mixed", { status: "running", attention: PENDING }),
 			],
+			[],
 			NOW,
 		);
 
@@ -127,7 +140,7 @@ describe("buildProjectState", () => {
 			lastActivityAt: 1000,
 		});
 
-		const agg = buildProjectState([...crowd, straggler], NOW);
+		const agg = buildProjectState([...crowd, straggler], [], NOW);
 		const quiet = agg.projects.find((project) => project.id === "/tmp/quiet");
 
 		expect(quiet?.sessions).toHaveLength(0);
@@ -141,8 +154,8 @@ describe("buildProjectState", () => {
 			sessionIn("sess-a", "/tmp/tie", { lastActivityAt: 3000 }),
 		];
 
-		const first = buildProjectState(sessions, NOW);
-		const second = buildProjectState(sessions, NOW);
+		const first = buildProjectState(sessions, [], NOW);
+		const second = buildProjectState(sessions, [], NOW);
 
 		expect(first.projects[0]?.sessions.map((s) => s.sessionId)).toEqual(["sess-a", "sess-b"]);
 		expect(second).toEqual(first);
@@ -155,13 +168,85 @@ describe("buildProjectState", () => {
 				sessionIn("sess-b", "/tmp/shared/"),
 				sessionIn("sess-c", "/tmp/shared/./"),
 			],
+			[],
 			NOW,
 		);
 
 		expect(agg.projects).toHaveLength(1);
 		expect(agg.projects[0]?.id).toBe("/tmp/shared");
 		expect(agg.projects[0]?.name).toBe("shared");
+		expect(agg.projects[0]?.registered).toBe(false);
 		expect(agg.projects[0]?.sessionCount).toBe(3);
+	});
+
+	it("includes a named registered project with no sessions", () => {
+		const projectPath = resolve("/tmp/sessionless-project");
+		const agg = buildProjectState([], [{ name: "Named Project", path: `${projectPath}/./` }], NOW);
+
+		expect(agg.projects).toEqual([
+			{
+				id: projectPath,
+				name: "Named Project",
+				path: projectPath,
+				registered: true,
+				attention: "done",
+				attentionRank: ATTENTION_RANK.done,
+				sessionCount: 0,
+				sessionsOmitted: 0,
+				lastActivityAt: 0,
+				sessions: [],
+			},
+		]);
+		expect(agg.sessionCount).toBe(0);
+		expect(agg.projectCount).toBe(1);
+		expect(agg.truncated).toBe(false);
+	});
+
+	it("matches normalized sessions to registered paths and keeps unmatched fallback groups", () => {
+		const registeredPath = resolve("/tmp/registered-project");
+		const fallbackPath = resolve("/tmp/unregistered-project");
+		const agg = buildProjectState(
+			[
+				sessionIn("sess-registered", `${registeredPath}/./`),
+				sessionIn("sess-fallback", `${fallbackPath}/`),
+			],
+			[{ name: "Persisted Name", path: `${registeredPath}/` }],
+			NOW,
+		);
+
+		expect(agg.projects).toHaveLength(2);
+		expect(agg.projects.filter((project) => project.id === registeredPath)).toHaveLength(1);
+		const registered = agg.projects.find((project) => project.id === registeredPath);
+		expect(registered?.name).toBe("Persisted Name");
+		expect(registered?.registered).toBe(true);
+		expect(registered?.sessionCount).toBe(1);
+		expect(registered?.sessions[0]?.sessionId).toBe("sess-registered");
+
+		const fallback = agg.projects.find((project) => project.id === fallbackPath);
+		expect(fallback?.name).toBe("unregistered-project");
+		expect(fallback?.registered).toBe(false);
+		expect(fallback?.sessionCount).toBe(1);
+		expect(fallback?.sessions[0]?.sessionId).toBe("sess-fallback");
+	});
+
+	it("falls back to an unregistered path group after registry removal", () => {
+		const projectPath = resolve("/tmp/removed-project");
+		const sessions = [sessionIn("sess-a", `${projectPath}/./`)];
+		const registered = buildProjectState(
+			sessions,
+			[{ name: "Before Removal", path: projectPath }],
+			NOW,
+		);
+		const fallback = buildProjectState(sessions, [], NOW);
+
+		expect(registered.projects).toHaveLength(1);
+		expect(registered.projects[0]?.name).toBe("Before Removal");
+		expect(registered.projects[0]?.registered).toBe(true);
+		expect(fallback.projects).toHaveLength(1);
+		expect(fallback.projects[0]?.id).toBe(projectPath);
+		expect(fallback.projects[0]?.name).toBe("removed-project");
+		expect(fallback.projects[0]?.registered).toBe(false);
+		expect(fallback.projects[0]?.sessions[0]?.sessionId).toBe("sess-a");
 	});
 
 	it("caps sessions, reports the omission, and keeps every blocked session", () => {
@@ -174,7 +259,7 @@ describe("buildProjectState", () => {
 			}),
 		);
 
-		const agg = buildProjectState(sessions, NOW);
+		const agg = buildProjectState(sessions, [], NOW);
 		const kept = agg.projects.flatMap((project) => project.sessions);
 
 		expect(kept).toHaveLength(PROJECT_STATE_MAX_SESSIONS);
@@ -198,7 +283,7 @@ describe("buildProjectState", () => {
 			),
 		);
 
-		const agg = buildProjectState(sessions, NOW);
+		const agg = buildProjectState(sessions, [], NOW);
 
 		// The byte budget fired before the count cap did.
 		expect(agg.projects.length).toBeLessThan(PROJECT_STATE_MAX_PROJECTS);
@@ -224,7 +309,7 @@ describe("buildProjectState", () => {
 			),
 		);
 
-		const agg = buildProjectState(sessions, NOW);
+		const agg = buildProjectState(sessions, [], NOW);
 
 		expect(agg.projects).toHaveLength(PROJECT_STATE_MAX_PROJECTS);
 		expect(agg.projectsOmitted).toBe(0);
@@ -237,7 +322,7 @@ describe("buildProjectState", () => {
 			sessionIn(`sess-${String(i).padStart(3, "0")}`, `/tmp/project-${String(i).padStart(3, "0")}`),
 		);
 
-		const agg = buildProjectState(sessions, NOW);
+		const agg = buildProjectState(sessions, [], NOW);
 		const kept = agg.projects.flatMap((project) => project.sessions);
 
 		expect(agg.projects).toHaveLength(PROJECT_STATE_MAX_PROJECTS);
@@ -270,14 +355,14 @@ describe("buildProjectState", () => {
 			});
 		});
 
-		const agg = buildProjectState(sessions, NOW);
+		const agg = buildProjectState(sessions, [], NOW);
 
 		expect(agg.truncated).toBe(false);
 		expect(Buffer.byteLength(JSON.stringify(agg)) * (4 / 3)).toBeLessThan(CIPHERTEXT_BASE64_MAX);
 	});
 
 	it("returns an empty, non-truncated aggregate for no sessions", () => {
-		const agg = buildProjectState([], NOW);
+		const agg = buildProjectState([], [], NOW);
 
 		expect(agg).toEqual({
 			generatedAt: NOW,
@@ -294,12 +379,37 @@ describe("buildProjectState", () => {
 });
 
 describe("projectStateSignature", () => {
+	it("reacts to a registry rename with no session changes", () => {
+		const projectPath = resolve("/tmp/renamed-project");
+		const before = buildProjectState([], [{ name: "Before", path: projectPath }], NOW);
+		const after = buildProjectState([], [{ name: "After", path: projectPath }], NOW);
+
+		expect(projectStateSignature(after)).not.toBe(projectStateSignature(before));
+	});
+
+	it("reacts to registry membership changing when the display name is unchanged", () => {
+		const projectPath = resolve("/tmp/membership-project");
+		const sessions = [sessionIn("sess-a", projectPath)];
+		const before = buildProjectState(sessions, [], NOW);
+		const after = buildProjectState(
+			sessions,
+			[{ name: "membership-project", path: projectPath }],
+			NOW,
+		);
+
+		expect(before.projects[0]?.name).toBe(after.projects[0]?.name);
+		expect(before.projects[0]?.registered).toBe(false);
+		expect(after.projects[0]?.registered).toBe(true);
+		expect(projectStateSignature(after)).not.toBe(projectStateSignature(before));
+	});
+
 	it("ignores a change to every lastActivityAt", () => {
 		const before = buildProjectState(
 			[
 				sessionIn("sess-a", "/tmp/a", { lastActivityAt: 1000 }),
 				sessionIn("sess-b", "/tmp/b", { lastActivityAt: 2000 }),
 			],
+			[],
 			NOW,
 		);
 		const after = buildProjectState(
@@ -307,6 +417,7 @@ describe("projectStateSignature", () => {
 				sessionIn("sess-a", "/tmp/a", { lastActivityAt: 7000 }),
 				sessionIn("sess-b", "/tmp/b", { lastActivityAt: 8000 }),
 			],
+			[],
 			NOW + 500,
 		);
 
@@ -319,6 +430,7 @@ describe("projectStateSignature", () => {
 				sessionIn("sess-a", "/tmp/pair", { lastActivityAt: 1000 }),
 				sessionIn("sess-b", "/tmp/pair", { lastActivityAt: 2000 }),
 			],
+			[],
 			NOW,
 		);
 		const after = buildProjectState(
@@ -326,6 +438,7 @@ describe("projectStateSignature", () => {
 				sessionIn("sess-a", "/tmp/pair", { lastActivityAt: 3000 }),
 				sessionIn("sess-b", "/tmp/pair", { lastActivityAt: 2000 }),
 			],
+			[],
 			NOW,
 		);
 
@@ -335,23 +448,36 @@ describe("projectStateSignature", () => {
 	});
 
 	it("reacts to a status change", () => {
-		const before = buildProjectState([sessionIn("sess-a", "/tmp/a", { status: "running" })], NOW);
-		const after = buildProjectState([sessionIn("sess-a", "/tmp/a", { status: "idle" })], NOW);
+		const before = buildProjectState(
+			[sessionIn("sess-a", "/tmp/a", { status: "running" })],
+			[],
+			NOW,
+		);
+		const after = buildProjectState([sessionIn("sess-a", "/tmp/a", { status: "idle" })], [], NOW);
 
 		expect(projectStateSignature(after)).not.toBe(projectStateSignature(before));
 	});
 
 	it("reacts to a session becoming blocked", () => {
-		const before = buildProjectState([sessionIn("sess-a", "/tmp/a")], NOW);
-		const after = buildProjectState([sessionIn("sess-a", "/tmp/a", { attention: PENDING })], NOW);
+		const before = buildProjectState([sessionIn("sess-a", "/tmp/a")], [], NOW);
+		const after = buildProjectState(
+			[sessionIn("sess-a", "/tmp/a", { attention: PENDING })],
+			[],
+			NOW,
+		);
 
 		expect(projectStateSignature(after)).not.toBe(projectStateSignature(before));
 	});
 
 	it("reacts to a pending request whose since alone changed", () => {
-		const before = buildProjectState([sessionIn("sess-a", "/tmp/a", { attention: PENDING })], NOW);
+		const before = buildProjectState(
+			[sessionIn("sess-a", "/tmp/a", { attention: PENDING })],
+			[],
+			NOW,
+		);
 		const after = buildProjectState(
 			[sessionIn("sess-a", "/tmp/a", { attention: { ...PENDING, since: 4321 } })],
+			[],
 			NOW,
 		);
 
@@ -359,9 +485,10 @@ describe("projectStateSignature", () => {
 	});
 
 	it("reacts to a session being added", () => {
-		const before = buildProjectState([sessionIn("sess-a", "/tmp/a")], NOW);
+		const before = buildProjectState([sessionIn("sess-a", "/tmp/a")], [], NOW);
 		const after = buildProjectState(
 			[sessionIn("sess-a", "/tmp/a"), sessionIn("sess-b", "/tmp/a")],
+			[],
 			NOW,
 		);
 
@@ -371,9 +498,10 @@ describe("projectStateSignature", () => {
 	it("reacts to a session being removed", () => {
 		const before = buildProjectState(
 			[sessionIn("sess-a", "/tmp/a"), sessionIn("sess-b", "/tmp/a")],
+			[],
 			NOW,
 		);
-		const after = buildProjectState([sessionIn("sess-a", "/tmp/a")], NOW);
+		const after = buildProjectState([sessionIn("sess-a", "/tmp/a")], [], NOW);
 
 		expect(projectStateSignature(after)).not.toBe(projectStateSignature(before));
 	});
@@ -384,8 +512,8 @@ describe("projectStateSignature", () => {
 		);
 		const overCap = [...atCap, sessionIn("sess-extra", "/tmp/a")];
 
-		const before = buildProjectState(atCap, NOW);
-		const after = buildProjectState(overCap, NOW);
+		const before = buildProjectState(atCap, [], NOW);
+		const after = buildProjectState(overCap, [], NOW);
 
 		expect(before.sessionsOmitted).toBe(0);
 		expect(after.sessionsOmitted).toBe(1);
@@ -395,6 +523,7 @@ describe("projectStateSignature", () => {
 	it("reacts to the blocked counts changing", () => {
 		const before = buildProjectState(
 			[sessionIn("sess-a", "/tmp/a", { attention: PENDING }), sessionIn("sess-b", "/tmp/b")],
+			[],
 			NOW,
 		);
 		const after = buildProjectState(
@@ -402,6 +531,7 @@ describe("projectStateSignature", () => {
 				sessionIn("sess-a", "/tmp/a", { attention: PENDING }),
 				sessionIn("sess-b", "/tmp/b", { attention: PENDING }),
 			],
+			[],
 			NOW,
 		);
 
@@ -413,6 +543,7 @@ describe("projectStateSignature", () => {
 	it("reacts to blockedSessionCount changing within one project", () => {
 		const before = buildProjectState(
 			[sessionIn("sess-a", "/tmp/a", { attention: PENDING }), sessionIn("sess-b", "/tmp/a")],
+			[],
 			NOW,
 		);
 		const after = buildProjectState(
@@ -420,6 +551,7 @@ describe("projectStateSignature", () => {
 				sessionIn("sess-a", "/tmp/a", { attention: PENDING }),
 				sessionIn("sess-b", "/tmp/a", { attention: PENDING }),
 			],
+			[],
 			NOW,
 		);
 
