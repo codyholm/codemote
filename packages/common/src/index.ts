@@ -165,6 +165,7 @@ export type {
 	ProjectSessionState,
 	ProjectState,
 	ProjectStateAggregate,
+	RegisteredProject,
 	SessionAttentionState,
 } from "./projectState.js";
 export {

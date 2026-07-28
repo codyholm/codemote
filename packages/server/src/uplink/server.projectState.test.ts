@@ -1,5 +1,7 @@
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import { ATTENTION_DESCRIPTION_MAX, type ProjectStateAggregate } from "@codemote/common";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
@@ -148,17 +150,30 @@ describe("UplinkServer project state", () => {
 	let port: number;
 	let server: UplinkServer;
 	let client: TestClient;
+	let fixtureDir = "";
 
 	beforeEach(async () => {
+		fixtureDir = await mkdtemp(join(tmpdir(), "codemote-uplink-registry-"));
 		port = await reserveFreePort();
-		server = new UplinkServer({ port, host: "127.0.0.1", runtimes: [] });
+		server = new UplinkServer({
+			port,
+			host: "127.0.0.1",
+			runtimes: [],
+			projectRegistryPath: join(fixtureDir, "projects.json"),
+		});
 		await server.start();
 		client = await TestClient.connect(port);
 	});
 
 	afterEach(async () => {
-		client.close();
-		await server.stop();
+		try {
+			client?.close();
+			await server?.stop();
+		} finally {
+			if (fixtureDir) {
+				await rm(fixtureDir, { recursive: true, force: true });
+			}
+		}
 	});
 
 	it("returns an empty aggregate on a fresh server and echoes the requestId", async () => {
@@ -210,6 +225,232 @@ describe("UplinkServer project state", () => {
 		const state = push.payload as ProjectStateAggregate;
 		expect(push.requestId).toBeUndefined();
 		expect(state.projects).toHaveLength(1);
+	});
+
+	it("correlates registry CRUD while publishing the sessionless aggregate", async () => {
+		const projectPath = join(fixtureDir, "alpha");
+
+		const beforeAdd = client.mark();
+		const added = await client.request(
+			{ type: "add_project", payload: { name: "Alpha", path: `${projectPath}/./` } },
+			"req-add",
+		);
+		expect(added).toEqual({
+			type: "project_registry_result",
+			requestId: "req-add",
+			payload: { operation: "add", path: projectPath, success: true },
+		});
+
+		const addPush = await client.waitFor(
+			(msg) =>
+				msg.type === "project_state_push" &&
+				(msg.payload as ProjectStateAggregate).projects[0]?.name === "Alpha",
+			"the add project-state push",
+			beforeAdd,
+		);
+		expect(addPush.requestId).toBeUndefined();
+		expect((addPush.payload as ProjectStateAggregate).projects).toEqual([
+			expect.objectContaining({
+				name: "Alpha",
+				path: projectPath,
+				registered: true,
+				sessionCount: 0,
+				sessions: [],
+			}),
+		]);
+
+		const listed = await client.request({ type: "list_projects" }, "req-list");
+		expect(listed.type).toBe("project_state");
+		expect(listed.requestId).toBe("req-list");
+		expect((listed.payload as ProjectStateAggregate).projects).toEqual([
+			expect.objectContaining({
+				name: "Alpha",
+				path: projectPath,
+				registered: true,
+			}),
+		]);
+
+		const beforeRename = client.mark();
+		const renamed = await client.request(
+			{ type: "rename_project", payload: { path: projectPath, name: "Beta" } },
+			"req-rename",
+		);
+		expect(renamed).toEqual({
+			type: "project_registry_result",
+			requestId: "req-rename",
+			payload: { operation: "rename", path: projectPath, success: true },
+		});
+
+		const renamePush = await client.waitFor(
+			(msg) =>
+				msg.type === "project_state_push" &&
+				(msg.payload as ProjectStateAggregate).projects[0]?.name === "Beta",
+			"the rename project-state push",
+			beforeRename,
+		);
+		expect(renamePush.requestId).toBeUndefined();
+		expect((renamePush.payload as ProjectStateAggregate).projects[0]).toEqual(
+			expect.objectContaining({
+				name: "Beta",
+				path: projectPath,
+				registered: true,
+				sessionCount: 0,
+			}),
+		);
+
+		const beforeRemove = client.mark();
+		const removed = await client.request(
+			{ type: "remove_project", payload: { path: projectPath } },
+			"req-remove",
+		);
+		expect(removed).toEqual({
+			type: "project_registry_result",
+			requestId: "req-remove",
+			payload: { operation: "remove", path: projectPath, success: true },
+		});
+
+		const removePush = await client.waitFor(
+			(msg) =>
+				msg.type === "project_state_push" &&
+				(msg.payload as ProjectStateAggregate).projects.length === 0,
+			"the remove project-state push",
+			beforeRemove,
+		);
+		expect(removePush.requestId).toBeUndefined();
+	});
+
+	it("keeps a live session visible as an unregistered project after removal", async () => {
+		const projectPath = join(fixtureDir, "registered-workspace");
+		await client.request(
+			{ type: "add_project", payload: { name: "Registered Workspace", path: projectPath } },
+			"req-add",
+		);
+
+		const started = await client.request(
+			{
+				type: "start_run",
+				payload: { profile: "opencode", workspace: projectPath, initialPrompt: "hello" },
+			},
+			"req-start",
+		);
+		const sessionId = (started.payload as { sessionId: string }).sessionId;
+
+		const registeredResponse = await client.request(
+			{ type: "get_project_state" },
+			"req-registered",
+		);
+		const registeredState = registeredResponse.payload as ProjectStateAggregate;
+		expect(registeredState.projects).toHaveLength(1);
+		expect(registeredState.projects[0]).toEqual(
+			expect.objectContaining({
+				name: "Registered Workspace",
+				path: projectPath,
+				registered: true,
+				sessionCount: 1,
+			}),
+		);
+		expect(registeredState.projects[0]?.sessions[0]?.sessionId).toBe(sessionId);
+
+		const beforeRemove = client.mark();
+		const removed = await client.request(
+			{ type: "remove_project", payload: { path: projectPath } },
+			"req-remove",
+		);
+		expect(removed.requestId).toBe("req-remove");
+
+		const fallbackPush = await client.waitFor(
+			(msg) =>
+				msg.type === "project_state_push" &&
+				(msg.payload as ProjectStateAggregate).projects[0]?.registered === false,
+			"the unregistered fallback push",
+			beforeRemove,
+		);
+		expect(fallbackPush.requestId).toBeUndefined();
+		const fallback = (fallbackPush.payload as ProjectStateAggregate).projects[0];
+		expect(fallback).toEqual(
+			expect.objectContaining({
+				name: basename(projectPath),
+				path: projectPath,
+				registered: false,
+				sessionCount: 1,
+			}),
+		);
+		expect(fallback?.sessions[0]?.sessionId).toBe(sessionId);
+	}, 30000);
+
+	it("preserves stable registry errors without changing the aggregate", async () => {
+		const projectPath = join(fixtureDir, "existing");
+		const missingPath = join(fixtureDir, "missing");
+		await client.request(
+			{ type: "add_project", payload: { name: "Existing", path: projectPath } },
+			"req-setup",
+		);
+
+		const baseline = await client.request({ type: "list_projects" }, "req-baseline");
+		const baselineState = baseline.payload as ProjectStateAggregate;
+		const beforeInvalid = client.mark();
+
+		const relative = await client.request(
+			{ type: "add_project", payload: { name: "Relative", path: "relative/path" } },
+			"req-relative",
+		);
+		expect(relative).toEqual({
+			type: "error",
+			requestId: "req-relative",
+			payload: {
+				message: "Project path must be an absolute path",
+				code: "INVALID_PROJECT",
+			},
+		});
+
+		const duplicate = await client.request(
+			{ type: "add_project", payload: { name: "Duplicate", path: projectPath } },
+			"req-duplicate",
+		);
+		expect(duplicate).toEqual({
+			type: "error",
+			requestId: "req-duplicate",
+			payload: {
+				message: `Project already exists: ${projectPath}`,
+				code: "PROJECT_ALREADY_EXISTS",
+			},
+		});
+
+		const missingRename = await client.request(
+			{ type: "rename_project", payload: { path: missingPath, name: "Missing" } },
+			"req-missing-rename",
+		);
+		expect(missingRename).toEqual({
+			type: "error",
+			requestId: "req-missing-rename",
+			payload: {
+				message: `Project not found: ${missingPath}`,
+				code: "PROJECT_NOT_FOUND",
+			},
+		});
+
+		const missingRemove = await client.request(
+			{ type: "remove_project", payload: { path: missingPath } },
+			"req-missing-remove",
+		);
+		expect(missingRemove).toEqual({
+			type: "error",
+			requestId: "req-missing-remove",
+			payload: {
+				message: `Project not found: ${missingPath}`,
+				code: "PROJECT_NOT_FOUND",
+			},
+		});
+
+		expect(
+			client.received.slice(beforeInvalid).filter((msg) => msg.type === "project_state_push"),
+		).toEqual([]);
+
+		const final = await client.request({ type: "list_projects" }, "req-final");
+		const finalState = final.payload as ProjectStateAggregate;
+		expect(finalState.projects).toEqual(baselineState.projects);
+		expect(finalState.projectCount).toBe(baselineState.projectCount);
+		expect(finalState.sessionCount).toBe(baselineState.sessionCount);
 	});
 
 	it("does not push when only lastActivityAt moved", async () => {

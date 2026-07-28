@@ -5,6 +5,7 @@ export type {
 	RuntimeType,
 	SessionStatus,
 	StreamEvent,
+	RegisteredProject,
 	RunOptions,
 	RunResult,
 	WorkspaceConfig,

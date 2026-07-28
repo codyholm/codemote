@@ -208,9 +208,38 @@ interface GetProjectStateMessage {
 	type: "get_project_state";
 }
 
+interface AddProjectMessage {
+	type: "add_project";
+	name: string;
+	path: string;
+}
+
+interface ListProjectsMessage {
+	type: "list_projects";
+}
+
+interface RenameProjectMessage {
+	type: "rename_project";
+	path: string;
+	name: string;
+}
+
+interface RemoveProjectMessage {
+	type: "remove_project";
+	path: string;
+}
+
 interface ProjectStateMessage {
 	type: "project_state";
 	state: ProjectStateAggregate;
+}
+
+interface ProjectRegistryResultMessage {
+	type: "project_registry_result";
+	operation: "add" | "rename" | "remove";
+	path: string;
+	success: boolean;
+	error?: string;
 }
 
 type DiffScope = "staged" | "unstaged" | "all";
@@ -307,6 +336,10 @@ type MobileInboundMessage =
 	| ListModelsMessage
 	| ListRuntimesMessage
 	| GetProjectStateMessage
+	| AddProjectMessage
+	| ListProjectsMessage
+	| RenameProjectMessage
+	| RemoveProjectMessage
 	| GetDiffMessage
 	| RequestDeviceInfoMessage
 	| ListDirectoryMessage
@@ -334,6 +367,7 @@ type MobileOutboundMessage =
 	| GitWorktreeResultMessage
 	| RuntimeListMessage
 	| ProjectStateMessage
+	| ProjectRegistryResultMessage
 	| GitPRResultMessage;
 
 const AUTO_RESUME_RUNTIMES: ReadonlySet<RuntimeType> = new Set(["claude", "opencode"]);
@@ -499,6 +533,40 @@ class UplinkWsClient {
 		// slow or unanswered state read would stall every user action behind it for
 		// the full command timeout.
 		return this.sendAndWait({ type: "get_project_state" }, { bypassQueue: true });
+	}
+
+	async addProject(name: string, path: string) {
+		return this.sendAndWait(
+			{
+				type: "add_project",
+				payload: { name, path },
+			},
+			{ bypassQueue: true },
+		);
+	}
+
+	async listProjects() {
+		return this.sendAndWait({ type: "list_projects" }, { bypassQueue: true });
+	}
+
+	async renameProject(path: string, name: string) {
+		return this.sendAndWait(
+			{
+				type: "rename_project",
+				payload: { path, name },
+			},
+			{ bypassQueue: true },
+		);
+	}
+
+	async removeProject(path: string) {
+		return this.sendAndWait(
+			{
+				type: "remove_project",
+				payload: { path },
+			},
+			{ bypassQueue: true },
+		);
 	}
 
 	async listModels(profile: RuntimeType) {
@@ -732,7 +800,12 @@ function expectedResponseType(commandType: UplinkCommand["type"]): UplinkRespons
 		case "list_sessions":
 			return "sessions";
 		case "get_project_state":
+		case "list_projects":
 			return "project_state";
+		case "add_project":
+		case "rename_project":
+		case "remove_project":
+			return "project_registry_result";
 		case "list_models":
 			return "model_list";
 		case "list_runtimes":
@@ -777,6 +850,11 @@ function commandTimeoutFor(commandType: UplinkCommand["type"]): number {
 		case "start_run":
 		case "send_input":
 			return longRunningMs;
+		case "add_project":
+		case "list_projects":
+		case "rename_project":
+		case "remove_project":
+			return baseMs;
 		default:
 			return baseMs;
 	}
@@ -1242,6 +1320,24 @@ export async function startRelayUplinkBridge(
 				return;
 			case "get_project_state":
 				await handleGetProjectState();
+				return;
+			case "add_project":
+				await handleProjectMutation("add", message.path, () =>
+					uplinkClient.addProject(message.name, message.path),
+				);
+				return;
+			case "list_projects":
+				await handleListProjects();
+				return;
+			case "rename_project":
+				await handleProjectMutation("rename", message.path, () =>
+					uplinkClient.renameProject(message.path, message.name),
+				);
+				return;
+			case "remove_project":
+				await handleProjectMutation("remove", message.path, () =>
+					uplinkClient.removeProject(message.path),
+				);
 				return;
 			case "list_directory":
 				await handleListDirectory(message);
@@ -1740,6 +1836,51 @@ export async function startRelayUplinkBridge(
 			log?.(
 				`[Bridge] Failed to get project state: ${error instanceof Error ? error.message : String(error)}`,
 			);
+		}
+	}
+
+	async function handleListProjects(): Promise<void> {
+		try {
+			const response = await uplinkClient.listProjects();
+			if (response.type !== "project_state") {
+				throw new Error("Unexpected list_projects response");
+			}
+
+			sendToMobile({ type: "project_state", state: response.payload });
+		} catch (error) {
+			log?.(
+				`[Bridge] Failed to list projects: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	async function handleProjectMutation(
+		operation: "add" | "rename" | "remove",
+		requestedPath: string,
+		send: () => Promise<UplinkResponse>,
+	): Promise<void> {
+		try {
+			const response = await send();
+			if (response.type !== "project_registry_result" || response.payload.operation !== operation) {
+				throw new Error(`Unexpected ${operation}_project response`);
+			}
+
+			sendToMobile({
+				type: "project_registry_result",
+				operation,
+				path: response.payload.path,
+				success: true,
+			});
+		} catch (error) {
+			const reason = errorMessage(error);
+			log?.(`[Bridge] Failed to ${operation} project: ${reason}`);
+			sendToMobile({
+				type: "project_registry_result",
+				operation,
+				path: requestedPath,
+				success: false,
+				error: reason,
+			});
 		}
 	}
 
@@ -2346,6 +2487,36 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 
 	if (type === "get_project_state") {
 		return { type: "get_project_state" };
+	}
+
+	if (type === "add_project") {
+		const name = (payload as { name?: unknown }).name;
+		const path = (payload as { path?: unknown }).path;
+		if (typeof name === "string" && typeof path === "string") {
+			return { type: "add_project", name: name.trim(), path };
+		}
+		return null;
+	}
+
+	if (type === "list_projects") {
+		return { type: "list_projects" };
+	}
+
+	if (type === "rename_project") {
+		const path = (payload as { path?: unknown }).path;
+		const name = (payload as { name?: unknown }).name;
+		if (typeof path === "string" && typeof name === "string") {
+			return { type: "rename_project", path, name: name.trim() };
+		}
+		return null;
+	}
+
+	if (type === "remove_project") {
+		const path = (payload as { path?: unknown }).path;
+		if (typeof path === "string") {
+			return { type: "remove_project", path };
+		}
+		return null;
 	}
 
 	if (type === "list_directory") {

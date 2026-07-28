@@ -17,6 +17,18 @@
 		"indentStyle": "tab",
 		"lineWidth": 100
 	},
+	"overrides": [
+		{
+			"include": ["packages/web/src/app/layout.tsx"],
+			"linter": {
+				"rules": {
+					"security": {
+						"noDangerouslySetInnerHtml": "off"
+					}
+				}
+			}
+		}
+	],
 	"files": {
 		"ignore": [
 			"node_modules",
@@ -26,6 +38,7 @@
 			".guild/exports",
 			".guild/.archive",
 			".guild/ops/evidence",
+			".guild/runtime",
 			".claude",
 			".codex",
 			"packages/mobile-ios/**/*.xcassets",

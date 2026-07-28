@@ -1,4 +1,5 @@
 import { readdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import {
 	type ModelInfo,
@@ -17,6 +18,7 @@ import {
 } from "./executors/index.js";
 import { MockExecutor } from "./mock-executor.js";
 import { discoverOpenCodeModels } from "./opencode-models.js";
+import { ProjectRegistry, ProjectRegistryError } from "./projectRegistry.js";
 import { buildProjectState, projectStateSignature } from "./projectState.js";
 import { probeInstalledRuntimes } from "./runtime-probe.js";
 import { SessionManager } from "./session.js";
@@ -40,6 +42,7 @@ export class UplinkServer {
 	private workspaceManager: WorkspaceManager;
 	private sessionManager: SessionManager;
 	private eventBus: EventBus;
+	private projectRegistry: ProjectRegistry;
 	private executors = new Map<RuntimeType, BaseExecutor>();
 	private availableRuntimes: RuntimeType[] = [];
 	private dynamicModels = new Map<RuntimeType, ModelInfo[]>();
@@ -52,6 +55,9 @@ export class UplinkServer {
 		this.workspaceManager = new WorkspaceManager(this.config.repoPath);
 		this.sessionManager = new SessionManager();
 		this.eventBus = new EventBus();
+		this.projectRegistry = new ProjectRegistry(
+			this.config.projectRegistryPath ?? join(homedir(), ".codemote", "projects.json"),
+		);
 
 		// Register mock executor for testing
 		this.registerExecutor(
@@ -232,6 +238,10 @@ export class UplinkServer {
 	}
 
 	private toSafeError(error: unknown): { message: string; code: string } {
+		if (error instanceof ProjectRegistryError) {
+			return { message: error.message, code: error.code };
+		}
+
 		if (error instanceof SyntaxError) {
 			return { message: "Invalid request", code: "BAD_REQUEST" };
 		}
@@ -266,6 +276,36 @@ export class UplinkServer {
 
 			case "get_project_state":
 				return { type: "project_state", payload: this.currentProjectState() };
+
+			case "list_projects":
+				return { type: "project_state", payload: this.currentProjectState() };
+
+			case "add_project": {
+				const project = this.projectRegistry.add(command.payload.name, command.payload.path);
+				this.publishProjectState();
+				return {
+					type: "project_registry_result",
+					payload: { operation: "add", path: project.path, success: true },
+				};
+			}
+
+			case "rename_project": {
+				const project = this.projectRegistry.rename(command.payload.path, command.payload.name);
+				this.publishProjectState();
+				return {
+					type: "project_registry_result",
+					payload: { operation: "rename", path: project.path, success: true },
+				};
+			}
+
+			case "remove_project": {
+				const project = this.projectRegistry.remove(command.payload.path);
+				this.publishProjectState();
+				return {
+					type: "project_registry_result",
+					payload: { operation: "remove", path: project.path, success: true },
+				};
+			}
 
 			case "list_runtimes":
 				return { type: "runtime_list", payload: { runtimes: this.availableRuntimes } };
@@ -472,7 +512,7 @@ export class UplinkServer {
 	}
 
 	private currentProjectState(): ProjectStateAggregate {
-		return buildProjectState(this.sessionManager.list(), Date.now());
+		return buildProjectState(this.sessionManager.list(), this.projectRegistry.list(), Date.now());
 	}
 
 	/**
