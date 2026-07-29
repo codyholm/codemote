@@ -23,12 +23,15 @@ describe("Server Integration", { timeout: 30000 }, () => {
 	let speechDir: string;
 	let suiteMachineStateDir: string | null = null;
 	let originalHome: string | undefined;
+	let originalUserProfile: string | undefined;
 	let startServerImplementation: StartServer | null = null;
 
 	beforeAll(async () => {
 		originalHome = process.env["HOME"];
+		originalUserProfile = process.env["USERPROFILE"];
 		suiteMachineStateDir = await mkdtemp(join(tmpdir(), "cli-server-suite-"));
 		process.env["HOME"] = suiteMachineStateDir;
+		process.env["USERPROFILE"] = suiteMachineStateDir;
 		({ startServer: startServerImplementation } = await import("./server.js"));
 	});
 
@@ -37,6 +40,11 @@ describe("Server Integration", { timeout: 30000 }, () => {
 			Reflect.deleteProperty(process.env, "HOME");
 		} else {
 			process.env["HOME"] = originalHome;
+		}
+		if (originalUserProfile === undefined) {
+			Reflect.deleteProperty(process.env, "USERPROFILE");
+		} else {
+			process.env["USERPROFILE"] = originalUserProfile;
 		}
 		if (suiteMachineStateDir) {
 			await rm(suiteMachineStateDir, { recursive: true, force: true });
@@ -86,6 +94,14 @@ describe("Server Integration", { timeout: 30000 }, () => {
 			expect(server.uplinkDeviceId).toBeDefined();
 			expect(server.uplinkPublicKey).toBeDefined();
 			expect(server.url).toBe(`wss://localhost:${testPort}`);
+			if (!suiteMachineStateDir) {
+				throw new Error("Server integration suite state is not initialized");
+			}
+			const persistedDeviceId = await readFile(
+				join(suiteMachineStateDir, ".codemote", "device-id"),
+				"utf8",
+			);
+			expect(persistedDeviceId.trim()).toBe(server.uplinkDeviceId);
 		});
 
 		it("should generate a valid PIN", async () => {
