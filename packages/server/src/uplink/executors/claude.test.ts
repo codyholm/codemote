@@ -40,6 +40,7 @@ describe.skipIf(platform() === "win32")("ClaudeExecutor", () => {
 		await git.init(["--initial-branch=main"]);
 		await git.addConfig("user.email", "test@test.com");
 		await git.addConfig("user.name", "Test");
+		await git.addConfig("commit.gpgsign", "false");
 		await writeFile(join(testDir, "README.md"), "# Test");
 		await git.add(".");
 		await git.commit("Initial commit");
@@ -88,6 +89,22 @@ exit 0
 		});
 
 		expect(executor.type).toBe("claude");
+	});
+
+	it("rejects start when the Claude binary cannot be spawned", async () => {
+		activeExecutor = new ClaudeExecutor(workspaceManager, sessionManager, eventBus, {
+			claudePath: join(testDir, "missing-claude"),
+		});
+
+		await expect(
+			activeExecutor.startRun({
+				profile: "claude",
+				workspace: testDir,
+				initialPrompt: "Hello",
+			}),
+		).rejects.toThrow(/ENOENT|spawn/u);
+		expect(sessionManager.list()).toHaveLength(1);
+		expect(sessionManager.list()[0]?.status).toBe("error");
 	});
 
 	it("starts a run and receives events", async () => {

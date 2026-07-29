@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import {
 	type ModelInfo,
+	type ProjectStartFailureDetails,
 	RUNTIME_MODELS,
 	type RuntimeType,
 	type StreamEvent,
@@ -19,6 +20,8 @@ import {
 import { MockExecutor } from "./mock-executor.js";
 import { discoverOpenCodeModels } from "./opencode-models.js";
 import { ProjectRegistry, ProjectRegistryError } from "./projectRegistry.js";
+import { ProjectStartCoordinator, ProjectStartError } from "./projectStart.js";
+import { ProjectStartJournal, ProjectStartJournalError } from "./projectStartJournal.js";
 import { buildProjectState, projectStateSignature } from "./projectState.js";
 import { probeInstalledRuntimes } from "./runtime-probe.js";
 import { SessionManager } from "./session.js";
@@ -43,6 +46,7 @@ export class UplinkServer {
 	private sessionManager: SessionManager;
 	private eventBus: EventBus;
 	private projectRegistry: ProjectRegistry;
+	private projectStartCoordinator: ProjectStartCoordinator | null = null;
 	private executors = new Map<RuntimeType, BaseExecutor>();
 	private availableRuntimes: RuntimeType[] = [];
 	private dynamicModels = new Map<RuntimeType, ModelInfo[]>();
@@ -58,7 +62,6 @@ export class UplinkServer {
 		this.projectRegistry = new ProjectRegistry(
 			this.config.projectRegistryPath ?? join(homedir(), ".codemote", "projects.json"),
 		);
-
 		// Register mock executor for testing
 		this.registerExecutor(
 			new MockExecutor(this.workspaceManager, this.sessionManager, this.eventBus),
@@ -237,9 +240,30 @@ export class UplinkServer {
 		});
 	}
 
-	private toSafeError(error: unknown): { message: string; code: string } {
+	private toSafeError(error: unknown): {
+		message: string;
+		code: string;
+		details?: ProjectStartFailureDetails;
+	} {
+		if (error instanceof ProjectStartError) {
+			return {
+				message: error.message,
+				code: error.code,
+				...(error.details ? { details: error.details } : {}),
+			};
+		}
 		if (error instanceof ProjectRegistryError) {
 			return { message: error.message, code: error.code };
+		}
+		if (
+			error instanceof ProjectStartJournalError &&
+			(error.code === "INVALID_PROJECT_START_JOURNAL" || error.code === "PROJECT_START_JOURNAL_IO")
+		) {
+			return {
+				message: error.message,
+				code: error.code,
+				...(error.details ? { details: error.details } : {}),
+			};
 		}
 
 		if (error instanceof SyntaxError) {
@@ -276,6 +300,12 @@ export class UplinkServer {
 
 			case "get_project_state":
 				return { type: "project_state", payload: this.currentProjectState() };
+
+			case "get_project_start_state":
+				return {
+					type: "project_start_state",
+					payload: await this.getProjectStartCoordinator().inspect(command.payload.projectPath),
+				};
 
 			case "list_projects":
 				return { type: "project_state", payload: this.currentProjectState() };
@@ -321,7 +351,11 @@ export class UplinkServer {
 				if (!executor) {
 					throw new Error(`No executor for runtime: ${command.payload.profile}`);
 				}
-				const result = await executor.startRun(command.payload);
+				const result = command.payload.projectStart
+					? await this.getProjectStartCoordinator().start(command.payload, (options, context) =>
+							executor.startRun(options, context),
+						)
+					: await executor.startRun(command.payload);
 				return { type: "run_started", payload: result };
 			}
 
@@ -543,6 +577,20 @@ export class UplinkServer {
 
 	private getModelsForRuntime(runtime: RuntimeType): ModelInfo[] {
 		return this.dynamicModels.get(runtime) ?? RUNTIME_MODELS[runtime];
+	}
+
+	private getProjectStartCoordinator(): ProjectStartCoordinator {
+		if (!this.projectStartCoordinator) {
+			this.projectStartCoordinator = new ProjectStartCoordinator({
+				journal: new ProjectStartJournal(
+					this.config.projectStartJournalPath ??
+						join(homedir(), ".codemote", "project-start-operations.json"),
+				),
+				registry: this.projectRegistry,
+				sessionManager: this.sessionManager,
+			});
+		}
+		return this.projectStartCoordinator;
 	}
 
 	private isLoopbackHost(host: string): boolean {

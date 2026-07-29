@@ -15,7 +15,7 @@ import {
 } from "@codemote/common";
 import { type EventBus, createEvent } from "./events.js";
 import type { SessionManager } from "./session.js";
-import type { Session, WorkspaceConfig } from "./types.js";
+import type { Session, SessionStartContext, WorkspaceConfig } from "./types.js";
 import type { WorkspaceManager } from "./workspace.js";
 
 /**
@@ -76,7 +76,7 @@ export abstract class BaseExecutor {
 	/**
 	 * Start a new run
 	 */
-	async startRun(options: RunOptions): Promise<RunResult> {
+	async startRun(options: RunOptions, context?: SessionStartContext): Promise<RunResult> {
 		// Create or get workspace
 		const workspaceConfig: WorkspaceConfig = {
 			repoPath: options.workspace,
@@ -84,7 +84,7 @@ export abstract class BaseExecutor {
 		};
 
 		const workspace = await this.workspaceManager.create(workspaceConfig);
-		const session = this.sessionManager.create(this.type, workspace);
+		const session = this.sessionManager.create(this.type, workspace, context);
 
 		this.emitStatus(session.id, "starting");
 
@@ -97,12 +97,23 @@ export abstract class BaseExecutor {
 			}
 		} catch (error) {
 			this.emitStatus(session.id, "error");
-			throw error;
+			throw new ExecutorStartError(
+				error instanceof Error ? error.message : String(error),
+				session.runId,
+				session.id,
+				error,
+			);
 		}
 
 		return {
 			runId: session.runId,
 			sessionId: session.id,
+			...(context
+				? {
+						originProjectPath: context.originProjectPath,
+						execution: context.execution,
+					}
+				: {}),
 		};
 	}
 
@@ -277,4 +288,16 @@ export abstract class BaseExecutor {
 	 * Implement runtime-specific stop logic
 	 */
 	protected abstract doStop(session: Session): Promise<void>;
+}
+
+export class ExecutorStartError extends Error {
+	constructor(
+		message: string,
+		readonly runId: string,
+		readonly sessionId: string,
+		options?: unknown,
+	) {
+		super(message, options !== undefined ? { cause: options } : undefined);
+		this.name = "ExecutorStartError";
+	}
 }

@@ -171,7 +171,7 @@ export class CodexExecutor extends BaseExecutor {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 
-		this.attachProcessHandlers(session.id, codexSession, proc);
+		await this.attachProcessHandlers(session.id, codexSession, proc);
 	}
 
 	/**
@@ -331,7 +331,7 @@ export class CodexExecutor extends BaseExecutor {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 
-		this.attachProcessHandlers(session.id, codexSession, proc);
+		await this.attachProcessHandlers(session.id, codexSession, proc);
 	}
 
 	// ========================================
@@ -450,11 +450,11 @@ export class CodexExecutor extends BaseExecutor {
 	/**
 	 * Attach stdout/stderr parsing and lifecycle handlers to a Codex process.
 	 */
-	private attachProcessHandlers(
+	private async attachProcessHandlers(
 		sessionId: string,
 		codexSession: CodexSession,
 		proc: ChildProcess,
-	): void {
+	): Promise<void> {
 		codexSession.process = proc;
 
 		// A codex process that has closed the read end of its stdin — exited after its
@@ -503,6 +503,23 @@ export class CodexExecutor extends BaseExecutor {
 			codexSession.running = false;
 			this.emitOutput(sessionId, `Error: ${error.message}\n`);
 			this.emitStatus(sessionId, "error");
+		});
+
+		await new Promise<void>((resolve, reject) => {
+			const cleanup = (): void => {
+				proc.removeListener("spawn", onSpawn);
+				proc.removeListener("error", onError);
+			};
+			const onSpawn = (): void => {
+				cleanup();
+				resolve();
+			};
+			const onError = (error: Error): void => {
+				cleanup();
+				reject(error);
+			};
+			proc.once("spawn", onSpawn);
+			proc.once("error", onError);
 		});
 	}
 

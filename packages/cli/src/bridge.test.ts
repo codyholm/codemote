@@ -360,7 +360,7 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
-	it("forwards model from new_session into uplink start_run payload", async () => {
+	it("forwards model but never an explicit resume ID from new_session", async () => {
 		let relayUplinkSocket: WebSocket | null = null;
 		let relayMobileSocket: WebSocket | null = null;
 		let startRunPayload: JsonRecord | null = null;
@@ -465,12 +465,14 @@ describe("RelayUplinkBridge", () => {
 						runtime: "claude",
 						prompt: "test",
 						model: "claude-sonnet-4-20250514",
+						resumeSessionId: "explicit-runtime-session",
 					},
 				}),
 			);
 
 			await waitForCondition(() => startRunPayload !== null, 8000);
 			expect(startRunPayload?.["model"]).toBe("claude-sonnet-4-20250514");
+			expect(startRunPayload?.["resumeSessionId"]).toBeUndefined();
 		} finally {
 			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
 				mobileSocket.close();
@@ -2045,7 +2047,7 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
-	it("auto-resumes opencode sessions when creating a new session", async () => {
+	it("starts a fresh local session even when an older runtime session exists", async () => {
 		let startRunPayload: JsonRecord | null = null;
 
 		uplinkWss.on("connection", (socket) => {
@@ -2112,17 +2114,17 @@ describe("RelayUplinkBridge", () => {
 		});
 
 		try {
-			await expect(bridge.startSession("opencode", "auto-resume validation")).resolves.toEqual({
+			await expect(bridge.startSession("opencode", "fresh-start validation")).resolves.toEqual({
 				sessionId: "sess-new-1",
 			});
 			expect(startRunPayload).toBeTruthy();
-			expect(startRunPayload?.["resumeSessionId"]).toBe("ses_existing_123");
+			expect(startRunPayload?.["resumeSessionId"]).toBeUndefined();
 		} finally {
 			await bridge.stop();
 		}
 	}, 20_000);
 
-	it("falls back to a fresh local start when opencode auto-resume fails", async () => {
+	it("does not retry a failed local new-session start", async () => {
 		const startRunPayloads: JsonRecord[] = [];
 
 		uplinkWss.on("connection", (socket) => {
@@ -2159,22 +2161,11 @@ describe("RelayUplinkBridge", () => {
 				if (type === "start_run") {
 					const payload = (command["payload"] as JsonRecord | undefined) ?? {};
 					startRunPayloads.push(payload);
-					if (startRunPayloads.length === 1) {
-						socket.send(
-							JSON.stringify({
-								type: "error",
-								payload: { message: "resume id no longer valid" },
-							}),
-						);
-						return;
-					}
 					socket.send(
 						JSON.stringify({
-							type: "run_started",
-							payload: {
-								sessionId: "sess-new-2",
-								runId: "run-new-2",
-							},
+							type: "error",
+							requestId: command["requestId"],
+							payload: { code: "COMMAND_FAILED", message: "runtime start failed" },
 						}),
 					);
 				}
@@ -2197,12 +2188,11 @@ describe("RelayUplinkBridge", () => {
 		});
 
 		try {
-			await expect(bridge.startSession("opencode", "fallback validation")).resolves.toEqual({
-				sessionId: "sess-new-2",
-			});
-			expect(startRunPayloads.length).toBe(2);
-			expect(startRunPayloads[0]?.["resumeSessionId"]).toBe("ses_stale_456");
-			expect(startRunPayloads[1]?.["resumeSessionId"]).toBeUndefined();
+			await expect(bridge.startSession("opencode", "single-attempt validation")).rejects.toThrow(
+				"runtime start failed",
+			);
+			expect(startRunPayloads).toHaveLength(1);
+			expect(startRunPayloads[0]?.["resumeSessionId"]).toBeUndefined();
 		} finally {
 			await bridge.stop();
 		}
