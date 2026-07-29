@@ -1,5 +1,4 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync } from "node:fs";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -88,9 +87,8 @@ function hasExcludedDirectory(path) {
 	return path.split("/").some((part) => EXCLUDED_DIRECTORY_NAMES.has(part));
 }
 
-function isRegularFile(root, path) {
-	const absolutePath = resolve(root, path);
-	return existsSync(absolutePath) && lstatSync(absolutePath).isFile();
+function isGuildExportManifest(path) {
+	return path.startsWith(".guild/exports/") && path.endsWith("/manifest.json");
 }
 
 export function classifyPath(path) {
@@ -113,10 +111,11 @@ export function classifyPath(path) {
 	return { biome, docs, shell, source, swift };
 }
 
-function classifyStagedPaths(root, paths) {
+function classifyStagedPaths(paths) {
 	const groups = {
 		biome: [],
 		docs: [],
+		exports: [],
 		included: [],
 		shell: [],
 		source: [],
@@ -124,10 +123,6 @@ function classifyStagedPaths(root, paths) {
 	};
 
 	for (const path of paths) {
-		if (!isRegularFile(root, path)) {
-			continue;
-		}
-
 		const classification = classifyPath(path);
 		let included = false;
 		for (const group of ["biome", "docs", "shell", "source", "swift"]) {
@@ -139,14 +134,18 @@ function classifyStagedPaths(root, paths) {
 		if (included) {
 			groups.included.push(path);
 		}
+		if (isGuildExportManifest(path)) {
+			groups.exports.push(path);
+		}
 	}
 
 	return groups;
 }
 
-function runCommand(root, command, args) {
+function runCommand(root, command, args, extraEnv = {}) {
 	const result = spawnSync(command, args, {
 		cwd: root,
+		env: { ...process.env, ...extraEnv },
 		stdio: "inherit",
 	});
 	if (result.error) {
@@ -174,8 +173,8 @@ function requireTool(root, command, args, label) {
 	return false;
 }
 
-function runFormatter(root, command, args, paths) {
-	const result = runCommand(root, command, args);
+function runFormatter(root, command, args, paths, extraEnv = {}) {
+	const result = runCommand(root, command, args, extraEnv);
 	if (!result.started) {
 		return result.status;
 	}
@@ -199,9 +198,17 @@ function runBiome(root, groups) {
 		return 0;
 	}
 
-	const exportsStatus = runCommand(root, "pnpm", ["format:exports"]).status;
-	if (exportsStatus !== 0) {
-		return exportsStatus;
+	if (groups.exports.length > 0) {
+		const exportsStatus = runFormatter(
+			root,
+			"pnpm",
+			["format:exports", "--", ...groups.exports],
+			groups.exports,
+			{ SKIP_GUILD_EXPORT_GIT_ADD: "1" },
+		);
+		if (exportsStatus !== 0) {
+			return exportsStatus;
+		}
 	}
 
 	const formatStatus = runFormatter(
@@ -317,7 +324,7 @@ export function main() {
 			"--diff-filter=ACMR",
 			"--",
 		]).map((path) => normalizeRepositoryPath(root, path));
-		const groups = classifyStagedPaths(root, stagedPaths);
+		const groups = classifyStagedPaths(stagedPaths);
 		if (groups.included.length === 0) {
 			return 0;
 		}
