@@ -5,9 +5,11 @@
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
-import { type ServerHandle, startServer } from "./server.js";
+import type { ServerConfig, ServerHandle } from "./server.js";
+
+type StartServer = (config: ServerConfig) => Promise<ServerHandle>;
 
 // Every test here starts a real relay + uplink + bridge: TLS cert work, Fastify
 // listening on several interfaces, then a full teardown. Individually they run in
@@ -19,6 +21,39 @@ describe("Server Integration", { timeout: 30000 }, () => {
 	let server: ServerHandle | null = null;
 	const testPort = 18080; // Use high port to avoid conflicts
 	let speechDir: string;
+	let suiteMachineStateDir: string | null = null;
+	let originalHome: string | undefined;
+	let startServerImplementation: StartServer | null = null;
+
+	beforeAll(async () => {
+		originalHome = process.env["HOME"];
+		suiteMachineStateDir = await mkdtemp(join(tmpdir(), "cli-server-suite-"));
+		process.env["HOME"] = suiteMachineStateDir;
+		({ startServer: startServerImplementation } = await import("./server.js"));
+	});
+
+	afterAll(async () => {
+		if (originalHome === undefined) {
+			Reflect.deleteProperty(process.env, "HOME");
+		} else {
+			process.env["HOME"] = originalHome;
+		}
+		if (suiteMachineStateDir) {
+			await rm(suiteMachineStateDir, { recursive: true, force: true });
+		}
+	});
+
+	async function startServer(config: ServerConfig): Promise<ServerHandle> {
+		if (!suiteMachineStateDir || !startServerImplementation) {
+			throw new Error("Server integration suite state is not initialized");
+		}
+		return startServerImplementation({
+			pairingStorePath: join(suiteMachineStateDir, "trusted-pairings.json"),
+			projectRegistryPath: join(suiteMachineStateDir, "projects.json"),
+			tlsDir: join(suiteMachineStateDir, "tls"),
+			...config,
+		});
+	}
 
 	// startServer also starts the speech service, which publishes its endpoint to
 	// ~/.codemote/speech.json and removes it on stop. Left unredirected, running
