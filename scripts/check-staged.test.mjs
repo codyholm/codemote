@@ -7,6 +7,7 @@ import {
 	mkdtempSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -52,6 +53,7 @@ function createFixture(t) {
 	const log = join(root, "tool-log.jsonl");
 	mkdirSync(bin);
 	const fakeTool = `#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 
@@ -60,6 +62,18 @@ const args = process.argv.slice(2);
 const log = process.env["CHECK_STAGED_TOOL_LOG"];
 if (log) {
 	appendFileSync(log, \`\${JSON.stringify({ args, tool })}\\n\`, "utf8");
+}
+
+if (tool === "pnpm" && args[0] === "format:exports") {
+	const result = spawnSync(
+		process.execPath,
+		[process.env["CHECK_STAGED_FORMAT_EXPORTS_PATH"], ...args.slice(2)],
+		{ stdio: "inherit" },
+	);
+	if (result.error) {
+		throw result.error;
+	}
+	process.exit(result.status ?? 1);
 }
 
 const separator = args.lastIndexOf("--");
@@ -87,6 +101,7 @@ if (failureMatch && \`\${tool} \${args.join(" ")}\`.includes(failureMatch)) {
 
 	const env = {
 		...process.env,
+		CHECK_STAGED_FORMAT_EXPORTS_PATH: resolve(dirname(scriptPath), "format-exports.mjs"),
 		CHECK_STAGED_TOOL_LOG: log,
 		PATH: `${bin}:${process.env["PATH"]}`,
 	};
@@ -95,6 +110,7 @@ if (failureMatch && \`\${tool} \${args.join(" ")}\`.includes(failureMatch)) {
 
 function createRealToolsFixture(t) {
 	const fixture = createFixture(t);
+	const repositoryRoot = resolve(dirname(scriptPath), "..");
 	const realBinRoot = resolve(dirname(scriptPath), "..", "node_modules", ".bin");
 	const pnpmPath = join(fixture.root, "fake-bin", "pnpm");
 	const pnpmWrapper = `#!/usr/bin/env node
@@ -107,7 +123,18 @@ const log = process.env["CHECK_STAGED_TOOL_LOG"];
 if (log) {
 	appendFileSync(log, \`\${JSON.stringify({ args, tool: "pnpm" })}\\n\`, "utf8");
 }
-if (args[0] === "format:exports" || args[0] === "typecheck") {
+if (args[0] === "format:exports") {
+	const result = spawnSync(
+		process.execPath,
+		[process.env["CHECK_STAGED_FORMAT_EXPORTS_PATH"], ...args.slice(2)],
+		{ stdio: "inherit" },
+	);
+	if (result.error) {
+		throw result.error;
+	}
+	process.exit(result.status ?? 1);
+}
+if (args[0] === "typecheck") {
 	process.exit(0);
 }
 if (args[0] !== "exec" || !args[1]) {
@@ -126,10 +153,20 @@ process.exit(result.status ?? 1);
 		rmSync(join(fixture.root, "fake-bin", tool));
 	}
 
-	const repositoryRoot = resolve(dirname(scriptPath), "..");
-	for (const config of [".prettierignore", ".prettierrc.json", ".swift-format", ".swiftlint.yml"]) {
+	for (const config of [
+		".prettierignore",
+		".prettierrc.json",
+		".swift-format",
+		".swiftlint.yml",
+		"biome.json",
+	]) {
 		copyFileSync(join(repositoryRoot, config), join(fixture.root, config));
 	}
+	fixture.env.CHECK_STAGED_FORMAT_EXPORTS_PATH = join(
+		repositoryRoot,
+		"scripts",
+		"format-exports.mjs",
+	);
 	fixture.env.CHECK_STAGED_REAL_BIN_ROOT = realBinRoot;
 	return fixture;
 }
@@ -172,6 +209,13 @@ describe("classifyPath", () => {
 		assert.equal(classifyPath("pnpm-lock.yaml").docs, false);
 		assert.equal(classifyPath(".guild/ops/plans/.archive/old.md").docs, false);
 	});
+});
+
+test("uses the Xcode 16-compatible multiline string configuration shape", () => {
+	const repositoryRoot = resolve(dirname(scriptPath), "..");
+	const configuration = JSON.parse(readFileSync(join(repositoryRoot, ".swift-format"), "utf8"));
+
+	assert.deepEqual(configuration.reflowMultilineStringLiterals, { never: {} });
 });
 
 describe("check-staged", () => {
@@ -219,6 +263,30 @@ describe("check-staged", () => {
 		assert.deepEqual(readLog(fixture.log), []);
 	});
 
+	for (const worktreeState of ["deleted", "symlink"]) {
+		test(`rejects a staged file ${worktreeState} in the worktree before running tools`, (t) => {
+			const fixture = createFixture(t);
+			write(fixture.root, "README.md", "baseline\n");
+			git(fixture.root, ["add", "--", "README.md"]);
+			git(fixture.root, ["commit", "-qm", "baseline"]);
+			write(fixture.root, "README.md", "staged\n");
+			git(fixture.root, ["add", "--", "README.md"]);
+			const stagedBefore = git(fixture.root, ["show", ":README.md"]);
+			rmSync(join(fixture.root, "README.md"));
+			if (worktreeState === "symlink") {
+				write(fixture.root, "replacement.md", "replacement\n");
+				symlinkSync("replacement.md", join(fixture.root, "README.md"));
+			}
+
+			const result = runHook(fixture);
+
+			assert.equal(result.status, 1);
+			assert.match(result.stderr, /README\.md/);
+			assert.equal(git(fixture.root, ["show", ":README.md"]), stagedBefore);
+			assert.deepEqual(readLog(fixture.log), []);
+		});
+	}
+
 	test("ignores deleted files and Android shell paths", (t) => {
 		const fixture = createFixture(t);
 		write(fixture.root, "docs/removed.md", "remove me\n");
@@ -239,12 +307,13 @@ describe("check-staged", () => {
 		const fixture = createFixture(t);
 		for (const [path, contents] of [
 			["packages/server/src/app.ts", "export const value=1\n"],
+			[".guild/exports/example/manifest.json", '{"name":"example"}\n'],
 			["packages/mobile-ios/Sources/App.swift", "let value=1\n"],
 			["scripts/release.sh", "#!/bin/sh\necho ok\n"],
 			["docs/config.yml", "enabled:true\n"],
 		]) {
 			write(fixture.root, path, contents);
-			git(fixture.root, ["add", "--", path]);
+			git(fixture.root, ["add", "--force", "--", path]);
 		}
 
 		const result = runHook(fixture);
@@ -253,7 +322,11 @@ describe("check-staged", () => {
 		const commands = readLog(fixture.log).map(
 			(entry) => `${basename(entry.tool)} ${entry.args.join(" ")}`,
 		);
-		assert.ok(commands.some((command) => command === "pnpm format:exports"));
+		assert.ok(
+			commands.some(
+				(command) => command === "pnpm format:exports -- .guild/exports/example/manifest.json",
+			),
+		);
 		assert.ok(commands.some((command) => command.startsWith("pnpm exec biome check --write")));
 		assert.ok(commands.some((command) => command === "pnpm typecheck"));
 		assert.ok(commands.some((command) => command.startsWith("xcrun swift-format format")));
@@ -261,6 +334,54 @@ describe("check-staged", () => {
 		assert.ok(commands.some((command) => command.startsWith("shfmt -w")));
 		assert.ok(commands.some((command) => command.startsWith("shellcheck --")));
 		assert.ok(commands.some((command) => command.startsWith("pnpm exec prettier --write")));
+	});
+
+	test("does not run the export formatter for an unrelated unstaged manifest", (t) => {
+		const fixture = createFixture(t);
+		const manifestPath = ".guild/exports/example/manifest.json";
+		write(fixture.root, manifestPath, '{"name":"baseline"}\n');
+		git(fixture.root, ["add", "--force", "--", manifestPath]);
+		git(fixture.root, ["commit", "-qm", "baseline"]);
+		write(fixture.root, manifestPath, '{"name":"unrelated work"}\n');
+		write(fixture.root, "packages/server/src/fixture.jsx", "export const value=1\n");
+		git(fixture.root, ["add", "--", "packages/server/src/fixture.jsx"]);
+
+		const result = runHook(fixture);
+
+		assert.equal(result.status, 0, result.stderr);
+		assert.equal(
+			readFileSync(join(fixture.root, manifestPath), "utf8"),
+			'{"name":"unrelated work"}\n',
+		);
+		assert.equal(
+			git(fixture.root, ["diff", "--cached", "--name-only"]).trim(),
+			"packages/server/src/fixture.jsx",
+		);
+		assert.equal(
+			readLog(fixture.log).some(
+				(entry) => entry.tool === "pnpm" && entry.args[0] === "format:exports",
+			),
+			false,
+		);
+	});
+
+	test("rejects a staged export-manifest symlink without modifying its target", (t) => {
+		const fixture = createFixture(t);
+		const externalRoot = mkdtempSync(join(tmpdir(), "codemote-export-target-"));
+		t.after(() => rmSync(externalRoot, { force: true, recursive: true }));
+		const externalPath = join(externalRoot, "manifest.json");
+		const originalContents = '{"name":"outside"}\n';
+		writeFileSync(externalPath, originalContents, "utf8");
+		const manifestPath = ".guild/exports/example/manifest.json";
+		mkdirSync(dirname(join(fixture.root, manifestPath)), { recursive: true });
+		symlinkSync(externalPath, join(fixture.root, manifestPath));
+		git(fixture.root, ["add", "--force", "--", manifestPath]);
+
+		const result = runHook(fixture);
+
+		assert.notEqual(result.status, 0);
+		assert.match(result.stdout + result.stderr, /regular non-symlink file/);
+		assert.equal(readFileSync(externalPath, "utf8"), originalContents);
 	});
 
 	test("restages formatter output while preserving its nonzero status", (t) => {
@@ -305,6 +426,7 @@ describe("check-staged", () => {
 
 			const files = new Map([
 				["packages/server/src/fixture.ts", "export const fixture={answer:1}\n"],
+				[".guild/exports/example/manifest.json", '{"name":"fixture"}\n'],
 				["packages/mobile-ios/Sources/Fixture.swift", "struct Fixture{let value:Int}\n"],
 				["scripts/fixture.sh", "#!/bin/sh\nif true;then echo ok;fi\n"],
 				["docs/fixture.md", "#   Fixture\n"],
@@ -312,7 +434,7 @@ describe("check-staged", () => {
 			]);
 			for (const [path, contents] of files) {
 				write(fixture.root, path, contents);
-				git(fixture.root, ["add", "--", path]);
+				git(fixture.root, ["add", "--force", "--", path]);
 			}
 
 			const firstResult = runHook(fixture);
