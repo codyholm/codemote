@@ -53,6 +53,7 @@ function createFixture(t) {
 	const log = join(root, "tool-log.jsonl");
 	mkdirSync(bin);
 	const fakeTool = `#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 
@@ -61,6 +62,18 @@ const args = process.argv.slice(2);
 const log = process.env["CHECK_STAGED_TOOL_LOG"];
 if (log) {
 	appendFileSync(log, \`\${JSON.stringify({ args, tool })}\\n\`, "utf8");
+}
+
+if (tool === "pnpm" && args[0] === "format:exports") {
+	const result = spawnSync(
+		process.execPath,
+		[process.env["CHECK_STAGED_FORMAT_EXPORTS_PATH"], ...args.slice(2)],
+		{ stdio: "inherit" },
+	);
+	if (result.error) {
+		throw result.error;
+	}
+	process.exit(result.status ?? 1);
 }
 
 const separator = args.lastIndexOf("--");
@@ -88,6 +101,7 @@ if (failureMatch && \`\${tool} \${args.join(" ")}\`.includes(failureMatch)) {
 
 	const env = {
 		...process.env,
+		CHECK_STAGED_FORMAT_EXPORTS_PATH: resolve(dirname(scriptPath), "format-exports.mjs"),
 		CHECK_STAGED_TOOL_LOG: log,
 		PATH: `${bin}:${process.env["PATH"]}`,
 	};
@@ -349,6 +363,25 @@ describe("check-staged", () => {
 			),
 			false,
 		);
+	});
+
+	test("rejects a staged export-manifest symlink without modifying its target", (t) => {
+		const fixture = createFixture(t);
+		const externalRoot = mkdtempSync(join(tmpdir(), "codemote-export-target-"));
+		t.after(() => rmSync(externalRoot, { force: true, recursive: true }));
+		const externalPath = join(externalRoot, "manifest.json");
+		const originalContents = '{"name":"outside"}\n';
+		writeFileSync(externalPath, originalContents, "utf8");
+		const manifestPath = ".guild/exports/example/manifest.json";
+		mkdirSync(dirname(join(fixture.root, manifestPath)), { recursive: true });
+		symlinkSync(externalPath, join(fixture.root, manifestPath));
+		git(fixture.root, ["add", "--force", "--", manifestPath]);
+
+		const result = runHook(fixture);
+
+		assert.notEqual(result.status, 0);
+		assert.match(result.stdout + result.stderr, /regular non-symlink file/);
+		assert.equal(readFileSync(externalPath, "utf8"), originalContents);
 	});
 
 	test("restages formatter output while preserving its nonzero status", (t) => {
