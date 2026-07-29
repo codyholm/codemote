@@ -1,4 +1,4 @@
-import type { RuntimeType, SessionStatus } from "./index.js";
+import type { RuntimeType, SessionExecutionState, SessionStatus } from "./index.js";
 
 /**
  * Why a session should be looked at, as opposed to what its process is doing.
@@ -58,6 +58,10 @@ export interface ProjectSessionState {
 	 * Unchanged by a repeated same-status write.
 	 */
 	statusChangedAt: number;
+	/** Registered project that originated this session, independent of execution path. */
+	originProjectPath?: string;
+	/** Actual directory and Git checkout state used by a project-aware session. */
+	execution?: SessionExecutionState;
 }
 
 /** A user-named project persisted in the machine registry. */
