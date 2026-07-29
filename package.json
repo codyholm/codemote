@@ -16,6 +16,8 @@
 		"lint:fix": "biome check --write .",
 		"format": "biome format --write .",
 		"format:exports": "node scripts/format-exports.mjs",
+		"check:staged": "node scripts/check-staged.mjs",
+		"setup:quality": "./scripts/setup-quality-tools.sh",
 		"ops:reconcile": "node scripts/ops/reconcile-master-plan.mjs",
 		"ops:reconcile:closed": "node scripts/ops/reconcile-master-plan.mjs --require-closed",
 		"typecheck": "pnpm -r typecheck",
@@ -23,12 +25,13 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^1.9.0",
+		"prettier": "3.9.6",
+		"simple-git-hooks": "^2.11.0",
 		"typescript": "^5.6.0",
-		"vitest": "^2.1.0",
-		"simple-git-hooks": "^2.11.0"
+		"vitest": "^2.1.0"
 	},
 	"simple-git-hooks": {
-		"pre-commit": "./scripts/pre-commit.sh"
+		"pre-commit": "pnpm check:staged"
 	},
 	"engines": {
 		"node": ">=22.0.0",
