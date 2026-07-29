@@ -1084,6 +1084,160 @@ describe("bridge project state", { timeout: 30000 }, () => {
 		}
 	});
 
+	it("keeps a timed-out project start unresolved and retries the same operation ID", async () => {
+		const previousTimeout = process.env["CODEMOTE_UPLINK_COMMAND_TIMEOUT_MS"];
+		const previousLongTimeout = process.env["CODEMOTE_UPLINK_LONG_COMMAND_TIMEOUT_MS"];
+		process.env["CODEMOTE_UPLINK_COMMAND_TIMEOUT_MS"] = "80";
+		process.env["CODEMOTE_UPLINK_LONG_COMMAND_TIMEOUT_MS"] = "80";
+
+		const startCommands: JsonRecord[] = [];
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+					return;
+				}
+				if (command["type"] === "get_project_state") {
+					socket.send(
+						JSON.stringify({
+							type: "project_state",
+							requestId: command["requestId"],
+							payload: aggregate(SOLICITED),
+						}),
+					);
+					return;
+				}
+				if (command["type"] !== "start_run") return;
+				startCommands.push(command);
+				if (startCommands.length === 1) return;
+				socket.send(
+					JSON.stringify({
+						type: "run_started",
+						requestId: command["requestId"],
+						payload: {
+							runId: "project-retry-run",
+							sessionId: "project-retry-session",
+							operationId: "operation-timeout",
+							originProjectPath: tempRepoDir,
+							execution: {
+								directory: tempRepoDir,
+								mode: "project_folder",
+								git: null,
+							},
+						},
+					}),
+				);
+			});
+		});
+
+		const relay = wireRelay(relayWss);
+		let bridge: Awaited<ReturnType<typeof startRelayUplinkBridge>> | null = null;
+		let mobileSocket: WebSocket | null = null;
+		try {
+			bridge = await startRelayUplinkBridge({
+				relayUrl: `ws://127.0.0.1:${relayPort}`,
+				uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+				repoPath: tempRepoDir,
+			});
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+			const received: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const payload = mobilePayload(raw.toString());
+				if (payload) received.push(payload);
+			});
+			await pairMobile(mobileSocket, bridge.pairingCode);
+
+			const startMessage = JSON.stringify({
+				type: "message",
+				payload: {
+					type: "new_session",
+					runtime: "codex",
+					prompt: "retry the same project start",
+					projectStart: {
+						operationId: "operation-timeout",
+						originProjectPath: tempRepoDir,
+						mode: "project_folder",
+						preparation: { type: "none" },
+					},
+				},
+			});
+			mobileSocket.send(startMessage);
+
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) =>
+							message["type"] === "session_start_unresolved" &&
+							message["operationId"] === "operation-timeout",
+					),
+				15_000,
+			);
+			expect(
+				received.find(
+					(message) =>
+						message["type"] === "session_start_unresolved" &&
+						message["operationId"] === "operation-timeout",
+				),
+			).toEqual({
+				type: "session_start_unresolved",
+				operationId: "operation-timeout",
+				retryable: true,
+				code: "UPLINK_RESPONSE_TIMEOUT",
+				message: "Timed out waiting for uplink response: run_started",
+			});
+			expect(
+				received.some(
+					(message) =>
+						message["type"] === "session_start_result" &&
+						message["operationId"] === "operation-timeout",
+				),
+			).toBe(false);
+
+			mobileSocket.send(startMessage);
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) =>
+							message["type"] === "session_start_result" &&
+							message["operationId"] === "operation-timeout" &&
+							message["success"] === true,
+					),
+				15_000,
+			);
+			expect(startCommands).toHaveLength(2);
+			expect(
+				startCommands.map(
+					(command) =>
+						((command["payload"] as JsonRecord)["projectStart"] as JsonRecord)["operationId"],
+				),
+			).toEqual(["operation-timeout", "operation-timeout"]);
+			expect(
+				received.some(
+					(message) =>
+						message["type"] === "session_start_result" &&
+						message["operationId"] === "operation-timeout" &&
+						message["success"] === false,
+				),
+			).toBe(false);
+		} finally {
+			mobileSocket?.close();
+			if (bridge) await bridge.stop();
+			relay.dispose();
+			if (previousTimeout === undefined) {
+				Reflect.deleteProperty(process.env, "CODEMOTE_UPLINK_COMMAND_TIMEOUT_MS");
+			} else {
+				process.env["CODEMOTE_UPLINK_COMMAND_TIMEOUT_MS"] = previousTimeout;
+			}
+			if (previousLongTimeout === undefined) {
+				Reflect.deleteProperty(process.env, "CODEMOTE_UPLINK_LONG_COMMAND_TIMEOUT_MS");
+			} else {
+				process.env["CODEMOTE_UPLINK_LONG_COMMAND_TIMEOUT_MS"] = previousLongTimeout;
+			}
+		}
+	});
+
 	it("forwards structured project and journal failures without synthetic sessions", async () => {
 		uplinkWss.on("connection", (socket) => {
 			socket.on("message", (raw) => {

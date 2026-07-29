@@ -270,6 +270,14 @@ type SessionStartResultMessage =
 			details?: ProjectStartFailureDetails;
 	  };
 
+interface SessionStartUnresolvedMessage {
+	type: "session_start_unresolved";
+	operationId: string;
+	retryable: true;
+	code: "UPLINK_RESPONSE_TIMEOUT" | "UPLINK_RESPONSE_UNRESOLVED";
+	message: string;
+}
+
 interface ProjectRegistryResultMessage {
 	type: "project_registry_result";
 	operation: "add" | "rename" | "remove";
@@ -406,6 +414,7 @@ type MobileOutboundMessage =
 	| ProjectStateMessage
 	| ProjectStartStateMessage
 	| SessionStartResultMessage
+	| SessionStartUnresolvedMessage
 	| ProjectRegistryResultMessage
 	| GitPRResultMessage;
 
@@ -474,6 +483,13 @@ class UplinkRequestError extends Error {
 	) {
 		super(message);
 		this.name = "UplinkRequestError";
+	}
+}
+
+class UplinkResponseTimeoutError extends Error {
+	constructor(readonly expectedType: UplinkResponse["type"]) {
+		super(`Timed out waiting for uplink response: ${expectedType}`);
+		this.name = "UplinkResponseTimeoutError";
 	}
 }
 
@@ -843,7 +859,7 @@ class UplinkWsClient {
 					if (idx >= 0) {
 						this.pending.splice(idx, 1);
 					}
-					reject(new Error(`Timed out waiting for uplink response: ${expectedType}`));
+					reject(new UplinkResponseTimeoutError(expectedType));
 				}, timeoutMs),
 			};
 			this.pending.push(waiter);
@@ -1511,20 +1527,32 @@ export async function startRelayUplinkBridge(
 			}
 		} catch (error) {
 			if (message.projectStart) {
-				const requestError =
-					error instanceof UplinkRequestError
-						? error
-						: new UplinkRequestError("COMMAND_FAILED", errorMessage(error));
+				if (!(error instanceof UplinkRequestError)) {
+					log?.(
+						`[Bridge] Project start ${message.projectStart.operationId} remains unresolved: ${errorMessage(error)}`,
+					);
+					sendToMobile({
+						type: "session_start_unresolved",
+						operationId: message.projectStart.operationId,
+						retryable: true,
+						code:
+							error instanceof UplinkResponseTimeoutError
+								? "UPLINK_RESPONSE_TIMEOUT"
+								: "UPLINK_RESPONSE_UNRESOLVED",
+						message: errorMessage(error),
+					});
+					return;
+				}
 				log?.(
-					`[Bridge] Project start ${message.projectStart.operationId} failed: ${requestError.message}`,
+					`[Bridge] Project start ${message.projectStart.operationId} failed: ${error.message}`,
 				);
 				sendToMobile({
 					type: "session_start_result",
 					operationId: message.projectStart.operationId,
 					success: false,
-					code: requestError.code,
-					message: requestError.message,
-					...(requestError.details ? { details: requestError.details } : {}),
+					code: error.code,
+					message: error.message,
+					...(error.details ? { details: error.details } : {}),
 				});
 				return;
 			}

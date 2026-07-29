@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { platform, tmpdir } from "node:os";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ProjectStartRequest, RunOptions, RunResult } from "@codemote/common";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -204,6 +204,56 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		).rejects.toBeDefined();
 	});
 
+	it.skipIf(platform() === "win32")(
+		"classifies non-Git folders independently of the inherited locale",
+		async () => {
+			const nonGit = join(fixtureRoot, "localized-plain");
+			const fakeBin = join(fixtureRoot, "fake-bin");
+			const fakeGit = join(fakeBin, "git");
+			await mkdir(nonGit);
+			await mkdir(fakeBin);
+			await writeFile(
+				fakeGit,
+				[
+					"#!/bin/sh",
+					'if [ "$LC_ALL" = "C" ]; then',
+					'\tprintf "%s\\n" "fatal: not a git repository" >&2',
+					"else",
+					'\tprintf "%s\\n" "fatal: dépôt Git introuvable" >&2',
+					"fi",
+					"exit 128",
+					"",
+				].join("\n"),
+				"utf8",
+			);
+			await chmod(fakeGit, 0o755);
+			registry.add("Localized plain folder", nonGit);
+			const inherited = {
+				PATH: process.env["PATH"],
+				LC_ALL: process.env["LC_ALL"],
+				LANG: process.env["LANG"],
+			};
+
+			try {
+				process.env["PATH"] = `${fakeBin}${delimiter}${inherited.PATH ?? ""}`;
+				process.env["LC_ALL"] = "fr_FR.UTF-8";
+				process.env["LANG"] = "fr_FR.UTF-8";
+
+				expect(await coordinator().inspect(nonGit)).toEqual({
+					originProjectPath: nonGit,
+					mode: "project_folder",
+					directory: nonGit,
+					git: null,
+				});
+			} finally {
+				for (const [key, value] of Object.entries(inherited)) {
+					if (value === undefined) delete process.env[key];
+					else process.env[key] = value;
+				}
+			}
+		},
+	);
+
 	it("rejects oversized Git output after terminating and reaping the command", async () => {
 		const repo = await makeGitProject();
 		const largePath = join(repo, "large-output.txt");
@@ -385,6 +435,49 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 			"STALE_PROJECT_STATE",
 		);
 		expect(await git(staleBranchRepo, ["branch", "--show-current"])).toBe("other");
+		expect(sessions.list()).toHaveLength(0);
+	});
+
+	it("rejects branch preparation during a conflicted merge without changing HEAD", async () => {
+		const repo = await makeGitProject("merge-in-progress");
+		await git(repo, ["checkout", "-b", "conflict-side"]);
+		await writeFile(join(repo, "tracked.txt"), "side change\n", "utf8");
+		await git(repo, ["add", "tracked.txt"]);
+		await git(repo, ["commit", "--no-gpg-sign", "-m", "side change"]);
+		await git(repo, ["checkout", "main"]);
+		await writeFile(join(repo, "tracked.txt"), "main change\n", "utf8");
+		await git(repo, ["add", "tracked.txt"]);
+		await git(repo, ["commit", "--no-gpg-sign", "-m", "main change"]);
+
+		const service = coordinator();
+		const state = await service.inspect(repo);
+		const headBeforeMerge = await git(repo, ["rev-parse", "HEAD"]);
+		await expect(
+			execFileAsync("git", ["-C", repo, "merge", "--no-edit", "conflict-side"], {
+				encoding: "utf8",
+				maxBuffer: 64 * 1024,
+			}),
+		).rejects.toBeDefined();
+		expect(await git(repo, ["rev-parse", "--verify", "MERGE_HEAD"])).not.toBe("");
+
+		const failure = await expectStartError(
+			service.start(
+				request(repo, "merge-in-progress", branchPreparation(state, "feature/during-merge")),
+				launcher(),
+			),
+			"REPOSITORY_OPERATION_IN_PROGRESS",
+		);
+
+		expect(failure.details?.phase).toBe("failed");
+		expect(await git(repo, ["branch", "--show-current"])).toBe("main");
+		expect(await git(repo, ["rev-parse", "HEAD"])).toBe(headBeforeMerge);
+		await expect(
+			execFileAsync(
+				"git",
+				["-C", repo, "show-ref", "--verify", "refs/heads/feature/during-merge"],
+				{ encoding: "utf8" },
+			),
+		).rejects.toBeDefined();
 		expect(sessions.list()).toHaveLength(0);
 	});
 

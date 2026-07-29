@@ -26,6 +26,16 @@ const GIT_OUTPUT_MAX_BYTES = 64 * 1024;
 const GIT_TERMINATE_GRACE_MS = 100;
 const GIT_REAP_TIMEOUT_MS = 1_000;
 
+const GIT_OPERATION_MARKERS = [
+	{ path: "MERGE_HEAD", operation: "merge" },
+	{ path: "rebase-merge", operation: "rebase" },
+	{ path: "rebase-apply", operation: "rebase or apply-mailbox" },
+	{ path: "CHERRY_PICK_HEAD", operation: "cherry-pick" },
+	{ path: "REVERT_HEAD", operation: "revert" },
+	{ path: "BISECT_START", operation: "bisect" },
+	{ path: "sequencer", operation: "sequenced Git" },
+] as const;
+
 const GIT_REDIRECT_ENVIRONMENT = new Set([
 	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
 	"GIT_CEILING_DIRECTORIES",
@@ -77,6 +87,7 @@ type ProjectStartErrorCode =
 	| "GIT_COMMAND_FAILED"
 	| "INVALID_BRANCH"
 	| "BRANCH_EXISTS"
+	| "REPOSITORY_OPERATION_IN_PROGRESS"
 	| "STALE_PROJECT_STATE"
 	| "UNBORN_HEAD"
 	| "OPERATION_CONFLICT"
@@ -117,6 +128,8 @@ function gitEnvironment(): NodeJS.ProcessEnv {
 		}
 		environment[key] = value;
 	}
+	environment["LC_ALL"] = "C";
+	environment["LANG"] = "C";
 	return environment;
 }
 
@@ -241,6 +254,10 @@ function isNotRepository(result: GitCommandResult): boolean {
 
 function trimLine(value: string): string {
 	return value.replace(/[\r\n]+$/u, "");
+}
+
+function isMissingPath(error: unknown): boolean {
+	return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 function sameGitState(a: GitCheckoutState | null, b: GitCheckoutState | null): boolean {
@@ -560,6 +577,16 @@ export class ProjectStartCoordinator {
 			throw this.gitFailure("Failed to check whether the requested branch exists");
 		}
 
+		const inProgressOperation = await this.findInProgressGitOperation(record.originProjectPath);
+		if (inProgressOperation) {
+			return this.fail(
+				record,
+				"failed",
+				"REPOSITORY_OPERATION_IN_PROGRESS",
+				`Finish or abort the in-progress ${inProgressOperation} operation before creating a session branch`,
+			);
+		}
+
 		const transaction = await this.git(
 			record.originProjectPath,
 			["update-ref", "--stdin"],
@@ -615,6 +642,18 @@ export class ProjectStartCoordinator {
 				"retained",
 				"OPERATION_RETAINED",
 				"The created branch tip no longer matches the recorded commit",
+				record.requestedBranch,
+				undefined,
+				executionFor(state),
+			);
+		}
+		const inProgressOperation = await this.findInProgressGitOperation(record.originProjectPath);
+		if (inProgressOperation) {
+			return this.fail(
+				record,
+				"retained",
+				"REPOSITORY_OPERATION_IN_PROGRESS",
+				`The branch was created, but an in-progress ${inProgressOperation} operation must finish before it can be activated`,
 				record.requestedBranch,
 				undefined,
 				executionFor(state),
@@ -684,6 +723,28 @@ export class ProjectStartCoordinator {
 				executionFor(state),
 			);
 		}
+	}
+
+	private async findInProgressGitOperation(cwd: string): Promise<string | null> {
+		const gitDirectoryResult = await this.git(cwd, ["rev-parse", "--absolute-git-dir"], true);
+		if (gitDirectoryResult.exitCode !== 0) {
+			throw this.gitFailure("Failed to inspect repository operation state");
+		}
+		const gitDirectory = trimLine(gitDirectoryResult.stdout);
+		if (!isAbsolute(gitDirectory)) {
+			throw this.gitFailure("Failed to inspect repository operation state");
+		}
+		for (const marker of GIT_OPERATION_MARKERS) {
+			try {
+				await stat(resolve(gitDirectory, marker.path));
+				return marker.operation;
+			} catch (error) {
+				if (!isMissingPath(error)) {
+					throw this.gitFailure("Failed to inspect repository operation state");
+				}
+			}
+		}
+		return null;
 	}
 
 	private fail(
