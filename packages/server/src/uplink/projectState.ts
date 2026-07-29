@@ -64,7 +64,7 @@ export function buildProjectState(
 	const all: GroupedSession[] = sessions.map((session) => {
 		const attention = attentionForSession(session.status, session.attention !== undefined);
 		return {
-			projectId: resolve(session.workspace.workingDir),
+			projectId: resolve(session.originProjectPath ?? session.workspace.workingDir),
 			state: {
 				sessionId: session.id,
 				runtime: session.runtime,
@@ -78,6 +78,10 @@ export function buildProjectState(
 				endedAt: session.endedAt,
 				lastActivityAt: session.lastActivityAt,
 				statusChangedAt: session.statusChangedAt,
+				...(session.originProjectPath
+					? { originProjectPath: resolve(session.originProjectPath) }
+					: {}),
+				...(session.execution ? { execution: session.execution } : {}),
 			},
 		};
 	});
@@ -243,6 +247,8 @@ export function projectStateSignature(state: ProjectStateAggregate): string {
 						status: session.status,
 						attention: session.attention,
 						pending: session.pending,
+						originProjectPath: session.originProjectPath,
+						execution: session.execution,
 					})),
 			})),
 	});

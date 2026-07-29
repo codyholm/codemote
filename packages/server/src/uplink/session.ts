@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { RuntimeType, SessionStatus } from "@codemote/common";
-import type { Session, Workspace } from "./types.js";
+import type { Session, SessionStartContext, Workspace } from "./types.js";
 
 /**
  * Manages session lifecycle
@@ -11,7 +11,7 @@ export class SessionManager {
 	/**
 	 * Create a new session
 	 */
-	create(runtime: RuntimeType, workspace: Workspace): Session {
+	create(runtime: RuntimeType, workspace: Workspace, context?: SessionStartContext): Session {
 		const id = randomUUID();
 		const runId = randomUUID();
 
@@ -25,6 +25,12 @@ export class SessionManager {
 			endedAt: null,
 			lastActivityAt: Date.now(),
 			statusChangedAt: Date.now(),
+			...(context
+				? {
+						originProjectPath: context.originProjectPath,
+						execution: context.execution,
+					}
+				: {}),
 		};
 
 		this.sessions.set(id, session);

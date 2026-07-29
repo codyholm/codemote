@@ -1,11 +1,15 @@
 import type {
 	ModelInfo,
 	PendingAttention,
+	ProjectStartFailureDetails,
+	ProjectStartRequest,
+	ProjectStartState,
 	ProjectStateAggregate,
 	RegisteredProject,
 	RunOptions,
 	RunResult,
 	RuntimeType,
+	SessionExecutionState,
 	SessionStatus,
 	StreamEvent,
 } from "@codemote/common";
@@ -14,11 +18,15 @@ import type {
 export type {
 	ModelInfo,
 	PendingAttention,
+	ProjectStartFailureDetails,
+	ProjectStartRequest,
+	ProjectStartState,
 	ProjectStateAggregate,
 	RegisteredProject,
 	RunOptions,
 	RunResult,
 	RuntimeType,
+	SessionExecutionState,
 	SessionStatus,
 	StreamEvent,
 };
@@ -83,6 +91,15 @@ export interface Session {
 	 * terminal/idle transition. Explicitly `| undefined` so the clear can assign
 	 * rather than `delete`, which Biome's noDelete rule rejects. */
 	attention?: PendingAttention | undefined;
+	/** Registered project that originated this session. */
+	originProjectPath?: string;
+	/** Effective directory and Git state selected before runtime launch. */
+	execution?: SessionExecutionState;
+}
+
+export interface SessionStartContext {
+	originProjectPath: string;
+	execution: SessionExecutionState;
 }
 
 /**
@@ -126,6 +143,7 @@ export type UplinkCommand =
 	  } & RequestEnvelope)
 	| ({ type: "list_sessions" } & RequestEnvelope)
 	| ({ type: "get_project_state" } & RequestEnvelope)
+	| ({ type: "get_project_start_state"; payload: { projectPath: string } } & RequestEnvelope)
 	| ({ type: "add_project"; payload: { name: string; path: string } } & RequestEnvelope)
 	| ({ type: "list_projects" } & RequestEnvelope)
 	| ({ type: "rename_project"; payload: { path: string; name: string } } & RequestEnvelope)
@@ -157,6 +175,7 @@ export type UplinkResponse =
 	| ({ type: "git_pr_result"; payload: { sessionId: string; url: string } } & RequestEnvelope)
 	| ({ type: "sessions"; payload: Session[] } & RequestEnvelope)
 	| ({ type: "project_state"; payload: ProjectStateAggregate } & RequestEnvelope)
+	| ({ type: "project_start_state"; payload: ProjectStartState } & RequestEnvelope)
 	| ({
 			type: "project_registry_result";
 			payload: {
@@ -184,7 +203,10 @@ export type UplinkResponse =
 			type: "cache_refreshed";
 			payload: { availableRuntimes: RuntimeType[]; modelCounts: Record<string, number> };
 	  } & RequestEnvelope)
-	| ({ type: "error"; payload: { message: string; code: string } } & RequestEnvelope)
+	| ({
+			type: "error";
+			payload: { message: string; code: string; details?: ProjectStartFailureDetails };
+	  } & RequestEnvelope)
 	| ({ type: "event"; payload: StreamEvent } & RequestEnvelope);
 
 /**
@@ -231,6 +253,8 @@ export interface UplinkConfig {
 	repoPath: string;
 	/** Project registry file path override */
 	projectRegistryPath?: string;
+	/** Project-folder start operation journal path override */
+	projectStartJournalPath?: string;
 	/** Available runtime profiles */
 	runtimes: RuntimeType[];
 	/** Runtime-specific configurations */

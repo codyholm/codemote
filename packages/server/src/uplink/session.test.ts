@@ -27,6 +27,28 @@ describe("SessionManager", () => {
 		expect(session1.id).not.toBe(session2.id);
 	});
 
+	it("records project origin separately from effective execution state", () => {
+		const manager = new SessionManager();
+		const execution = {
+			directory: "/tmp/project-worktree",
+			mode: "project_folder" as const,
+			git: {
+				repositoryRoot: "/tmp/project-worktree",
+				head: "abc123",
+				branch: "feature/session",
+				detached: false,
+			},
+		};
+
+		const session = manager.create("codex", mockWorkspace, {
+			originProjectPath: "/tmp/project",
+			execution,
+		});
+
+		expect(session.originProjectPath).toBe("/tmp/project");
+		expect(session.execution).toEqual(execution);
+	});
+
 	it("updates session status", () => {
 		const manager = new SessionManager();
 		const session = manager.create("claude", mockWorkspace);

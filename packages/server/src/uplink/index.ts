@@ -3,9 +3,13 @@
 // Types
 export type {
 	RuntimeType,
+	SessionExecutionState,
 	SessionStatus,
 	StreamEvent,
 	RegisteredProject,
+	ProjectStartFailureDetails,
+	ProjectStartRequest,
+	ProjectStartState,
 	RunOptions,
 	RunResult,
 	WorkspaceConfig,
@@ -13,6 +17,7 @@ export type {
 	DirectoryEntry,
 	GitStatusSummary,
 	Session,
+	SessionStartContext,
 	UplinkCommand,
 	UplinkResponse,
 	RequestEnvelope,
