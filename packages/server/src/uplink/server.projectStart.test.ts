@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ProjectStartState, RunOptions, RunResult } from "@codemote/common";
@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import type { EventBus } from "./events.js";
 import { BaseExecutor } from "./executor.js";
+import { ClaudeExecutor } from "./executors/claude.js";
+import { CodexExecutor } from "./executors/codex.js";
 import { ProjectRegistry } from "./projectRegistry.js";
 import { UplinkServer } from "./server.js";
 import type { SessionManager } from "./session.js";
@@ -180,9 +182,10 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		initialPrompt: string,
 		preparation: Record<string, unknown> = { type: "none" },
 		path = project,
+		profile: "claude" | "codex" = "codex",
 	): Record<string, unknown> {
 		return {
-			profile: "codex",
+			profile,
 			workspace: path,
 			initialPrompt,
 			projectStart: {
@@ -301,5 +304,150 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		expect(replay.type).toBe("error");
 		expect(replay.payload).toEqual(first.payload);
 		expect(controlled.starts).toBe(1);
+	});
+
+	it.skipIf(platform() === "win32")(
+		"retains prepared branches when actual Claude and Codex binaries cannot spawn",
+		async () => {
+			const internals = server as unknown as ServerInternals;
+			server.registerExecutor(
+				new ClaudeExecutor(
+					internals.workspaceManager,
+					internals.sessionManager,
+					internals.eventBus,
+					{
+						claudePath: join(fixtureRoot, "missing-claude"),
+					},
+				),
+			);
+			const unexecutableCodex = join(fixtureRoot, "unexecutable-codex");
+			await writeFile(unexecutableCodex, "#!/bin/sh\nexit 0\n", "utf8");
+			await chmod(unexecutableCodex, 0o644);
+			server.registerExecutor(
+				new CodexExecutor(
+					internals.workspaceManager,
+					internals.sessionManager,
+					internals.eventBus,
+					{
+						codexPath: unexecutableCodex,
+					},
+				),
+			);
+
+			const claudeState = await state();
+			const claudeResponse = await client.request(
+				{
+					type: "start_run",
+					payload: startPayload(
+						"actual-claude-missing",
+						"start Claude",
+						{
+							type: "create_branch",
+							newBranch: "feature/missing-claude",
+							expectedHead: claudeState.git?.head,
+							expectedBranch: claudeState.git?.branch,
+						},
+						project,
+						"claude",
+					),
+				},
+				"actual-claude-missing",
+			);
+			expect(claudeResponse.type).toBe("error");
+			expect(claudeResponse.payload).toMatchObject({
+				code: "RUNTIME_LAUNCH_FAILED",
+				details: {
+					phase: "retained",
+					retainedBranch: "feature/missing-claude",
+				},
+			});
+			expect(await git(project, ["branch", "--show-current"])).toBe("feature/missing-claude");
+
+			const codexState = await state();
+			const codexResponse = await client.request(
+				{
+					type: "start_run",
+					payload: startPayload(
+						"actual-codex-unexecutable",
+						"start Codex",
+						{
+							type: "create_branch",
+							newBranch: "feature/unexecutable-codex",
+							expectedHead: codexState.git?.head,
+							expectedBranch: codexState.git?.branch,
+						},
+						project,
+						"codex",
+					),
+				},
+				"actual-codex-unexecutable",
+			);
+			expect(codexResponse.type).toBe("error");
+			expect(codexResponse.payload).toMatchObject({
+				code: "RUNTIME_LAUNCH_FAILED",
+				details: {
+					phase: "retained",
+					retainedBranch: "feature/unexecutable-codex",
+				},
+			});
+			expect(await git(project, ["branch", "--show-current"])).toBe("feature/unexecutable-codex");
+
+			const journal = JSON.parse(await readFile(journalPath, "utf8")) as {
+				operations: Array<{ operationId: string; phase: string; failure?: { code: string } }>;
+			};
+			expect(journal.operations).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						operationId: "actual-claude-missing",
+						phase: "retained",
+						failure: expect.objectContaining({ code: "RUNTIME_LAUNCH_FAILED" }),
+					}),
+					expect.objectContaining({
+						operationId: "actual-codex-unexecutable",
+						phase: "retained",
+						failure: expect.objectContaining({ code: "RUNTIME_LAUNCH_FAILED" }),
+					}),
+				]),
+			);
+		},
+	);
+
+	it("preserves corrupt journal errors over WebSocket", async () => {
+		await mkdir(join(fixtureRoot, "machine"), { recursive: true });
+		await writeFile(journalPath, "{ invalid", "utf8");
+
+		const response = await client.request(
+			{ type: "get_project_start_state", payload: { projectPath: project } },
+			"corrupt-journal",
+		);
+
+		expect(response.type).toBe("error");
+		expect(response.payload).toEqual({
+			code: "INVALID_PROJECT_START_JOURNAL",
+			message: "Invalid project start operation journal",
+		});
+	});
+
+	it("preserves unwritable journal errors with operation phase details over WebSocket", async () => {
+		await mkdir(`${journalPath}.tmp`, { recursive: true });
+
+		const response = await client.request(
+			{
+				type: "start_run",
+				payload: startPayload("unwritable-journal", "start without a branch"),
+			},
+			"unwritable-journal",
+		);
+
+		expect(response.type).toBe("error");
+		expect(response.payload).toEqual({
+			code: "PROJECT_START_JOURNAL_IO",
+			message: "Failed to persist project start operation journal",
+			details: {
+				operationId: "unwritable-journal",
+				phase: "recorded",
+				originProjectPath: project,
+			},
+		});
 	});
 });

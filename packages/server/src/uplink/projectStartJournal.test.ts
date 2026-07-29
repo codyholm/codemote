@@ -42,14 +42,49 @@ describe("ProjectStartJournal", () => {
 		};
 	}
 
-	function expectJournalError(action: () => unknown, code: ProjectStartJournalError["code"]): void {
+	function expectJournalError(
+		action: () => unknown,
+		code: ProjectStartJournalError["code"],
+	): ProjectStartJournalError {
 		try {
 			action();
 			throw new Error(`Expected ${code}`);
 		} catch (error) {
 			expect(error).toBeInstanceOf(ProjectStartJournalError);
 			expect((error as ProjectStartJournalError).code).toBe(code);
+			return error as ProjectStartJournalError;
 		}
+	}
+
+	function terminalResult(branch = "feature/session") {
+		return {
+			runId: "run-1",
+			sessionId: "session-1",
+			operationId: "operation-1",
+			originProjectPath: join(fixtureDir, "project"),
+			execution: {
+				directory: join(fixtureDir, "project"),
+				mode: "project_folder" as const,
+				git: {
+					repositoryRoot: join(fixtureDir, "project"),
+					head: "abc123",
+					branch,
+					detached: false,
+				},
+			},
+		};
+	}
+
+	function terminalFailure(phase: "failed" | "retained") {
+		return {
+			code: "OPERATION_RETAINED",
+			message: "Operation did not complete",
+			details: {
+				operationId: "operation-1",
+				phase,
+				originProjectPath: join(fixtureDir, "project"),
+			},
+		};
 	}
 
 	it("round trips records and returns defensive copies", () => {
@@ -197,6 +232,94 @@ describe("ProjectStartJournal", () => {
 			{ version: 1, operations: [{ ...record(), mode: "worktree" }] },
 			{ version: 1, operations: [{ ...record(), phase: "session_started" }] },
 			{ version: 1, operations: [{ ...record(), phase: "retained" }] },
+			{
+				version: 1,
+				operations: [{ ...record(), result: terminalResult() }],
+			},
+			{
+				version: 1,
+				operations: [
+					{
+						...record(),
+						phase: "launch_requested",
+						failure: {
+							...terminalFailure("retained"),
+							details: {
+								...terminalFailure("retained").details,
+								phase: "launch_requested",
+							},
+						},
+					},
+				],
+			},
+			{
+				version: 1,
+				operations: [
+					{
+						...record(),
+						phase: "session_started",
+						result: terminalResult("wrong-branch"),
+					},
+				],
+			},
+			{
+				version: 1,
+				operations: [
+					{
+						...record(),
+						phase: "session_started",
+						result: {
+							...terminalResult(),
+							execution: {
+								...terminalResult().execution,
+								git: {
+									...terminalResult().execution.git,
+									detached: true,
+								},
+							},
+						},
+					},
+				],
+			},
+			{
+				version: 1,
+				operations: [
+					{
+						...record(),
+						phase: "failed",
+						failure: { code: "FAILED", message: "Missing details" },
+					},
+				],
+			},
+			{
+				version: 1,
+				operations: [
+					{
+						...record(),
+						phase: "branch_created",
+						requestedBranch: null,
+					},
+				],
+			},
+			{
+				version: 1,
+				operations: [
+					{
+						...record(),
+						repositoryRoot: null,
+						observedHead: null,
+					},
+				],
+			},
+			{
+				version: 1,
+				operations: [
+					{
+						...record(),
+						updatedAt: 999,
+					},
+				],
+			},
 			{ version: 1, operations: [record(), record()] },
 		];
 
@@ -215,7 +338,7 @@ describe("ProjectStartJournal", () => {
 		const goodFile = await readFile(journalPath, "utf8");
 		await mkdir(`${journalPath}.tmp`);
 
-		expectJournalError(
+		const error = expectJournalError(
 			() =>
 				journal.update("operation-1", (current) => ({
 					...current,
@@ -223,6 +346,11 @@ describe("ProjectStartJournal", () => {
 				})),
 			"PROJECT_START_JOURNAL_IO",
 		);
+		expect(error.details).toMatchObject({
+			operationId: "operation-1",
+			phase: "recorded",
+			originProjectPath: join(fixtureDir, "project"),
+		});
 		expect(journal.get("operation-1")?.updatedAt).toBe(1000);
 		expect(await readFile(journalPath, "utf8")).toBe(goodFile);
 	});

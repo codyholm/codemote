@@ -58,6 +58,7 @@ export class ProjectStartJournalError extends Error {
 	constructor(
 		readonly code: ProjectStartJournalErrorCode,
 		message: string,
+		readonly details?: ProjectStartFailureDetails,
 	) {
 		super(message);
 		this.name = "ProjectStartJournalError";
@@ -129,11 +130,17 @@ function parseExecution(value: unknown): SessionExecutionState {
 		if (typeof gitCandidate["detached"] !== "boolean") {
 			return invalid("Invalid journal result Git detached state");
 		}
+		const head = nullableString(gitCandidate["head"], "head");
+		const branch = nullableString(gitCandidate["branch"], "branch");
+		const detached = gitCandidate["detached"];
+		if (detached !== (head !== null && branch === null)) {
+			return invalid("Invalid journal result Git checkout state");
+		}
 		git = {
 			repositoryRoot: absolutePath(gitCandidate["repositoryRoot"], "repositoryRoot"),
-			head: nullableString(gitCandidate["head"], "head"),
-			branch: nullableString(gitCandidate["branch"], "branch"),
-			detached: gitCandidate["detached"],
+			head,
+			branch,
+			detached,
 		};
 	}
 	return {
@@ -232,9 +239,39 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 	};
 	if (candidate["result"] !== undefined) record.result = parseResult(candidate["result"]);
 	if (candidate["failure"] !== undefined) record.failure = parseFailure(candidate["failure"]);
-	if (record.result && record.failure) invalid("Journal record cannot contain result and failure");
-	if (record.phase === "session_started" && !record.result) {
-		invalid("Successful journal record is missing its result");
+	const hasResult = record.result !== undefined;
+	const hasFailure = record.failure !== undefined;
+	if (hasResult !== (record.phase === "session_started")) {
+		invalid("Journal result must exist only for a started session");
+	}
+	if (hasFailure !== (record.phase === "failed" || record.phase === "retained")) {
+		invalid("Journal failure must exist only for a failed or retained operation");
+	}
+	if (record.updatedAt < record.createdAt) {
+		invalid("Journal update timestamp precedes creation");
+	}
+	if (
+		record.repositoryRoot === null &&
+		(record.observedHead !== null || record.observedBranch !== null)
+	) {
+		invalid("Non-Git journal record contains Git state");
+	}
+	if (
+		record.requestedBranch !== null &&
+		(record.phase === "branch_created" ||
+			record.phase === "branch_checked_out" ||
+			record.phase === "launch_requested" ||
+			record.phase === "session_started" ||
+			record.phase === "retained") &&
+		(record.repositoryRoot === null || record.observedHead === null)
+	) {
+		invalid("Branch operation is missing its repository or commit");
+	}
+	if (
+		(record.phase === "branch_created" || record.phase === "branch_checked_out") &&
+		record.requestedBranch === null
+	) {
+		invalid("Prepared branch phase is missing its requested branch");
 	}
 	if (
 		record.result &&
@@ -244,16 +281,48 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 	) {
 		invalid("Successful journal record has inconsistent project start metadata");
 	}
-	if ((record.phase === "failed" || record.phase === "retained") && !record.failure) {
-		invalid("Terminal journal record is missing its failure");
+	if (record.result) {
+		const execution = record.result.execution;
+		if (!execution || execution.directory !== record.originProjectPath) {
+			invalid("Successful journal record has an inconsistent execution directory");
+		}
+		if (record.repositoryRoot === null) {
+			if (execution.git !== null) {
+				invalid("Successful non-Git journal record contains Git execution state");
+			}
+		} else {
+			const expectedBranch = record.requestedBranch ?? record.observedBranch;
+			if (
+				!execution.git ||
+				execution.git.repositoryRoot !== record.repositoryRoot ||
+				execution.git.head !== record.observedHead ||
+				execution.git.branch !== expectedBranch ||
+				execution.git.detached !== (execution.git.head !== null && execution.git.branch === null)
+			) {
+				invalid("Successful journal record has inconsistent Git execution state");
+			}
+		}
 	}
 	if (
-		record.failure?.details &&
-		(record.failure.details.operationId !== record.operationId ||
+		record.failure &&
+		(!record.failure.details ||
+			record.failure.details.operationId !== record.operationId ||
 			record.failure.details.originProjectPath !== record.originProjectPath ||
 			record.failure.details.phase !== record.phase)
 	) {
 		invalid("Terminal journal record has inconsistent failure details");
+	}
+	if (
+		record.failure?.details?.effectiveState &&
+		record.failure.details.effectiveState.directory !== record.originProjectPath
+	) {
+		invalid("Terminal journal record has an inconsistent execution directory");
+	}
+	if (
+		record.failure?.details?.retainedBranch &&
+		record.failure.details.retainedBranch !== record.requestedBranch
+	) {
+		invalid("Terminal journal record has an inconsistent retained branch");
 	}
 	return record;
 }
@@ -275,6 +344,14 @@ function parseFile(value: unknown): ProjectStartOperationRecord[] {
 
 function cloneRecord(record: ProjectStartOperationRecord): ProjectStartOperationRecord {
 	return structuredClone(record);
+}
+
+function errorDetails(record: ProjectStartOperationRecord): ProjectStartFailureDetails {
+	return {
+		operationId: record.operationId,
+		phase: record.phase,
+		originProjectPath: record.originProjectPath,
+	};
 }
 
 export class ProjectStartJournal {
@@ -305,7 +382,7 @@ export class ProjectStartJournal {
 			);
 		}
 		const candidate = [...this.operations, normalized];
-		this.persist(candidate);
+		this.persist(candidate, errorDetails(normalized));
 		this.operations = candidate;
 		return cloneRecord(normalized);
 	}
@@ -331,7 +408,7 @@ export class ProjectStartJournal {
 		}
 		const candidate = [...this.operations];
 		candidate[index] = updated;
-		this.persist(candidate);
+		this.persist(candidate, errorDetails(updated));
 		this.operations = candidate;
 		return cloneRecord(updated);
 	}
@@ -367,7 +444,10 @@ export class ProjectStartJournal {
 		}
 	}
 
-	private persist(operations: ProjectStartOperationRecord[]): void {
+	private persist(
+		operations: ProjectStartOperationRecord[],
+		details?: ProjectStartFailureDetails,
+	): void {
 		const file: ProjectStartJournalFile = {
 			version: 1,
 			operations: operations.map(cloneRecord),
@@ -405,6 +485,7 @@ export class ProjectStartJournal {
 			throw new ProjectStartJournalError(
 				"PROJECT_START_JOURNAL_IO",
 				"Failed to persist project start operation journal",
+				details,
 			);
 		}
 		if (backupCreated) {

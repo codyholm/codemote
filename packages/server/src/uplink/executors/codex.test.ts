@@ -37,6 +37,7 @@ describe.skipIf(platform() === "win32")("CodexExecutor", () => {
 		await git.init(["--initial-branch=main"]);
 		await git.addConfig("user.email", "test@test.com");
 		await git.addConfig("user.name", "Test");
+		await git.addConfig("commit.gpgsign", "false");
 		await writeFile(join(testDir, "README.md"), "# Test");
 		await git.add(".");
 		await git.commit("Initial commit");
@@ -95,6 +96,25 @@ exit 0
 		});
 
 		expect(executor.type).toBe("codex");
+	});
+
+	it("rejects start when the Codex binary is not executable", async () => {
+		const unexecutablePath = join(testDir, "unexecutable-codex");
+		await writeFile(unexecutablePath, "#!/bin/sh\nexit 0\n", "utf8");
+		await chmod(unexecutablePath, 0o644);
+		activeExecutor = new CodexExecutor(workspaceManager, sessionManager, eventBus, {
+			codexPath: unexecutablePath,
+		});
+
+		await expect(
+			activeExecutor.startRun({
+				profile: "codex",
+				workspace: testDir,
+				initialPrompt: "Hello",
+			}),
+		).rejects.toThrow(/EACCES|permission denied|spawn/u);
+		expect(sessionManager.list()).toHaveLength(1);
+		expect(sessionManager.list()[0]?.status).toBe("error");
 	});
 
 	it("starts a run and receives events", async () => {

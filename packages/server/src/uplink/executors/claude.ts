@@ -231,21 +231,6 @@ export class ClaudeExecutor extends BaseExecutor {
 			this.handleOutput(session.id, data);
 		});
 
-		// Send initial prompt as JSON message (for stream-json input format)
-		// Format: {"type":"user","message":{"role":"user","content":"..."}}
-		// NOTE: We do NOT close stdin - keeping it open allows follow-up messages
-		const initialMessage = JSON.stringify({
-			type: "user",
-			message: {
-				role: "user",
-				content: options.initialPrompt,
-			},
-		});
-		proc.stdin.write(`${initialMessage}\n`);
-		// Some Claude builds don't emit a distinct session_start event.
-		// Mark the turn as running immediately after enqueueing input.
-		this.emitStatus(session.id, "running");
-
 		// Handle spawn errors (e.g., binary missing / not executable). Without this,
 		// Node can emit an unhandled 'error' event and crash the uplink process.
 		proc.on("error", (error) => {
@@ -272,6 +257,28 @@ export class ClaudeExecutor extends BaseExecutor {
 				this.emitStatus(session.id, "error");
 			}
 		});
+
+		try {
+			await this.waitForSpawn(proc);
+		} catch (error) {
+			this.claudeSessions.delete(session.id);
+			throw error;
+		}
+
+		// Send initial prompt as JSON message (for stream-json input format)
+		// Format: {"type":"user","message":{"role":"user","content":"..."}}
+		// NOTE: We do NOT close stdin - keeping it open allows follow-up messages
+		const initialMessage = JSON.stringify({
+			type: "user",
+			message: {
+				role: "user",
+				content: options.initialPrompt,
+			},
+		});
+		proc.stdin.write(`${initialMessage}\n`);
+		// Some Claude builds don't emit a distinct session_start event.
+		// Mark the turn as running immediately after enqueueing input.
+		this.emitStatus(session.id, "running");
 	}
 
 	/**
@@ -379,6 +386,25 @@ export class ClaudeExecutor extends BaseExecutor {
 	// ========================================
 	// Private helper methods
 	// ========================================
+
+	private waitForSpawn(proc: ChildProcessWithoutNullStreams): Promise<void> {
+		return new Promise((resolve, reject) => {
+			const cleanup = (): void => {
+				proc.removeListener("spawn", onSpawn);
+				proc.removeListener("error", onError);
+			};
+			const onSpawn = (): void => {
+				cleanup();
+				resolve();
+			};
+			const onError = (error: Error): void => {
+				cleanup();
+				reject(error);
+			};
+			proc.once("spawn", onSpawn);
+			proc.once("error", onError);
+		});
+	}
 
 	/**
 	 * Build command line arguments for claude CLI

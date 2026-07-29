@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -157,6 +157,63 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		expect(nestedState.git?.repositoryRoot).toBe(await git(repo, ["rev-parse", "--show-toplevel"]));
 		expect(nestedState.git?.branch).toBe("main");
 		expect(await git(repo, ["status", "--porcelain=v1"])).toBe("");
+	});
+
+	it("ignores poisoned Git repository and config redirection variables", async () => {
+		const registered = await makeGitProject("registered");
+		const unrelated = await makeGitProject("unrelated");
+		const state = await coordinator().inspect(registered);
+		const environment = {
+			GIT_DIR: process.env["GIT_DIR"],
+			GIT_WORK_TREE: process.env["GIT_WORK_TREE"],
+			GIT_CONFIG_COUNT: process.env["GIT_CONFIG_COUNT"],
+			GIT_CONFIG_KEY_0: process.env["GIT_CONFIG_KEY_0"],
+			GIT_CONFIG_VALUE_0: process.env["GIT_CONFIG_VALUE_0"],
+		};
+
+		try {
+			process.env["GIT_DIR"] = join(unrelated, ".git");
+			process.env["GIT_WORK_TREE"] = unrelated;
+			process.env["GIT_CONFIG_COUNT"] = "1";
+			process.env["GIT_CONFIG_KEY_0"] = "core.bare";
+			process.env["GIT_CONFIG_VALUE_0"] = "true";
+
+			await coordinator().start(
+				request(
+					registered,
+					"sanitized-environment",
+					branchPreparation(state, "feature/registered-only"),
+				),
+				launcher(),
+			);
+		} finally {
+			for (const [key, value] of Object.entries(environment)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+
+		expect(await git(registered, ["branch", "--show-current"])).toBe("feature/registered-only");
+		expect(await git(unrelated, ["branch", "--show-current"])).toBe("main");
+		await expect(
+			execFileAsync(
+				"git",
+				["-C", unrelated, "show-ref", "--verify", "refs/heads/feature/registered-only"],
+				{ encoding: "utf8" },
+			),
+		).rejects.toBeDefined();
+	});
+
+	it("rejects oversized Git output after terminating and reaping the command", async () => {
+		const repo = await makeGitProject();
+		const largePath = join(repo, "large-output.txt");
+		await writeFile(largePath, "x".repeat(4 * 1024 * 1024), "utf8");
+		const objectId = await git(repo, ["hash-object", "-w", largePath]);
+
+		await expect(runGitCommand(repo, ["cat-file", "blob", objectId])).rejects.toThrow(
+			"Git output exceeded the safety limit",
+		);
+		expect((await runGitCommand(repo, ["status", "--porcelain=v1"])).exitCode).toBe(0);
 	});
 
 	it("rejects unregistered, missing, conflicting-directory, and resume requests", async () => {
@@ -382,32 +439,22 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		expect(launches).toBe(1);
 	});
 
-	it("resumes a safely interrupted branch_created phase", async () => {
+	it("resumes a durable branch_created phase after restart", async () => {
 		const repo = await makeGitProject();
 		const state = await coordinator().inspect(repo);
-		let branchCreated = false;
-		const interrupted = coordinator({
-			runGit: async (cwd, args, input) => {
-				if (branchCreated && args[0] === "rev-parse" && args[1] === "--is-inside-work-tree") {
-					throw new Error("simulated interruption");
-				}
-				const result = await runGitCommand(cwd, args, input);
-				if (args[0] === "update-ref" && result.exitCode === 0) branchCreated = true;
-				return result;
-			},
-		});
-		await expectStartError(
-			interrupted.start(
-				request(repo, "resume-created", branchPreparation(state, "feature/resume-created")),
-				launcher(),
-			),
-			"GIT_COMMAND_FAILED",
+		const options = request(
+			repo,
+			"resume-created",
+			branchPreparation(state, "feature/resume-created"),
 		);
+		await coordinator().start(options, launcher());
+		rewritePhase("resume-created", "branch_created");
+		await git(repo, ["symbolic-ref", "HEAD", "refs/heads/main"]);
 		expect(journal.get("resume-created")?.phase).toBe("branch_created");
 		expect(await git(repo, ["branch", "--show-current"])).toBe("main");
 
-		const result = await coordinator().start(
-			request(repo, "resume-created", branchPreparation(state, "feature/resume-created")),
+		const result = await coordinator({ sessionManager: new SessionManager() }).start(
+			options,
 			launcher(),
 		);
 		expect(result.execution?.git?.branch).toBe("feature/resume-created");
@@ -483,6 +530,85 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 			"OPERATION_RETAINED",
 		);
 		expect(retainedSession.details?.createdSessionId).toBe(activeResult.sessionId);
+	});
+
+	it("persists retained outcomes when post-mutation projects cannot be safely resumed", async () => {
+		const removedRepo = await makeGitProject("removed-registration");
+		const removedState = await coordinator().inspect(removedRepo);
+		const removedOptions = request(
+			removedRepo,
+			"removed-registration",
+			branchPreparation(removedState, "feature/removed-registration"),
+		);
+		await coordinator().start(removedOptions, launcher());
+		rewritePhase("removed-registration", "branch_created");
+		await git(removedRepo, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+		registry.remove(removedRepo);
+		let removedLaunches = 0;
+
+		const removed = await expectStartError(
+			coordinator({ sessionManager: new SessionManager() }).start(
+				removedOptions,
+				launcher(new SessionManager(), () => {
+					removedLaunches++;
+				}),
+			),
+			"OPERATION_RETAINED",
+		);
+		expect(removed.details?.originProjectPath).toBe(removedRepo);
+		expect(removed.details?.retainedBranch).toBe("feature/removed-registration");
+		expect(removed.details?.effectiveState?.directory).toBe(removedRepo);
+		expect(removed.details?.effectiveState?.git?.branch).toBe("main");
+		expect(journal.get("removed-registration")?.phase).toBe("retained");
+		expect(removedLaunches).toBe(0);
+
+		const missingRepo = await makeGitProject("missing-after-mutation");
+		const missingState = await coordinator().inspect(missingRepo);
+		const missingOptions = request(
+			missingRepo,
+			"missing-after-mutation",
+			branchPreparation(missingState, "feature/missing-after-mutation"),
+		);
+		await coordinator().start(missingOptions, launcher());
+		rewritePhase("missing-after-mutation", "branch_checked_out");
+		await rename(missingRepo, `${missingRepo}-moved`);
+
+		const missing = await expectStartError(
+			coordinator({ sessionManager: new SessionManager() }).start(missingOptions, launcher()),
+			"OPERATION_RETAINED",
+		);
+		expect(missing.details?.effectiveState?.directory).toBe(missingRepo);
+		expect(missing.details?.effectiveState?.git?.branch).toBe("feature/missing-after-mutation");
+		expect(journal.get("missing-after-mutation")?.phase).toBe("retained");
+
+		const inspectionRepo = await makeGitProject("inspection-failure");
+		const inspectionState = await coordinator().inspect(inspectionRepo);
+		const inspectionOptions = request(
+			inspectionRepo,
+			"inspection-failure",
+			branchPreparation(inspectionState, "feature/inspection-failure"),
+		);
+		await coordinator().start(inspectionOptions, launcher());
+		rewritePhase("inspection-failure", "branch_checked_out");
+		let inspectionLaunches = 0;
+
+		const inspection = await expectStartError(
+			coordinator({
+				sessionManager: new SessionManager(),
+				runGit: async () => {
+					throw new Error("simulated Git inspection failure");
+				},
+			}).start(
+				inspectionOptions,
+				launcher(new SessionManager(), () => {
+					inspectionLaunches++;
+				}),
+			),
+			"OPERATION_RETAINED",
+		);
+		expect(inspection.details?.effectiveState?.git?.branch).toBe("feature/inspection-failure");
+		expect(journal.get("inspection-failure")?.phase).toBe("retained");
+		expect(inspectionLaunches).toBe(0);
 	});
 
 	it("retains an activated branch and structured session identity after launch failure", async () => {

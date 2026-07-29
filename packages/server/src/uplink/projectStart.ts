@@ -23,6 +23,21 @@ import type { SessionStartContext } from "./types.js";
 
 const GIT_TIMEOUT_MS = 5_000;
 const GIT_OUTPUT_MAX_BYTES = 64 * 1024;
+const GIT_TERMINATE_GRACE_MS = 100;
+const GIT_REAP_TIMEOUT_MS = 1_000;
+
+const GIT_REDIRECT_ENVIRONMENT = new Set([
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	"GIT_CEILING_DIRECTORIES",
+	"GIT_COMMON_DIR",
+	"GIT_DIR",
+	"GIT_DISCOVERY_ACROSS_FILESYSTEM",
+	"GIT_INDEX_FILE",
+	"GIT_NAMESPACE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_QUARANTINE_PATH",
+	"GIT_WORK_TREE",
+]);
 
 export interface GitCommandResult {
 	exitCode: number;
@@ -88,50 +103,103 @@ class GitProcessError extends Error {
 	}
 }
 
+function gitEnvironment(): NodeJS.ProcessEnv {
+	const environment: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		const normalizedKey = key.toUpperCase();
+		if (
+			GIT_REDIRECT_ENVIRONMENT.has(normalizedKey) ||
+			normalizedKey === "GIT_CONFIG" ||
+			normalizedKey === "GIT_CONFIG_PARAMETERS" ||
+			normalizedKey.startsWith("GIT_CONFIG_")
+		) {
+			continue;
+		}
+		environment[key] = value;
+	}
+	return environment;
+}
+
 export function runGitCommand(
 	cwd: string,
 	args: string[],
 	input?: string,
 ): Promise<GitCommandResult> {
 	return new Promise((resolvePromise, reject) => {
-		const controller = new AbortController();
-		const timeout = setTimeout(() => controller.abort(), GIT_TIMEOUT_MS);
 		let stdout = "";
 		let stderr = "";
+		let stdoutBytes = 0;
+		let stderrBytes = 0;
 		let settled = false;
+		let terminationError: GitProcessError | undefined;
+		let hardKillTimer: ReturnType<typeof setTimeout> | undefined;
+		let reapTimer: ReturnType<typeof setTimeout> | undefined;
 		const child = spawn("git", ["-C", cwd, ...args], {
+			env: gitEnvironment(),
 			shell: false,
-			signal: controller.signal,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
+
+		const clearTimers = (): void => {
+			clearTimeout(timeout);
+			if (hardKillTimer) clearTimeout(hardKillTimer);
+			if (reapTimer) clearTimeout(reapTimer);
+		};
 
 		const finishError = (error: GitProcessError): void => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timeout);
+			clearTimers();
 			reject(error);
 		};
 
-		const append = (current: string, chunk: Buffer): string => {
-			const next = current + chunk.toString("utf8");
-			if (Buffer.byteLength(next, "utf8") > GIT_OUTPUT_MAX_BYTES) {
-				child.kill("SIGTERM");
-				finishError(new GitProcessError("output_limit", "Git output exceeded the safety limit"));
-			}
-			return next;
+		const stopCollection = (): void => {
+			child.stdout.removeListener("data", onStdout);
+			child.stderr.removeListener("data", onStderr);
+			child.stdout.pause();
+			child.stderr.pause();
 		};
 
-		child.stdout.on("data", (chunk: Buffer) => {
-			stdout = append(stdout, chunk);
-		});
-		child.stderr.on("data", (chunk: Buffer) => {
-			stderr = append(stderr, chunk);
-		});
-		child.on("error", (error: NodeJS.ErrnoException) => {
-			if (error.name === "AbortError") {
-				finishError(new GitProcessError("timeout", "Git command timed out"));
+		const terminate = (error: GitProcessError): void => {
+			if (settled || terminationError) return;
+			terminationError = error;
+			stopCollection();
+			child.stdin.destroy();
+			child.kill("SIGTERM");
+			hardKillTimer = setTimeout(() => {
+				if (!settled) child.kill("SIGKILL");
+			}, GIT_TERMINATE_GRACE_MS);
+			reapTimer = setTimeout(() => finishError(error), GIT_REAP_TIMEOUT_MS);
+		};
+
+		function onStdout(chunk: Buffer): void {
+			if (stdoutBytes + chunk.byteLength > GIT_OUTPUT_MAX_BYTES) {
+				terminate(new GitProcessError("output_limit", "Git output exceeded the safety limit"));
 				return;
 			}
+			stdoutBytes += chunk.byteLength;
+			stdout += chunk.toString("utf8");
+		}
+
+		function onStderr(chunk: Buffer): void {
+			if (stderrBytes + chunk.byteLength > GIT_OUTPUT_MAX_BYTES) {
+				terminate(new GitProcessError("output_limit", "Git output exceeded the safety limit"));
+				return;
+			}
+			stderrBytes += chunk.byteLength;
+			stderr += chunk.toString("utf8");
+		}
+
+		const timeout = setTimeout(() => {
+			terminate(new GitProcessError("timeout", "Git command timed out"));
+		}, GIT_TIMEOUT_MS);
+
+		child.stdout.on("data", onStdout);
+		child.stderr.on("data", onStderr);
+		child.stdin.on("error", (error) => {
+			terminate(new GitProcessError("spawn", `Git command input failed: ${error.message}`));
+		});
+		child.on("error", (error: NodeJS.ErrnoException) => {
 			if (error.code === "ENOENT") {
 				finishError(new GitProcessError("unavailable", "Git executable is unavailable"));
 				return;
@@ -140,12 +208,25 @@ export function runGitCommand(
 		});
 		child.on("close", (code) => {
 			if (settled) return;
+			if (terminationError) {
+				finishError(terminationError);
+				return;
+			}
 			settled = true;
-			clearTimeout(timeout);
+			clearTimers();
 			resolvePromise({ exitCode: code ?? 1, stdout, stderr });
 		});
-		if (input !== undefined) child.stdin.end(input);
-		else child.stdin.end();
+		try {
+			if (input !== undefined) child.stdin.end(input);
+			else child.stdin.end();
+		} catch (error) {
+			terminate(
+				new GitProcessError(
+					"spawn",
+					`Git command input failed: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			);
+		}
 	});
 }
 
@@ -316,7 +397,10 @@ export class ProjectStartCoordinator {
 			);
 		}
 
-		let state = await this.inspect(record.originProjectPath);
+		let state =
+			record.phase === "recorded"
+				? await this.inspect(record.originProjectPath)
+				: await this.inspectPostMutationState(record);
 		const recordedGit =
 			record.repositoryRoot === null
 				? null
@@ -497,7 +581,7 @@ export class ProjectStartCoordinator {
 		}));
 		return this.resumeBranchActivation(
 			this.journal.get(record.operationId) ?? record,
-			await this.inspect(record.originProjectPath),
+			await this.inspectPostMutationState(this.journal.get(record.operationId) ?? record),
 		);
 	}
 
@@ -552,7 +636,7 @@ export class ProjectStartCoordinator {
 				executionFor(state),
 			);
 		}
-		const activeState = await this.inspect(record.originProjectPath);
+		const activeState = await this.inspectPostMutationState(record);
 		await this.verifyActivatedBranch(record, activeState);
 		this.journal.update(record.operationId, (current) => ({
 			...current,
@@ -630,6 +714,82 @@ export class ProjectStartCoordinator {
 			};
 		});
 		throw new ProjectStartError(code, message, details);
+	}
+
+	private async inspectPostMutationState(
+		record: ProjectStartOperationRecord,
+	): Promise<ProjectStartState> {
+		const bestKnown = this.bestKnownExecution(record);
+		if (!this.registry.get(record.originProjectPath)) {
+			return this.fail(
+				record,
+				"retained",
+				"OPERATION_RETAINED",
+				"The project is no longer registered; the prepared operation will not launch",
+				record.requestedBranch ?? undefined,
+				record.result?.sessionId,
+				bestKnown,
+			);
+		}
+
+		let git: GitCheckoutState | null;
+		try {
+			await this.requireDirectory(record.originProjectPath);
+			git = await this.inspectGit(record.originProjectPath, true);
+		} catch (error) {
+			if (error instanceof ProjectStartError) {
+				return this.fail(
+					record,
+					"retained",
+					"OPERATION_RETAINED",
+					"The prepared project could not be inspected; the operation will not launch",
+					record.requestedBranch ?? undefined,
+					record.result?.sessionId,
+					bestKnown,
+				);
+			}
+			throw error;
+		}
+		if (!git) {
+			return this.fail(
+				record,
+				"retained",
+				"OPERATION_RETAINED",
+				"The prepared project is no longer a Git working repository",
+				record.requestedBranch ?? undefined,
+				record.result?.sessionId,
+				bestKnown,
+			);
+		}
+		return {
+			originProjectPath: record.originProjectPath,
+			mode: "project_folder",
+			directory: record.originProjectPath,
+			git,
+		};
+	}
+
+	private bestKnownExecution(record: ProjectStartOperationRecord): SessionExecutionState {
+		if (record.failure?.details?.effectiveState) {
+			return record.failure.details.effectiveState;
+		}
+		if (record.result?.execution) return record.result.execution;
+		const branch =
+			record.requestedBranch && record.phase !== "branch_created"
+				? record.requestedBranch
+				: record.observedBranch;
+		return {
+			directory: record.originProjectPath,
+			mode: "project_folder",
+			git: record.repositoryRoot
+				? {
+						repositoryRoot: record.repositoryRoot,
+						head: record.observedHead,
+						branch,
+						detached: record.observedHead !== null && branch === null,
+					}
+				: null,
+		};
 	}
 
 	private normalizeOptions(

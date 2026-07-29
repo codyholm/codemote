@@ -1084,7 +1084,7 @@ describe("bridge project state", { timeout: 30000 }, () => {
 		}
 	});
 
-	it("forwards structured project start failure without a synthetic session", async () => {
+	it("forwards structured project and journal failures without synthetic sessions", async () => {
 		uplinkWss.on("connection", (socket) => {
 			socket.on("message", (raw) => {
 				const command = JSON.parse(raw.toString()) as JsonRecord;
@@ -1103,18 +1103,36 @@ describe("bridge project state", { timeout: 30000 }, () => {
 					return;
 				}
 				if (command["type"] === "start_run") {
+					const payload = command["payload"] as JsonRecord;
+					const projectStart = payload["projectStart"] as JsonRecord;
+					const operationId = projectStart["operationId"];
+					const journalCode =
+						operationId === "corrupt-journal"
+							? "INVALID_PROJECT_START_JOURNAL"
+							: operationId === "unwritable-journal"
+								? "PROJECT_START_JOURNAL_IO"
+								: null;
 					socket.send(
 						JSON.stringify({
 							type: "error",
 							requestId: command["requestId"],
 							payload: {
-								code: "STALE_PROJECT_STATE",
-								message: "Refresh the project state",
-								details: {
-									operationId: "operation-failure",
-									phase: "failed",
-									originProjectPath: tempRepoDir,
-								},
+								code: journalCode ?? "STALE_PROJECT_STATE",
+								message:
+									journalCode === "INVALID_PROJECT_START_JOURNAL"
+										? "Invalid project start operation journal"
+										: journalCode === "PROJECT_START_JOURNAL_IO"
+											? "Failed to persist project start operation journal"
+											: "Refresh the project state",
+								...(operationId === "corrupt-journal"
+									? {}
+									: {
+											details: {
+												operationId,
+												phase: operationId === "unwritable-journal" ? "recorded" : "failed",
+												originProjectPath: tempRepoDir,
+											},
+										}),
 							},
 						}),
 					);
@@ -1138,36 +1156,98 @@ describe("bridge project state", { timeout: 30000 }, () => {
 				if (payload) received.push(payload);
 			});
 			await pairMobile(mobileSocket, bridge.pairingCode);
-			mobileSocket.send(
-				JSON.stringify({
-					type: "message",
-					payload: {
-						type: "new_session",
-						runtime: "codex",
-						prompt: "stale",
-						projectStart: {
-							operationId: "operation-failure",
-							originProjectPath: tempRepoDir,
-							mode: "project_folder",
-							preparation: { type: "none" },
+			const sendProjectStart = (operationId: string): void => {
+				mobileSocket?.send(
+					JSON.stringify({
+						type: "message",
+						payload: {
+							type: "new_session",
+							runtime: "codex",
+							prompt: operationId,
+							projectStart: {
+								operationId,
+								originProjectPath: tempRepoDir,
+								mode: "project_folder",
+								preparation: { type: "none" },
+							},
 						},
-					},
-				}),
-			);
+					}),
+				);
+			};
+			sendProjectStart("operation-failure");
 
 			await waitForCondition(
 				() =>
 					received.some(
-						(message) => message["type"] === "session_start_result" && message["success"] === false,
+						(message) =>
+							message["type"] === "session_start_result" &&
+							message["operationId"] === "operation-failure",
 					),
 				15_000,
 			);
-			expect(received.find((message) => message["type"] === "session_start_result")).toMatchObject({
+			expect(
+				received.find(
+					(message) =>
+						message["type"] === "session_start_result" &&
+						message["operationId"] === "operation-failure",
+				),
+			).toMatchObject({
 				operationId: "operation-failure",
 				success: false,
 				code: "STALE_PROJECT_STATE",
 				message: "Refresh the project state",
 				details: { phase: "failed", originProjectPath: tempRepoDir },
+			});
+
+			sendProjectStart("corrupt-journal");
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) =>
+							message["type"] === "session_start_result" &&
+							message["operationId"] === "corrupt-journal",
+					),
+				15_000,
+			);
+			expect(
+				received.find(
+					(message) =>
+						message["type"] === "session_start_result" &&
+						message["operationId"] === "corrupt-journal",
+				),
+			).toMatchObject({
+				operationId: "corrupt-journal",
+				success: false,
+				code: "INVALID_PROJECT_START_JOURNAL",
+				message: "Invalid project start operation journal",
+			});
+
+			sendProjectStart("unwritable-journal");
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) =>
+							message["type"] === "session_start_result" &&
+							message["operationId"] === "unwritable-journal",
+					),
+				15_000,
+			);
+			expect(
+				received.find(
+					(message) =>
+						message["type"] === "session_start_result" &&
+						message["operationId"] === "unwritable-journal",
+				),
+			).toMatchObject({
+				operationId: "unwritable-journal",
+				success: false,
+				code: "PROJECT_START_JOURNAL_IO",
+				message: "Failed to persist project start operation journal",
+				details: {
+					operationId: "unwritable-journal",
+					phase: "recorded",
+					originProjectPath: tempRepoDir,
+				},
 			});
 			expect(
 				received

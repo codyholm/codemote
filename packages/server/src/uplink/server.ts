@@ -21,7 +21,7 @@ import { MockExecutor } from "./mock-executor.js";
 import { discoverOpenCodeModels } from "./opencode-models.js";
 import { ProjectRegistry, ProjectRegistryError } from "./projectRegistry.js";
 import { ProjectStartCoordinator, ProjectStartError } from "./projectStart.js";
-import { ProjectStartJournal } from "./projectStartJournal.js";
+import { ProjectStartJournal, ProjectStartJournalError } from "./projectStartJournal.js";
 import { buildProjectState, projectStateSignature } from "./projectState.js";
 import { probeInstalledRuntimes } from "./runtime-probe.js";
 import { SessionManager } from "./session.js";
@@ -254,6 +254,16 @@ export class UplinkServer {
 		}
 		if (error instanceof ProjectRegistryError) {
 			return { message: error.message, code: error.code };
+		}
+		if (
+			error instanceof ProjectStartJournalError &&
+			(error.code === "INVALID_PROJECT_START_JOURNAL" || error.code === "PROJECT_START_JOURNAL_IO")
+		) {
+			return {
+				message: error.message,
+				code: error.code,
+				...(error.details ? { details: error.details } : {}),
+			};
 		}
 
 		if (error instanceof SyntaxError) {
