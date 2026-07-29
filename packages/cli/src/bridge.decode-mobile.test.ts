@@ -95,4 +95,89 @@ describe("decodeMobileInbound", () => {
 			expect(asRecord(result)["maxTokens"]).toBeUndefined();
 		});
 	});
+
+	describe("project-folder starts", () => {
+		const base = {
+			type: "new_session",
+			runtime: "codex",
+			prompt: "test",
+			projectStart: {
+				operationId: "operation-1",
+				originProjectPath: "/tmp/project",
+				mode: "project_folder",
+				preparation: { type: "none" },
+			},
+		};
+
+		it("accepts strict no-branch and branch requests", () => {
+			expect(decodeMobileInbound(base)).toMatchObject({ projectStart: base.projectStart });
+			expect(
+				decodeMobileInbound({
+					...base,
+					projectStart: {
+						...base.projectStart,
+						preparation: {
+							type: "create_branch",
+							newBranch: "feature/session",
+							expectedHead: "abc123",
+							expectedBranch: null,
+						},
+					},
+				}),
+			).toMatchObject({
+				projectStart: {
+					preparation: {
+						type: "create_branch",
+						newBranch: "feature/session",
+						expectedHead: "abc123",
+						expectedBranch: null,
+					},
+				},
+			});
+		});
+
+		it("rejects malformed nested intent instead of downgrading it", () => {
+			const malformed: unknown[] = [
+				null,
+				{},
+				{ ...base.projectStart, operationId: "" },
+				{ ...base.projectStart, mode: "worktree" },
+				{ ...base.projectStart, preparation: { type: "none", newBranch: "feature/oops" } },
+				{
+					...base.projectStart,
+					preparation: {
+						type: "create_branch",
+						newBranch: "",
+						expectedHead: "abc123",
+						expectedBranch: "main",
+					},
+				},
+				{
+					...base.projectStart,
+					preparation: {
+						type: "create_branch",
+						newBranch: "feature/session",
+						expectedBranch: "main",
+					},
+				},
+			];
+
+			for (const projectStart of malformed) {
+				expect(decodeMobileInbound({ ...base, projectStart })).toBeNull();
+			}
+		});
+
+		it("decodes project start capability requests", () => {
+			expect(
+				decodeMobileInbound({
+					type: "get_project_start_state",
+					projectPath: "/tmp/project",
+				}),
+			).toEqual({
+				type: "get_project_start_state",
+				projectPath: "/tmp/project",
+			});
+			expect(decodeMobileInbound({ type: "get_project_start_state", projectPath: "" })).toBeNull();
+		});
+	});
 });

@@ -46,7 +46,7 @@ export class UplinkServer {
 	private sessionManager: SessionManager;
 	private eventBus: EventBus;
 	private projectRegistry: ProjectRegistry;
-	private projectStartCoordinator: ProjectStartCoordinator;
+	private projectStartCoordinator: ProjectStartCoordinator | null = null;
 	private executors = new Map<RuntimeType, BaseExecutor>();
 	private availableRuntimes: RuntimeType[] = [];
 	private dynamicModels = new Map<RuntimeType, ModelInfo[]>();
@@ -62,15 +62,6 @@ export class UplinkServer {
 		this.projectRegistry = new ProjectRegistry(
 			this.config.projectRegistryPath ?? join(homedir(), ".codemote", "projects.json"),
 		);
-		this.projectStartCoordinator = new ProjectStartCoordinator({
-			journal: new ProjectStartJournal(
-				this.config.projectStartJournalPath ??
-					join(homedir(), ".codemote", "project-start-operations.json"),
-			),
-			registry: this.projectRegistry,
-			sessionManager: this.sessionManager,
-		});
-
 		// Register mock executor for testing
 		this.registerExecutor(
 			new MockExecutor(this.workspaceManager, this.sessionManager, this.eventBus),
@@ -303,7 +294,7 @@ export class UplinkServer {
 			case "get_project_start_state":
 				return {
 					type: "project_start_state",
-					payload: await this.projectStartCoordinator.inspect(command.payload.projectPath),
+					payload: await this.getProjectStartCoordinator().inspect(command.payload.projectPath),
 				};
 
 			case "list_projects":
@@ -351,7 +342,7 @@ export class UplinkServer {
 					throw new Error(`No executor for runtime: ${command.payload.profile}`);
 				}
 				const result = command.payload.projectStart
-					? await this.projectStartCoordinator.start(command.payload, (options, context) =>
+					? await this.getProjectStartCoordinator().start(command.payload, (options, context) =>
 							executor.startRun(options, context),
 						)
 					: await executor.startRun(command.payload);
@@ -576,6 +567,20 @@ export class UplinkServer {
 
 	private getModelsForRuntime(runtime: RuntimeType): ModelInfo[] {
 		return this.dynamicModels.get(runtime) ?? RUNTIME_MODELS[runtime];
+	}
+
+	private getProjectStartCoordinator(): ProjectStartCoordinator {
+		if (!this.projectStartCoordinator) {
+			this.projectStartCoordinator = new ProjectStartCoordinator({
+				journal: new ProjectStartJournal(
+					this.config.projectStartJournalPath ??
+						join(homedir(), ".codemote", "project-start-operations.json"),
+				),
+				registry: this.projectRegistry,
+				sessionManager: this.sessionManager,
+			});
+		}
+		return this.projectStartCoordinator;
 	}
 
 	private isLoopbackHost(host: string): boolean {

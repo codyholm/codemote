@@ -70,7 +70,7 @@ type ProjectStartErrorCode =
 
 export class ProjectStartError extends Error {
 	constructor(
-		readonly code: ProjectStartErrorCode,
+		readonly code: string,
 		message: string,
 		readonly details?: ProjectStartFailureDetails,
 	) {
@@ -181,13 +181,7 @@ function executionFor(state: ProjectStartState): SessionExecutionState {
 }
 
 function terminalError(failure: ProjectStartJournalFailure): ProjectStartError {
-	const code =
-		failure.code === "OPERATION_CONFLICT"
-			? "OPERATION_CONFLICT"
-			: failure.code === "RUNTIME_LAUNCH_FAILED"
-				? "RUNTIME_LAUNCH_FAILED"
-				: "OPERATION_RETAINED";
-	return new ProjectStartError(code, failure.message, failure.details);
+	return new ProjectStartError(failure.code, failure.message, failure.details);
 }
 
 export class ProjectStartCoordinator {
@@ -248,7 +242,6 @@ export class ProjectStartCoordinator {
 		launch: LaunchProjectSession,
 	): Promise<RunResult> {
 		const request = options.projectStart;
-		const state = await this.inspect(request.originProjectPath);
 		let record = this.journal.get(request.operationId);
 		if (record && record.fingerprint !== fingerprint) {
 			throw new ProjectStartError(
@@ -256,32 +249,42 @@ export class ProjectStartCoordinator {
 				`Operation ID ${request.operationId} was reused with a different request`,
 			);
 		}
-		if (!record) {
-			const now = Date.now();
-			record = this.journal.create({
-				operationId: request.operationId,
-				fingerprint,
-				mode: "project_folder",
-				originProjectPath: request.originProjectPath,
-				runtime: options.profile,
-				repositoryRoot: state.git?.repositoryRoot ?? null,
-				observedHead: state.git?.head ?? null,
-				observedBranch: state.git?.branch ?? null,
-				requestedBranch:
-					request.preparation.type === "create_branch" ? request.preparation.newBranch : null,
-				phase: "recorded",
-				createdAt: now,
-				updatedAt: now,
-			});
+		if (record) {
+			const existing = record;
+			const lockKey = existing.repositoryRoot ?? existing.originProjectPath;
+			return this.withRepositoryLock(lockKey, () =>
+				this.reconcileAndLaunch(options, existing, launch, true),
+			);
 		}
+
+		const state = await this.inspect(request.originProjectPath);
+		const now = Date.now();
+		record = this.journal.create({
+			operationId: request.operationId,
+			fingerprint,
+			mode: "project_folder",
+			originProjectPath: request.originProjectPath,
+			runtime: options.profile,
+			repositoryRoot: state.git?.repositoryRoot ?? null,
+			observedHead: state.git?.head ?? null,
+			observedBranch: state.git?.branch ?? null,
+			requestedBranch:
+				request.preparation.type === "create_branch" ? request.preparation.newBranch : null,
+			phase: "recorded",
+			createdAt: now,
+			updatedAt: now,
+		});
 		const lockKey = record.repositoryRoot ?? record.originProjectPath;
-		return this.withRepositoryLock(lockKey, () => this.reconcileAndLaunch(options, record, launch));
+		return this.withRepositoryLock(lockKey, () =>
+			this.reconcileAndLaunch(options, record, launch, false),
+		);
 	}
 
 	private async reconcileAndLaunch(
 		options: RunOptions & { projectStart: ProjectStartRequest },
 		initialRecord: ProjectStartOperationRecord,
 		launch: LaunchProjectSession,
+		isReplay: boolean,
 	): Promise<RunResult> {
 		let record = this.journal.get(initialRecord.operationId) ?? initialRecord;
 		const request = options.projectStart;
@@ -334,7 +337,7 @@ export class ProjectStartCoordinator {
 				);
 			}
 			if (request.preparation.type === "create_branch") {
-				state = await this.createAndActivateBranch(record, request.preparation, state);
+				state = await this.createAndActivateBranch(record, request.preparation, state, isReplay);
 				record = this.journal.get(record.operationId) ?? record;
 			}
 		} else if (record.phase === "branch_created") {
@@ -401,6 +404,7 @@ export class ProjectStartCoordinator {
 		record: ProjectStartOperationRecord,
 		preparation: Extract<ProjectStartRequest["preparation"], { type: "create_branch" }>,
 		state: ProjectStartState,
+		isReplay: boolean,
 	): Promise<ProjectStartState> {
 		if (!state.git) {
 			return this.fail(
@@ -450,6 +454,17 @@ export class ProjectStartCoordinator {
 			true,
 		);
 		if (exists.exitCode === 0) {
+			if (isReplay) {
+				return this.fail(
+					record,
+					"retained",
+					"OPERATION_RETAINED",
+					"The requested branch exists while its recorded creation phase is uncertain",
+					preparation.newBranch,
+					undefined,
+					executionFor(state),
+				);
+			}
 			return this.fail(
 				record,
 				"failed",

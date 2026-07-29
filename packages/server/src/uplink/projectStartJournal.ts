@@ -236,8 +236,24 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 	if (record.phase === "session_started" && !record.result) {
 		invalid("Successful journal record is missing its result");
 	}
+	if (
+		record.result &&
+		(record.result.operationId !== record.operationId ||
+			record.result.originProjectPath !== record.originProjectPath ||
+			record.result.execution === undefined)
+	) {
+		invalid("Successful journal record has inconsistent project start metadata");
+	}
 	if ((record.phase === "failed" || record.phase === "retained") && !record.failure) {
 		invalid("Terminal journal record is missing its failure");
+	}
+	if (
+		record.failure?.details &&
+		(record.failure.details.operationId !== record.operationId ||
+			record.failure.details.originProjectPath !== record.originProjectPath ||
+			record.failure.details.phase !== record.phase)
+	) {
+		invalid("Terminal journal record has inconsistent failure details");
 	}
 	return record;
 }

@@ -272,13 +272,9 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 
 		const repo = await makeGitProject("committed");
 		const state = await coordinator().inspect(repo);
-		await expectStartError(
-			coordinator().start(
-				request(repo, "invalid", branchPreparation(state, "invalid branch")),
-				launcher(),
-			),
-			"INVALID_BRANCH",
-		);
+		const invalidOptions = request(repo, "invalid", branchPreparation(state, "invalid branch"));
+		await expectStartError(coordinator().start(invalidOptions, launcher()), "INVALID_BRANCH");
+		await expectStartError(coordinator().start(invalidOptions, launcher()), "INVALID_BRANCH");
 		await git(repo, ["branch", "existing"]);
 		await expectStartError(
 			coordinator().start(
@@ -416,6 +412,36 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		);
 		expect(result.execution?.git?.branch).toBe("feature/resume-created");
 		expect(await git(repo, ["branch", "--show-current"])).toBe("feature/resume-created");
+	});
+
+	it("retains an existing requested ref when a recorded creation phase is uncertain", async () => {
+		const repo = await makeGitProject();
+		const state = await coordinator().inspect(repo);
+		const options = request(
+			repo,
+			"uncertain-recorded",
+			branchPreparation(state, "feature/uncertain-recorded"),
+		);
+		await coordinator().start(options, launcher());
+		rewritePhase("uncertain-recorded", "recorded");
+		await git(repo, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+		let launches = 0;
+
+		const retained = await expectStartError(
+			coordinator({ sessionManager: new SessionManager() }).start(
+				options,
+				launcher(new SessionManager(), () => {
+					launches++;
+				}),
+			),
+			"OPERATION_RETAINED",
+		);
+
+		expect(retained.details?.retainedBranch).toBe("feature/uncertain-recorded");
+		expect(
+			await git(repo, ["show-ref", "--verify", "refs/heads/feature/uncertain-recorded"]),
+		).toContain(state.git?.head);
+		expect(launches).toBe(0);
 	});
 
 	it("reconciles branch_checked_out, launch_requested, and session_started phases safely", async () => {
