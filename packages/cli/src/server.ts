@@ -77,6 +77,10 @@ export interface ServerConfig {
 	statusFilePath?: string;
 	/** Repository path for uplink */
 	repoPath?: string;
+	/** Override path for the machine-local project registry */
+	projectRegistryPath?: string;
+	/** Override directory for the local TLS certificate and key */
+	tlsDir?: string;
 	/** Runtime types to enable in uplink */
 	runtimes?: RuntimeType[];
 	/** Override path for trusted pairings store */
@@ -193,6 +197,8 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		hostedEndpointUrl,
 		statusFilePath,
 		repoPath,
+		projectRegistryPath,
+		tlsDir,
 		runtimes,
 		pairingStorePath,
 	} = config;
@@ -229,7 +235,8 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
 	// Canonical pairing token is issued by the relay on register.
 	let currentPIN = "";
-	const tlsInfo = localRelayEnabled && !tlsDisabled ? await ensureLocalTLS() : undefined;
+	const tlsInfo =
+		localRelayEnabled && !tlsDisabled ? await ensureLocalTLS(tlsDir ? { tlsDir } : {}) : undefined;
 	const relayCertPem = tlsInfo ? await readFile(tlsInfo.certPath) : undefined;
 	let relayTlsPin = tlsInfo?.tlsPin;
 	if (!localRelayEnabled && remoteRelayTarget?.startsWith("wss://")) {
@@ -289,6 +296,9 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	};
 	if (runtimes) {
 		uplinkConfig.runtimes = runtimes;
+	}
+	if (projectRegistryPath) {
+		uplinkConfig.projectRegistryPath = projectRegistryPath;
 	}
 
 	const uplink = new UplinkServer(uplinkConfig);

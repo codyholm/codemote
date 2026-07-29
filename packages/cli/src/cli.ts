@@ -143,6 +143,9 @@ Environment:
   CODEMOTE_PAIRING_STORE_PATH  Override trusted pairing store JSON path
   CODEMOTE_REMOTE_RELAY_URL    Default hosted relay URL for --remote
   CODEMOTE_STATUS_FILE         Machine-readable status file path
+  CODEMOTE_PROJECT_REGISTRY_PATH
+                               Override project registry JSON path
+  CODEMOTE_TLS_DIR              Override local TLS certificate directory
   CODEMOTE_SPEECH              Set to 0 to disable the local speech service
   CODEMOTE_SPEECH_PORT         Speech service port (default: PORT + 2)
   CODEMOTE_KOKORO_BIN          Path to kokoro-tts-tool (text to speech)
@@ -162,6 +165,8 @@ async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 	const inferredRepoPath = process.env["INIT_CWD"]?.trim() || process.cwd();
 	const repoPath = resolve(configuredRepoPath || inferredRepoPath);
 	const statusFilePath = process.env["CODEMOTE_STATUS_FILE"]?.trim() || undefined;
+	const projectRegistryPath = process.env["CODEMOTE_PROJECT_REGISTRY_PATH"]?.trim() || undefined;
+	const tlsDir = process.env["CODEMOTE_TLS_DIR"]?.trim() || undefined;
 
 	if (configuredRepoPath) {
 		await mkdir(repoPath, { recursive: true });
@@ -192,6 +197,8 @@ async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 		...(remoteRelayUrl ? { remoteRelayUrl } : {}),
 		...(!remoteRelayUrl ? { advertisedRelayUrl: localRelayUrl } : {}),
 		...(statusFilePath ? { statusFilePath } : {}),
+		...(projectRegistryPath ? { projectRegistryPath } : {}),
+		...(tlsDir ? { tlsDir } : {}),
 		onClientConnected: () => {
 			if (mode === "serve") {
 				console.log("[CLI] Mobile device connected");
@@ -243,7 +250,7 @@ async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 		let tlsPin: string | undefined;
 		if (relayScheme === "wss") {
 			if (localMode) {
-				tlsPin = (await ensureLocalTLS()).tlsPin;
+				tlsPin = (await ensureLocalTLS(tlsDir ? { tlsDir } : {})).tlsPin;
 			} else {
 				try {
 					tlsPin = await fetchRelayTlsPin(relayUrl);

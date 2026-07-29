@@ -2,7 +2,7 @@
  * Tests for server integration
  */
 
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -251,6 +251,71 @@ describe("Server Integration", { timeout: 30000 }, () => {
 			});
 
 			expect(server).toBeDefined();
+		});
+
+		it("uses supplied project registry and TLS locations", async () => {
+			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-state-"));
+			const projectRegistryPath = join(fixtureDir, "projects.json");
+			const seededProjectPath = join(fixtureDir, "seeded-project");
+			const statusFilePath = join(fixtureDir, "server-status.json");
+			const tlsDir = join(fixtureDir, "tls");
+			let uplinkWs: WebSocket | null = null;
+
+			try {
+				await writeFile(
+					projectRegistryPath,
+					`${JSON.stringify({
+						projects: [{ name: "Seeded Project", path: seededProjectPath }],
+					})}\n`,
+					"utf8",
+				);
+
+				server = await startServer({
+					port: testPort + 90,
+					projectRegistryPath,
+					statusFilePath,
+					tlsDir,
+				});
+
+				uplinkWs = new WebSocket(`ws://127.0.0.1:${testPort + 91}`);
+				await waitForOpen(uplinkWs);
+				const projectStatePromise = waitForMessageOfType(uplinkWs, "project_state");
+				uplinkWs.send(JSON.stringify({ type: "list_projects" }));
+
+				const projectState = await projectStatePromise;
+				const payload = projectState["payload"] as {
+					projects?: Array<{
+						name?: string;
+						path?: string;
+						registered?: boolean;
+					}>;
+				};
+				expect(payload.projects).toEqual([
+					expect.objectContaining({
+						name: "Seeded Project",
+						path: seededProjectPath,
+						registered: true,
+					}),
+				]);
+
+				expect((await readdir(tlsDir)).sort()).toEqual(["cert.pem", "key.pem"]);
+				expect(await readFile(join(tlsDir, "cert.pem"), "utf8")).toContain("BEGIN CERTIFICATE");
+				expect(await readFile(join(tlsDir, "key.pem"), "utf8")).toMatch(/BEGIN (RSA )?PRIVATE KEY/);
+
+				const status = JSON.parse(await readFile(statusFilePath, "utf8")) as {
+					pin?: string;
+					tlsPin?: string;
+				};
+				expect(status.pin).toMatch(/^\d{6}$/);
+				expect(status.tlsPin).toMatch(/^[0-9a-f]{64}$/);
+			} finally {
+				uplinkWs?.close();
+				if (server) {
+					await server.stop();
+					server = null;
+				}
+				await rm(fixtureDir, { recursive: true, force: true });
+			}
 		});
 
 		it("writes machine-readable status snapshots", async () => {
