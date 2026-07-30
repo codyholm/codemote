@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -184,6 +185,99 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		await expect(missing.mapProject(escapePlan.destination, "escape")).rejects.toMatchObject({
 			code: "WORKTREE_PROJECT_PATH_UNSAFE",
 		});
+	});
+
+	it("classifies recorded worktree truth exhaustively", async () => {
+		const commit = await git(["rev-parse", "HEAD"]);
+		const service = new ManagedWorktreeService(runGitCommand, managedRoot);
+		const nested = join(repository, "packages", "nested");
+		const plan = await service.plan(repository, nested, "truth");
+		const recorded = {
+			repositoryRoot: repository,
+			destination: plan.destination,
+			selectedBaseRef: "refs/heads/main",
+			selectedBaseCommit: commit,
+			projectRelativePath: plan.projectRelativePath,
+			requestedBranch: "feature/truth",
+		};
+
+		expect(await service.inspectRecorded(recorded)).toEqual({ status: "absent" });
+
+		await service.create(repository, recorded.destination, commit, recorded.requestedBranch);
+		const exact = await service.inspectRecorded(recorded);
+		expect(exact).toMatchObject({
+			status: "exact",
+			git: { repositoryRoot: recorded.destination, head: commit, branch: "feature/truth" },
+			mapping: { ok: true, directory: join(recorded.destination, "packages", "nested") },
+			selectedBaseMatches: true,
+			clean: true,
+		});
+
+		// Local changes of any class are visible, so rollback can never claim clean.
+		await writeFile(join(recorded.destination, "untracked.txt"), "local\n");
+		expect(await service.inspectRecorded(recorded)).toMatchObject({
+			status: "exact",
+			clean: false,
+		});
+		await rm(join(recorded.destination, "untracked.txt"));
+
+		// A worktree the operation does not own is changed, never adoptable.
+		const otherCommit = await git(["commit-tree", `${commit}^{tree}`, "-p", commit, "-m", "next"]);
+		expect(
+			await service.inspectRecorded({ ...recorded, selectedBaseCommit: otherCommit }),
+		).toMatchObject({ status: "changed" });
+		expect(await service.inspectRecorded({ ...recorded, requestedBranch: null })).toMatchObject({
+			status: "changed",
+		});
+
+		// Inspection that cannot complete is uncertain, never absent or clean.
+		const failing = new ManagedWorktreeService(async () => {
+			throw new Error("git unavailable");
+		}, managedRoot);
+		expect(await failing.inspectRecorded(recorded)).toMatchObject({ status: "uncertain" });
+	});
+
+	it("removes only an exact clean worktree and only its unmoved branch", async () => {
+		const commit = await git(["rev-parse", "HEAD"]);
+		const service = new ManagedWorktreeService(runGitCommand, managedRoot);
+		const plan = await service.plan(repository, repository, "rollback");
+		const recorded = {
+			repositoryRoot: repository,
+			destination: plan.destination,
+			selectedBaseRef: "refs/heads/main",
+			selectedBaseCommit: commit,
+			projectRelativePath: plan.projectRelativePath,
+			requestedBranch: "feature/rollback",
+		};
+		await service.create(repository, recorded.destination, commit, recorded.requestedBranch);
+
+		await writeFile(join(recorded.destination, "tracked.txt"), "dirty\n");
+		expect(await service.rollbackExact(recorded)).toMatchObject({ status: "retained" });
+		expect(await git(["rev-parse", "--verify", "refs/heads/feature/rollback"])).toBe(commit);
+		await git(["checkout", "--", "tracked.txt"], recorded.destination);
+
+		expect(await service.rollbackExact(recorded)).toEqual({ status: "removed" });
+		expect(existsSync(recorded.destination)).toBe(false);
+		expect(await git(["worktree", "list", "--porcelain"])).not.toContain(recorded.destination);
+
+		// The branch survives a moved tip and is deleted only at the recorded commit.
+		const moved = await git(["commit-tree", `${commit}^{tree}`, "-p", commit, "-m", "moved"]);
+		await git(["update-ref", "refs/heads/feature/rollback", moved]);
+		expect(await service.deleteRollbackBranch(recorded)).toMatchObject({ status: "retained" });
+		expect(await git(["rev-parse", "--verify", "refs/heads/feature/rollback"])).toBe(moved);
+
+		await git(["update-ref", "refs/heads/feature/rollback", commit]);
+		expect(await service.deleteRollbackBranch(recorded)).toEqual({ status: "removed" });
+		await expect(
+			execFileAsync("git", [
+				"-C",
+				repository,
+				"rev-parse",
+				"--verify",
+				"refs/heads/feature/rollback",
+			]),
+		).rejects.toBeDefined();
+		expect(await service.deleteRollbackBranch(recorded)).toEqual({ status: "removed" });
 	});
 
 	it("rejects managed roots inside unrelated Git metadata and bare repositories", async () => {

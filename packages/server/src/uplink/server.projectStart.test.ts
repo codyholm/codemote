@@ -169,6 +169,37 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		return result.stdout.trim();
 	}
 
+	/**
+	 * Replace the running service with a new one over the same fixture-owned
+	 * registry, journal and managed root: a service restart, not a new machine.
+	 */
+	async function restartServer(
+		options: { stopExisting?: boolean } = {},
+	): Promise<{ client: TestClient; executor: ControlledExecutor }> {
+		client.close();
+		if (options.stopExisting !== false) await server.stop();
+		const port = await reserveFreePort();
+		server = new UplinkServer({
+			port,
+			host: "127.0.0.1",
+			repoPath: fixtureRoot,
+			runtimes: [],
+			projectRegistryPath: join(fixtureRoot, "machine", "projects.json"),
+			projectStartJournalPath: journalPath,
+			managedWorktreeRoot: join(fixtureRoot, "managed"),
+		});
+		const internals = server as unknown as ServerInternals;
+		controlled = new ControlledExecutor(
+			internals.workspaceManager,
+			internals.sessionManager,
+			internals.eventBus,
+		);
+		server.registerExecutor(controlled);
+		await server.start();
+		client = await TestClient.connect(port);
+		return { client, executor: controlled };
+	}
+
 	async function state(path = project): Promise<ProjectStartState> {
 		const response = await client.request(
 			{ type: "get_project_start_state", payload: { projectPath: path } },
@@ -465,20 +496,195 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		},
 	);
 
-	it("preserves corrupt journal errors over WebSocket", async () => {
+	it("starts with an unreadable journal, fails Project-start closed, and serves everything else", async () => {
 		await mkdir(join(fixtureRoot, "machine"), { recursive: true });
 		await writeFile(journalPath, "{ invalid", "utf8");
+		const headBefore = await git(project, ["rev-parse", "HEAD"]);
 
-		const response = await client.request(
+		const { client: restartedClient } = await restartServer();
+
+		const inspection = await restartedClient.request(
 			{ type: "get_project_start_state", payload: { projectPath: project } },
 			"corrupt-journal",
 		);
-
-		expect(response.type).toBe("error");
-		expect(response.payload).toEqual({
+		expect(inspection.type).toBe("error");
+		expect(inspection.payload).toEqual({
 			code: "INVALID_PROJECT_START_JOURNAL",
 			message: "Invalid project start operation journal",
 		});
+
+		const start = await restartedClient.request(
+			{ type: "start_run", payload: startPayload("corrupt-journal-start", "start") },
+			"corrupt-journal-start",
+		);
+		expect(start.type).toBe("error");
+		expect((start.payload as { code: string }).code).toBe("INVALID_PROJECT_START_JOURNAL");
+		expect(controlled.starts).toBe(0);
+
+		// Unrelated capability is unaffected by an unusable Project-start journal.
+		expect((await restartedClient.request({ type: "ping" }, "corrupt-ping")).type).toBe("pong");
+		expect(
+			(await restartedClient.request({ type: "list_sessions" }, "corrupt-sessions")).type,
+		).toBe("sessions");
+		expect(await readFile(journalPath, "utf8")).toBe("{ invalid");
+		expect(await git(project, ["rev-parse", "HEAD"])).toBe(headBefore);
+		expect(await git(project, ["branch", "--show-current"])).toBe("main");
+	});
+
+	it("coalesces duplicate delivery and conflicts a changed request with the same ID", async () => {
+		const current = await state();
+		const payload = startPayload("duplicate-delivery", "duplicate", {
+			type: "create_branch",
+			newBranch: "feature/duplicate",
+			expectedHead: current.git?.head,
+			expectedBranch: current.git?.branch,
+		});
+
+		const [first, second, changed] = await Promise.all([
+			client.request({ type: "start_run", payload }, "duplicate-a"),
+			client.request({ type: "start_run", payload }, "duplicate-b"),
+			client.request(
+				{ type: "start_run", payload: { ...payload, initialPrompt: "different" } },
+				"duplicate-changed",
+			),
+		]);
+
+		expect(first.type).toBe("run_started");
+		expect(second.payload).toEqual(first.payload);
+		expect(changed.type).toBe("error");
+		expect((changed.payload as { code: string }).code).toBe("OPERATION_CONFLICT");
+		expect(controlled.starts).toBe(1);
+		const sessions = await client.request({ type: "list_sessions" }, "duplicate-sessions");
+		expect((sessions.payload as Session[]).length).toBe(1);
+		expect(await git(project, ["for-each-ref", "--format=%(refname)", "refs/heads"])).toBe(
+			"refs/heads/feature/duplicate\nrefs/heads/main",
+		);
+	});
+
+	it("replays a completed branch start after restart and keeps the session discoverable", async () => {
+		const current = await state();
+		const payload = startPayload("restart-branch", "branch", {
+			type: "create_branch",
+			newBranch: "feature/restart-branch",
+			expectedHead: current.git?.head,
+			expectedBranch: current.git?.branch,
+		});
+		const first = await client.request({ type: "start_run", payload }, "restart-branch-first");
+		const firstResult = first.payload as RunResult;
+		expect(first.type).toBe("run_started");
+
+		const { client: restartedClient, executor } = await restartServer();
+
+		const replay = await restartedClient.request(
+			{ type: "start_run", payload },
+			"restart-branch-replay",
+		);
+		expect(replay.type).toBe("run_started");
+		expect(replay.payload).toEqual(firstResult);
+		expect(executor.starts).toBe(0);
+
+		const sessions = (
+			await restartedClient.request({ type: "list_sessions" }, "restart-branch-sessions")
+		).payload as Session[];
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0]?.id).toBe(firstResult.sessionId);
+		expect(sessions[0]?.status).toBe("ended");
+		expect(sessions[0]?.originProjectPath).toBe(project);
+		expect(sessions[0]?.execution?.directory).toBe(project);
+
+		const aggregate = await restartedClient.request(
+			{ type: "get_project_state" },
+			"restart-branch-state",
+		);
+		const projected = aggregate.payload as {
+			projects: Array<{
+				id: string;
+				sessions: Array<{ sessionId: string; execution?: { directory: string } }>;
+			}>;
+		};
+		expect(projected.projects[0]?.id).toBe(project);
+		expect(projected.projects[0]?.sessions[0]?.sessionId).toBe(firstResult.sessionId);
+		expect(projected.projects[0]?.sessions[0]?.execution?.directory).toBe(project);
+		expect(await git(project, ["for-each-ref", "--format=%(refname)", "refs/heads"])).toBe(
+			"refs/heads/feature/restart-branch\nrefs/heads/main",
+		);
+	});
+
+	it("replays a completed worktree start after restart without a second worktree", async () => {
+		const current = await state();
+		const base = current.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const payload = worktreeStartPayload(
+			"restart-worktree",
+			base.ref,
+			base.commit,
+			"feature/restart-worktree",
+		);
+		const first = await client.request({ type: "start_run", payload }, "restart-worktree-first");
+		const firstResult = first.payload as RunResult;
+		if (firstResult.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+		const destination = firstResult.execution.worktree.path;
+
+		const { client: restartedClient, executor } = await restartServer();
+
+		const replay = await restartedClient.request(
+			{ type: "start_run", payload },
+			"restart-worktree-replay",
+		);
+		expect(replay.type).toBe("run_started");
+		expect(replay.payload).toEqual(firstResult);
+		expect(executor.starts).toBe(0);
+
+		const registrations = (await git(project, ["worktree", "list", "--porcelain"]))
+			.split("\n")
+			.filter((line) => line === `worktree ${destination}`);
+		expect(registrations).toHaveLength(1);
+		const sessions = (
+			await restartedClient.request({ type: "list_sessions" }, "restart-worktree-sessions")
+		).payload as Session[];
+		expect(sessions[0]?.execution?.directory).toBe(firstResult.execution.directory);
+		expect(sessions[0]?.originProjectPath).toBe(project);
+		expect(await git(project, ["branch", "--show-current"])).toBe("main");
+	});
+
+	it("retains a worktree whose runtime launch may already have started, across restart", async () => {
+		const current = await state();
+		const base = current.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const payload = worktreeStartPayload("restart-ambiguous", base.ref, base.commit);
+		const started = await client.request({ type: "start_run", payload }, "restart-ambiguous-first");
+		const result = started.payload as RunResult;
+		if (result.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+
+		// Rewind to the boundary where the runtime call may or may not have run.
+		await server.stop();
+		const journal = JSON.parse(await readFile(journalPath, "utf8")) as {
+			version: number;
+			operations: Array<Record<string, unknown>>;
+		};
+		journal.operations = journal.operations.map((operation) => {
+			if (operation["operationId"] !== "restart-ambiguous") return operation;
+			const { result: _result, ...rest } = operation;
+			return { ...rest, phase: "runtime_launch_requested" };
+		});
+		await writeFile(journalPath, JSON.stringify(journal), "utf8");
+		const { client: restartedClient, executor } = await restartServer({ stopExisting: false });
+
+		const replay = await restartedClient.request(
+			{ type: "start_run", payload },
+			"restart-ambiguous-replay",
+		);
+
+		expect(replay.type).toBe("error");
+		const failure = replay.payload as {
+			code: string;
+			details?: { retainedWorktreePath?: string; createdSessionId?: string };
+		};
+		expect(failure.code).toBe("OPERATION_RETAINED");
+		expect(failure.details?.retainedWorktreePath).toBe(result.execution.worktree.path);
+		expect(failure.details?.createdSessionId).toBe(result.sessionId);
+		expect(executor.starts).toBe(0);
+		expect(await realpath(result.execution.worktree.path)).toBeTruthy();
 	});
 
 	it("preserves unwritable journal errors with operation phase details over WebSocket", async () => {

@@ -488,7 +488,7 @@ describe("Server Integration", { timeout: 30000 }, () => {
 			}
 		}, 15_000);
 
-		it("replays a project-folder start from the configured journal", async () => {
+		it("replays project-folder and worktree starts across a service restart", async () => {
 			vi.stubEnv("GUILD_REMOTE_DISABLE_TLS", "1");
 			vi.stubEnv("GUILD_REMOTE_ALLOW_INSECURE", "1");
 			vi.stubEnv("CODEMOTE_SPEECH", "0");
@@ -523,12 +523,29 @@ describe("Server Integration", { timeout: 30000 }, () => {
 					},
 				},
 			};
+			const worktreeStart = {
+				type: "new_session",
+				runtime: "opencode",
+				prompt: "restart-safe worktree start",
+				projectStart: {
+					operationId: "configured-journal-worktree",
+					originProjectPath: projectPath,
+					mode: "worktree",
+					preparation: {
+						type: "create_worktree",
+						baseRef: "refs/heads/main",
+						expectedCommit: head,
+						newBranch: "feature/configured-worktree",
+					},
+				},
+			};
 			const config: ServerConfig = {
 				port,
 				repoPath: fixtureDir,
 				runtimes: [],
 				projectRegistryPath: registryPath,
 				projectStartJournalPath: journalPath,
+				managedWorktreeRoot: join(fixtureDir, "managed"),
 				pairingStorePath: pairingPath,
 			};
 			let mobile: WebSocket | null = null;
@@ -566,6 +583,23 @@ describe("Server Integration", { timeout: 30000 }, () => {
 					"feature/configured-journal",
 				);
 
+				const worktreePromise = waitForMobilePayloadType(mobile, "session_start_result");
+				mobile.send(JSON.stringify({ type: "message", payload: worktreeStart }));
+				const worktreeResult = await worktreePromise;
+				expect(worktreeResult["success"]).toBe(true);
+				const worktreeSessionId = worktreeResult["sessionId"];
+				const worktreePath = (
+					(worktreeResult["execution"] as Record<string, unknown>)["worktree"] as Record<
+						string,
+						unknown
+					>
+				)["path"] as string;
+				expect(await realpath(dirname(worktreePath))).toBe(
+					await realpath(join(fixtureDir, "managed")),
+				);
+
+				// Drop the responses and the service, exactly as a lost reply plus a
+				// restart would: the phone still holds both operation IDs.
 				mobile.close();
 				mobile = null;
 				await server.stop();
@@ -588,22 +622,41 @@ describe("Server Integration", { timeout: 30000 }, () => {
 				const replayPromise = waitForMobilePayloadType(mobile, "session_start_result");
 				mobile.send(JSON.stringify({ type: "message", payload: start }));
 				const replay = await replayPromise;
-				expect(replay["success"]).toBe(false);
-				expect(replay["code"]).toBe("OPERATION_RETAINED");
-				expect(
-					(replay["details"] as Record<string, unknown> | undefined)?.["createdSessionId"],
-				).toBe(firstSessionId);
+				expect(replay["success"]).toBe(true);
+				expect(replay["sessionId"]).toBe(firstSessionId);
+				expect(replay["operationId"]).toBe("configured-journal-operation");
+
+				const worktreeReplayPromise = waitForMobilePayloadType(mobile, "session_start_result");
+				mobile.send(JSON.stringify({ type: "message", payload: worktreeStart }));
+				const worktreeReplay = await worktreeReplayPromise;
+				expect(worktreeReplay["success"]).toBe(true);
+				expect(worktreeReplay["sessionId"]).toBe(worktreeSessionId);
+				expect(worktreeReplay["execution"]).toEqual(worktreeResult["execution"]);
+
 				expect(await git(projectPath, ["branch", "--show-current"])).toBe(
 					"feature/configured-journal",
 				);
 				expect(await git(projectPath, ["for-each-ref", "--format=%(refname)", "refs/heads"])).toBe(
-					"refs/heads/feature/configured-journal\nrefs/heads/main",
+					[
+						"refs/heads/feature/configured-journal",
+						"refs/heads/feature/configured-worktree",
+						"refs/heads/main",
+					].join("\n"),
 				);
+				const registrations = (await git(projectPath, ["worktree", "list", "--porcelain"]))
+					.split("\n")
+					.filter((line) => line === `worktree ${worktreePath}`);
+				expect(registrations).toHaveLength(1);
+
 				const journal = JSON.parse(await readFile(journalPath, "utf8")) as {
-					operations: Array<{ result?: { sessionId?: string } }>;
+					version: number;
+					operations: Array<{ phase?: string; result?: { sessionId?: string } }>;
 				};
-				expect(journal.operations).toHaveLength(1);
-				expect(journal.operations[0]?.result).toBeUndefined();
+				expect(journal.version).toBe(2);
+				expect(journal.operations).toHaveLength(2);
+				expect(journal.operations.map((operation) => operation.result?.sessionId).sort()).toEqual(
+					[firstSessionId, worktreeSessionId].sort(),
+				);
 			} finally {
 				mobile?.close();
 				if (server) {

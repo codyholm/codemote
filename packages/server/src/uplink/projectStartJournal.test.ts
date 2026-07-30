@@ -30,6 +30,7 @@ describe("ProjectStartJournal", () => {
 		return {
 			operationId: "operation-1",
 			fingerprint: "fingerprint-1",
+			recordVersion: 2,
 			mode: "project_folder",
 			originProjectPath: join(fixtureDir, "project"),
 			runtime: "codex",
@@ -77,6 +78,46 @@ describe("ProjectStartJournal", () => {
 		};
 	}
 
+	function durableSession() {
+		return {
+			sessionId: "session-1",
+			runId: "run-1",
+			workspaceId: "workspace-1",
+			createdAt: 1500,
+			execution: {
+				directory: join(fixtureDir, "project"),
+				mode: "project_folder" as const,
+				git: {
+					repositoryRoot: join(fixtureDir, "project"),
+					head: "abc123",
+					branch: "feature/session",
+					detached: false,
+				},
+			},
+		};
+	}
+
+	function worktreeSession() {
+		const destination = join(fixtureDir, "managed", "source-operation");
+		return {
+			sessionId: "worktree-session-1",
+			runId: "worktree-run-1",
+			workspaceId: "worktree-workspace-1",
+			createdAt: 1500,
+			execution: {
+				directory: join(destination, "packages", "nested"),
+				mode: "worktree" as const,
+				git: {
+					repositoryRoot: destination,
+					head: "abc123",
+					branch: "feature/worktree",
+					detached: false,
+				},
+				worktree: { path: destination, baseRef: "refs/heads/main", baseCommit: "abc123" },
+			},
+		};
+	}
+
 	function terminalFailure(phase: "failed" | "retained") {
 		return {
 			code: "OPERATION_RETAINED",
@@ -96,6 +137,7 @@ describe("ProjectStartJournal", () => {
 		return {
 			operationId: "worktree-1",
 			fingerprint: "fingerprint-worktree",
+			recordVersion: 2,
 			mode: "worktree",
 			originProjectPath,
 			runtime: "codex",
@@ -170,6 +212,7 @@ describe("ProjectStartJournal", () => {
 			...current,
 			phase: "session_started",
 			updatedAt: 2000,
+			session: durableSession(),
 			result: {
 				runId: "run-1",
 				sessionId: "session-1",
@@ -192,9 +235,155 @@ describe("ProjectStartJournal", () => {
 			version: number;
 			operations: ProjectStartOperationRecord[];
 		};
-		expect(persisted.version).toBe(1);
+		expect(persisted.version).toBe(2);
 		expect(persisted.operations[0]?.result?.sessionId).toBe("session-1");
+		expect(persisted.operations[0]?.session?.workspaceId).toBe("workspace-1");
 		expect(existsSync(`${journalPath}.tmp`)).toBe(false);
+	});
+
+	it("keeps landed version-1 records readable without rewriting or crediting them", async () => {
+		const legacy = { ...record(), phase: "launch_requested" as const };
+		const { recordVersion: _recordVersion, ...withoutVersion } = legacy;
+		const legacyWorktree = { ...worktreeRecord() };
+		const { recordVersion: _worktreeVersion, ...worktreeWithoutVersion } = legacyWorktree;
+		const document = JSON.stringify({
+			version: 1,
+			operations: [withoutVersion, worktreeWithoutVersion],
+		});
+		await mkdir(dirname(journalPath), { recursive: true });
+		await writeFile(journalPath, document, "utf8");
+
+		const journal = new ProjectStartJournal(journalPath);
+
+		// A launch this build did not record cannot be credited with the session
+		// boundary it never had.
+		expect(journal.get("operation-1")?.recordVersion).toBe(1);
+		expect(journal.get("worktree-1")?.recordVersion).toBe(1);
+		expect(journal.get("worktree-1")?.phase).toBe("retained");
+		expect(await readFile(journalPath, "utf8")).toBe(document);
+
+		journal.update("operation-1", (current) => ({ ...current, updatedAt: 3000 }));
+		expect(journal.get("operation-1")?.recordVersion).toBe(1);
+		journal.update("operation-1", (current) => ({
+			...current,
+			phase: "retained",
+			updatedAt: 4000,
+			failure: terminalFailure("retained"),
+		}));
+		expect(journal.get("operation-1")?.recordVersion).toBe(2);
+		expect((JSON.parse(await readFile(journalPath, "utf8")) as { version: number }).version).toBe(
+			2,
+		);
+	});
+
+	it("rejects version-2 phases and payloads inside a version-1 file", async () => {
+		await mkdir(dirname(journalPath), { recursive: true });
+		const rejected: unknown[] = [
+			{ version: 1, operations: [{ ...record(), phase: "session_recorded" }] },
+			{ version: 1, operations: [{ ...record(), phase: "runtime_launch_requested" }] },
+			{
+				version: 1,
+				operations: [{ ...record(), phase: "recorded", session: durableSession() }],
+			},
+		];
+
+		for (const document of rejected) {
+			await writeFile(journalPath, JSON.stringify(document), "utf8");
+			expectJournalError(
+				() => new ProjectStartJournal(journalPath),
+				"INVALID_PROJECT_START_JOURNAL",
+			);
+		}
+	});
+
+	it("binds a durable session to the phase and execution that own it", async () => {
+		await mkdir(dirname(journalPath), { recursive: true });
+		const invalid: unknown[] = [
+			// Session identity is required from the moment it exists.
+			{ version: 2, operations: [{ ...record(), phase: "session_recorded" }] },
+			{ version: 2, operations: [{ ...record(), phase: "runtime_launch_requested" }] },
+			// ...and cannot exist before it.
+			{ version: 2, operations: [{ ...record(), phase: "recorded", session: durableSession() }] },
+			{
+				version: 2,
+				operations: [{ ...record(), phase: "launch_requested", session: durableSession() }],
+			},
+			// The session must describe the same execution as its operation.
+			{
+				version: 2,
+				operations: [
+					{
+						...record(),
+						phase: "session_recorded",
+						session: {
+							...durableSession(),
+							execution: {
+								...durableSession().execution,
+								directory: join(fixtureDir, "elsewhere"),
+							},
+						},
+					},
+				],
+			},
+			// A terminal result must name the session that produced it.
+			{
+				version: 2,
+				operations: [
+					{
+						...record(),
+						phase: "session_started",
+						session: durableSession(),
+						result: { ...terminalResult(), sessionId: "other-session" },
+					},
+				],
+			},
+		];
+
+		for (const document of invalid) {
+			await writeFile(journalPath, JSON.stringify(document), "utf8");
+			expectJournalError(
+				() => new ProjectStartJournal(journalPath),
+				"INVALID_PROJECT_START_JOURNAL",
+			);
+		}
+	});
+
+	it("accepts rollback intent only for an unlaunched Worktree operation", async () => {
+		await mkdir(dirname(journalPath), { recursive: true });
+		const intent = { requestedAt: 2000, code: "RUNTIME_LAUNCH_FAILED", message: "Runtime failed" };
+		const rolling = { ...worktreeRecord(), phase: "rollback_requested" as const, rollback: intent };
+		const { failure: _failure, ...rollingWithoutFailure } = rolling;
+		const invalid: unknown[] = [
+			// A Project-folder operation never rolls back.
+			{ version: 2, operations: [{ ...record(), phase: "rollback_requested", rollback: intent }] },
+			// Rollback intent cannot exist outside a rollback phase.
+			{ version: 2, operations: [{ ...worktreeRecord(), rollback: intent }] },
+			// A rollback phase without its intent has lost the failure to report.
+			{
+				version: 2,
+				operations: [{ ...worktreeRecord(), phase: "worktree_removed", failure: undefined }],
+			},
+			// A launched operation is never eligible.
+			{
+				version: 2,
+				operations: [{ ...rollingWithoutFailure, session: worktreeSession() }],
+			},
+		];
+
+		for (const document of invalid) {
+			await writeFile(journalPath, JSON.stringify(document), "utf8");
+			expectJournalError(
+				() => new ProjectStartJournal(journalPath),
+				"INVALID_PROJECT_START_JOURNAL",
+			);
+		}
+
+		await writeFile(
+			journalPath,
+			JSON.stringify({ version: 2, operations: [rollingWithoutFailure] }),
+			"utf8",
+		);
+		expect(new ProjectStartJournal(journalPath).get("worktree-1")?.rollback).toEqual(intent);
 	});
 
 	it("preserves retained failure details", () => {
@@ -363,7 +552,7 @@ describe("ProjectStartJournal", () => {
 	it("recovers the last good Windows-style backup when the target is missing", async () => {
 		const backupPath = `${journalPath}.bak`;
 		await mkdir(dirname(journalPath), { recursive: true });
-		await writeFile(backupPath, JSON.stringify({ version: 1, operations: [record()] }), "utf8");
+		await writeFile(backupPath, JSON.stringify({ version: 2, operations: [record()] }), "utf8");
 
 		const journal = new ProjectStartJournal(journalPath);
 
@@ -377,7 +566,7 @@ describe("ProjectStartJournal", () => {
 		const invalidDocuments: unknown[] = [
 			null,
 			{},
-			{ version: 2, operations: [] },
+			{ version: 3, operations: [] },
 			{ version: 1, operations: "invalid" },
 			{ version: 1, operations: [{ ...record(), mode: "worktree" }] },
 			{ version: 1, operations: [{ ...record(), phase: "session_started" }] },

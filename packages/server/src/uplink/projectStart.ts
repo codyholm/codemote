@@ -13,7 +13,12 @@ import type {
 	SessionExecutionState,
 } from "@codemote/common";
 import { ExecutorStartError } from "./executor.js";
-import { ManagedWorktreeError, ManagedWorktreeService } from "./managedWorktree.js";
+import {
+	ManagedWorktreeError,
+	ManagedWorktreeService,
+	type ManagedWorktreeTruth,
+	type RecordedManagedWorktree,
+} from "./managedWorktree.js";
 import type { ProjectRegistry } from "./projectRegistry.js";
 import type {
 	ProjectStartJournal,
@@ -21,7 +26,13 @@ import type {
 	ProjectStartOperationRecord,
 } from "./projectStartJournal.js";
 import type { SessionManager } from "./session.js";
-import type { SessionStartContext } from "./types.js";
+import type {
+	DurableProjectSession,
+	ProjectSessionLaunchControl,
+	Session,
+	SessionStartContext,
+} from "./types.js";
+import type { WorkspaceManager } from "./workspace.js";
 
 const GIT_TIMEOUT_MS = 5_000;
 const GIT_OUTPUT_MAX_BYTES = 64 * 1024;
@@ -67,9 +78,12 @@ export interface ProjectStartCoordinatorOptions {
 	journal: ProjectStartJournal;
 	registry: ProjectRegistry;
 	sessionManager: SessionManager;
+	workspaceManager: WorkspaceManager;
 	runGit?: GitCommandRunner;
 	managedWorktreeRoot?: string;
 }
+
+type WorktreeOperationRecord = Extract<ProjectStartOperationRecord, { mode: "worktree" }>;
 
 type LaunchProjectSession = (
 	options: RunOptions,
@@ -281,6 +295,22 @@ function executionFor(state: ProjectStartState): SessionExecutionState {
 	};
 }
 
+function sameExecution(a: SessionExecutionState, b: SessionExecutionState): boolean {
+	if (a.directory !== b.directory || a.mode !== b.mode || !sameGitState(a.git, b.git)) return false;
+	if (a.mode === "worktree" && b.mode === "worktree") {
+		return (
+			a.worktree.path === b.worktree.path &&
+			a.worktree.baseRef === b.worktree.baseRef &&
+			a.worktree.baseCommit === b.worktree.baseCommit
+		);
+	}
+	return true;
+}
+
+function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 function terminalError(failure: ProjectStartJournalFailure): ProjectStartError {
 	return new ProjectStartError(failure.code, failure.message, failure.details);
 }
@@ -289,6 +319,7 @@ export class ProjectStartCoordinator {
 	private readonly journal: ProjectStartJournal;
 	private readonly registry: ProjectRegistry;
 	private readonly sessionManager: SessionManager;
+	private readonly workspaceManager: WorkspaceManager;
 	private readonly runGit: GitCommandRunner;
 	private readonly managedWorktrees: ManagedWorktreeService;
 	private readonly inFlight = new Map<string, InFlightOperation>();
@@ -298,6 +329,7 @@ export class ProjectStartCoordinator {
 		this.journal = options.journal;
 		this.registry = options.registry;
 		this.sessionManager = options.sessionManager;
+		this.workspaceManager = options.workspaceManager;
 		this.runGit = options.runGit ?? runGitCommand;
 		this.managedWorktrees = new ManagedWorktreeService(
 			this.runGit,
@@ -324,6 +356,101 @@ export class ProjectStartCoordinator {
 			git,
 			worktree,
 		};
+	}
+
+	/**
+	 * Reconcile durable operations with current truth once, before this process
+	 * accepts commands.
+	 *
+	 * Startup may validate or advance an exact Git phase, finish an already
+	 * intended rollback, restore a terminal session mapping, or record an
+	 * actionable retained result. It never launches a runtime: the initial prompt
+	 * is represented only by the request fingerprint, so only a retransmission of
+	 * the same operation can start one.
+	 */
+	async reconcileOnStartup(): Promise<void> {
+		for (const record of this.journal.list()) {
+			try {
+				await this.reconcileRecordOnStartup(record);
+			} catch (error) {
+				// A recorded terminal outcome is the point of the reconciliation, not a
+				// startup failure. Anything else must not stop unrelated recovery.
+				if (error instanceof ProjectStartError) continue;
+				console.error(
+					`Project start recovery skipped operation ${record.operationId}:`,
+					describeError(error),
+				);
+			}
+		}
+	}
+
+	private async reconcileRecordOnStartup(record: ProjectStartOperationRecord): Promise<void> {
+		if (record.phase === "session_started") {
+			await this.restoreDurableSession(record);
+			return;
+		}
+		if (record.phase === "runtime_launch_requested") {
+			this.failAmbiguousLaunch(record);
+		}
+		if (record.mode !== "worktree") return;
+		if (record.phase === "rollback_requested" || record.phase === "worktree_removed") {
+			await this.withRepositoryLock(record.repositoryRoot, () => this.finishRollback(record));
+			return;
+		}
+		if (record.phase !== "worktree_created" && record.phase !== "worktree_ready") return;
+		await this.withRepositoryLock(record.repositoryRoot, async () => {
+			const truth = await this.managedWorktrees.inspectRecorded(this.recordedWorktree(record));
+			if (truth.status !== "exact") {
+				this.failWorktree(record, "OPERATION_RETAINED", this.describeTruth(truth));
+			}
+			if (!truth.mapping.ok) {
+				this.failWorktree(record, truth.mapping.code, truth.mapping.message);
+			}
+			if (record.phase === "worktree_created") {
+				this.journal.update(record.operationId, (current) => ({
+					...current,
+					phase: "worktree_ready",
+					updatedAt: Date.now(),
+				}));
+			}
+		});
+	}
+
+	/**
+	 * Make a completed operation's session, workspace and effective directory
+	 * discoverable again. The status is `ended` because the previous process took
+	 * its runtime with it; this restores the mapping, not a live conversation.
+	 */
+	private async restoreDurableSession(record: ProjectStartOperationRecord): Promise<void> {
+		const durable = record.session;
+		if (!durable) return;
+		try {
+			if (!(await stat(durable.execution.directory)).isDirectory()) return;
+		} catch {
+			// The recorded directory no longer resolves safely; the journal keeps the
+			// human-readable mapping and replay still names it.
+			return;
+		}
+		const workspace = this.workspaceManager.restore({
+			id: durable.workspaceId,
+			workingDir: durable.execution.directory,
+			createdAt: durable.createdAt,
+		});
+		this.sessionManager.restore({
+			id: durable.sessionId,
+			runId: durable.runId,
+			runtime: record.runtime,
+			status: "ended",
+			workspace,
+			startedAt: durable.createdAt,
+			endedAt: record.updatedAt,
+			lastActivityAt: record.updatedAt,
+			statusChangedAt: record.updatedAt,
+			...(durable.runtimeSessionId ? { runtimeSessionId: durable.runtimeSessionId } : {}),
+			originProjectPath: record.originProjectPath,
+			execution: durable.execution,
+		});
+		this.bindRuntimeSessionPersistence(record.operationId, durable.sessionId);
 	}
 
 	start(options: RunOptions, launch: LaunchProjectSession): Promise<RunResult> {
@@ -369,7 +496,7 @@ export class ProjectStartCoordinator {
 			const lockKey = existing.repositoryRoot ?? existing.originProjectPath;
 			return this.withRepositoryLock(lockKey, () =>
 				existing.mode === "worktree"
-					? this.reconcileWorktree(options, existing, launch)
+					? this.reconcileWorktree(options, existing, launch, true)
 					: this.reconcileAndLaunch(options, existing, launch, true),
 			);
 		}
@@ -411,6 +538,7 @@ export class ProjectStartCoordinator {
 			const worktreeRecord = this.journal.create({
 				operationId: request.operationId,
 				fingerprint,
+				recordVersion: 2,
 				mode: "worktree",
 				originProjectPath: request.originProjectPath,
 				runtime: options.profile,
@@ -427,15 +555,16 @@ export class ProjectStartCoordinator {
 				phase: "recorded",
 				createdAt: now,
 				updatedAt: now,
-			}) as Extract<ProjectStartOperationRecord, { mode: "worktree" }>;
+			}) as WorktreeOperationRecord;
 			return this.withRepositoryLock(worktreeRecord.repositoryRoot, () =>
-				this.reconcileWorktree(options, worktreeRecord, launch),
+				this.reconcileWorktree(options, worktreeRecord, launch, false),
 			);
 		}
 		const now = Date.now();
 		record = this.journal.create({
 			operationId: request.operationId,
 			fingerprint,
+			recordVersion: 2,
 			mode: "project_folder",
 			originProjectPath: request.originProjectPath,
 			runtime: options.profile,
@@ -454,6 +583,10 @@ export class ProjectStartCoordinator {
 		);
 	}
 
+	/**
+	 * Reconcile everything a Project-folder operation may already have done, then
+	 * hand the one prepared execution to the shared launch path.
+	 */
 	private async reconcileAndLaunch(
 		options: RunOptions & { projectStart: ProjectStartRequest },
 		initialRecord: ProjectStartOperationRecord,
@@ -463,30 +596,20 @@ export class ProjectStartCoordinator {
 		let record = this.journal.get(initialRecord.operationId) ?? initialRecord;
 		const request = options.projectStart;
 
-		if (record.phase === "failed" || record.phase === "retained") {
-			if (!record.failure) {
-				throw new ProjectStartError("OPERATION_RETAINED", "Operation has no replayable result");
-			}
-			throw terminalError(record.failure);
+		const replay = this.replayTerminal(record);
+		if (replay) return replay;
+		if (record.phase === "runtime_launch_requested") {
+			return this.failAmbiguousLaunch(record);
 		}
-		if (record.phase === "session_started") {
-			if (record.result && this.sessionManager.get(record.result.sessionId)) return record.result;
+		if (record.phase === "launch_requested" && record.recordVersion === 1) {
 			return this.fail(
 				record,
 				"retained",
 				"OPERATION_RETAINED",
-				"The recorded session is no longer present; the operation will not launch again",
+				"An earlier version recorded this launch without a session boundary, so the runtime may already have started; the operation will not launch again",
 				record.requestedBranch ?? undefined,
-				record.result?.sessionId,
-			);
-		}
-		if (record.phase === "launch_requested") {
-			return this.fail(
-				record,
-				"retained",
-				"OPERATION_RETAINED",
-				"Runtime launch may already have started; the operation will not launch again",
-				record.requestedBranch ?? undefined,
+				undefined,
+				this.bestKnownExecution(record),
 			);
 		}
 
@@ -520,72 +643,379 @@ export class ProjectStartCoordinator {
 		} else if (record.phase === "branch_created") {
 			state = await this.resumeBranchActivation(record, state);
 			record = this.journal.get(record.operationId) ?? record;
-		} else if (record.phase === "branch_checked_out") {
+		} else if (record.requestedBranch !== null) {
 			await this.verifyActivatedBranch(record, state);
-		}
-
-		const effective = executionFor(state);
-		record = this.journal.update(record.operationId, (current) => ({
-			...current,
-			phase: "launch_requested",
-			updatedAt: Date.now(),
-		}));
-
-		let launched: RunResult;
-		try {
-			launched = await launch(options, {
-				originProjectPath: record.originProjectPath,
-				execution: effective,
-			});
-		} catch (error) {
-			const createdSessionId = error instanceof ExecutorStartError ? error.sessionId : undefined;
-			const message = error instanceof Error ? error.message : String(error);
-			if (record.requestedBranch) {
-				return this.fail(
-					record,
-					"retained",
-					"RUNTIME_LAUNCH_FAILED",
-					message,
-					record.requestedBranch,
-					createdSessionId,
-					effective,
-				);
-			}
+		} else if (!sameGitState(state.git, recordedGit)) {
 			return this.fail(
 				record,
-				"failed",
-				"RUNTIME_LAUNCH_FAILED",
-				message,
+				"retained",
+				"OPERATION_RETAINED",
+				"The prepared checkout no longer matches the recorded operation",
 				undefined,
-				createdSessionId,
-				effective,
+				record.session?.sessionId,
+				this.bestKnownExecution(record),
 			);
 		}
 
+		return this.launchPrepared(options, record, executionFor(state), launch);
+	}
+
+	/**
+	 * Reconcile everything a Worktree operation may already have done. Only exact
+	 * truth advances a phase; anything else keeps the resource and says so.
+	 */
+	private async reconcileWorktree(
+		options: RunOptions & { projectStart: ProjectStartRequest },
+		initialRecord: WorktreeOperationRecord,
+		launch: LaunchProjectSession,
+		isReplay: boolean,
+	): Promise<RunResult> {
+		let record =
+			(this.journal.get(initialRecord.operationId) as WorktreeOperationRecord | undefined) ??
+			initialRecord;
+
+		const replay = this.replayTerminal(record);
+		if (replay) return replay;
+		if (record.phase === "runtime_launch_requested") {
+			return this.failAmbiguousLaunch(record);
+		}
+		if (record.phase === "rollback_requested" || record.phase === "worktree_removed") {
+			return this.finishRollback(record);
+		}
+		if (record.phase === "launch_requested" && record.recordVersion === 1) {
+			return this.failWorktree(
+				record,
+				"OPERATION_RETAINED",
+				"An earlier version recorded this launch without a session boundary, so the runtime may already have started; the worktree was retained",
+			);
+		}
+
+		if (record.phase === "recorded") {
+			record = isReplay
+				? await this.adoptOrCreateWorktree(record)
+				: await this.createRecordedWorktree(record);
+		}
+
+		const truth = await this.managedWorktrees.inspectRecorded(this.recordedWorktree(record));
+		if (truth.status !== "exact") {
+			return this.failWorktree(record, "OPERATION_RETAINED", this.describeTruth(truth));
+		}
+		if (!truth.mapping.ok) {
+			return this.failWorktree(record, truth.mapping.code, truth.mapping.message);
+		}
+		const effective: SessionExecutionState = {
+			directory: truth.mapping.directory,
+			mode: "worktree",
+			git: truth.git,
+			worktree: {
+				path: record.worktree.destination,
+				baseRef: record.worktree.selectedBaseRef,
+				baseCommit: record.worktree.selectedBaseCommit,
+			},
+		};
+		if (record.phase === "worktree_created") {
+			record = this.journal.update(record.operationId, (current) => ({
+				...current,
+				phase: "worktree_ready",
+				updatedAt: Date.now(),
+			})) as WorktreeOperationRecord;
+		}
+		if (record.session && !sameExecution(effective, record.session.execution)) {
+			return this.failWorktree(
+				record,
+				"OPERATION_RETAINED",
+				"The prepared worktree no longer matches the recorded session; the worktree was retained",
+				record.session.execution,
+				record.session.sessionId,
+			);
+		}
+		return this.launchPrepared(options, record, effective, launch);
+	}
+
+	/**
+	 * First delivery: nothing has been created yet, so a pre-existing branch or
+	 * destination is the caller's mistake to report, not a resource to adopt.
+	 */
+	private async createRecordedWorktree(
+		record: WorktreeOperationRecord,
+	): Promise<WorktreeOperationRecord> {
+		let commit: string;
+		try {
+			commit = await this.managedWorktrees.resolveBase(
+				record.repositoryRoot,
+				record.worktree.selectedBaseRef,
+			);
+		} catch (error) {
+			return this.failManagedBeforeCreation(record, error);
+		}
+		if (commit !== record.worktree.selectedBaseCommit) {
+			return this.failManagedBeforeCreation(
+				record,
+				new ManagedWorktreeError(
+					"STALE_WORKTREE_BASE",
+					"The selected worktree base changed before creation",
+				),
+			);
+		}
+		try {
+			await this.managedWorktrees.create(
+				record.repositoryRoot,
+				record.worktree.destination,
+				record.worktree.selectedBaseCommit,
+				record.requestedBranch,
+			);
+		} catch (error) {
+			if (
+				error instanceof ManagedWorktreeError &&
+				(error.code === "INVALID_BRANCH" || error.code === "BRANCH_EXISTS")
+			) {
+				return this.failManagedBeforeCreation(record, error);
+			}
+			// Creation failed partway: only provably absent resources allow a clean
+			// failure. Anything left behind is retained with the path or branch it is.
+			const truth = await this.managedWorktrees.inspectRecorded(this.recordedWorktree(record));
+			if (truth.status === "absent") return this.failManagedBeforeCreation(record, error);
+			return this.failWorktree(
+				record,
+				"OPERATION_RETAINED",
+				describeError(error),
+				undefined,
+				undefined,
+				truth.status !== "branch_only",
+			);
+		}
+		return this.journal.update(record.operationId, (current) => ({
+			...current,
+			phase: "worktree_created",
+			updatedAt: Date.now(),
+		})) as WorktreeOperationRecord;
+	}
+
+	/**
+	 * Retransmission at `recorded`: a lost creation response can leave exactly the
+	 * deterministic worktree this operation asked for. Adopt only that.
+	 */
+	private async adoptOrCreateWorktree(
+		record: WorktreeOperationRecord,
+	): Promise<WorktreeOperationRecord> {
+		const truth = await this.managedWorktrees.inspectRecorded(this.recordedWorktree(record));
+		if (truth.status === "absent") return this.createRecordedWorktree(record);
+		if (truth.status !== "exact") {
+			return this.failWorktree(
+				record,
+				"OPERATION_RETAINED",
+				this.describeTruth(truth),
+				undefined,
+				undefined,
+				truth.status !== "branch_only",
+			);
+		}
+		return this.journal.update(record.operationId, (current) => ({
+			...current,
+			phase: "worktree_created",
+			updatedAt: Date.now(),
+		})) as WorktreeOperationRecord;
+	}
+
+	/**
+	 * The one place a prepared operation becomes a session.
+	 *
+	 * Both modes share the durable session boundaries, the terminal result, and
+	 * the launch-failure classification, so neither can drift from the other.
+	 */
+	private async launchPrepared(
+		options: RunOptions & { projectStart: ProjectStartRequest },
+		prepared: ProjectStartOperationRecord,
+		effective: SessionExecutionState,
+		launch: LaunchProjectSession,
+	): Promise<RunResult> {
+		const operationId = prepared.operationId;
+		let record = prepared;
+		if (record.phase !== "launch_requested" && record.phase !== "session_recorded") {
+			record = this.journal.update(operationId, (current) => ({
+				...current,
+				phase: "launch_requested",
+				updatedAt: Date.now(),
+			}));
+		}
+		const recorded = record.session;
+		const control: ProjectSessionLaunchControl = {
+			...(recorded ? { session: recorded } : {}),
+			recordSession: (session) => this.recordDurableSession(operationId, session, effective),
+			recordRuntimeLaunchRequested: () => {
+				this.journal.update(operationId, (current) => ({
+					...current,
+					phase: "runtime_launch_requested",
+					updatedAt: Date.now(),
+				}));
+			},
+		};
+		const context: SessionStartContext = {
+			originProjectPath: record.originProjectPath,
+			execution: effective,
+			launch: control,
+		};
+
+		let launched: RunResult;
+		try {
+			if (record.mode === "worktree") {
+				const { resumeSessionId: _resumeSessionId, ...freshOptions } = options;
+				launched = await launch({ ...freshOptions, workspace: effective.directory }, context);
+			} else {
+				launched = await launch(options, context);
+			}
+		} catch (error) {
+			return this.failLaunch(operationId, record, error, effective);
+		}
+
+		const current = this.journal.get(operationId) ?? record;
+		const session = current.session ?? this.durableSessionFor(launched, effective);
 		const result: RunResult = {
 			...launched,
-			operationId: record.operationId,
+			operationId,
 			originProjectPath: record.originProjectPath,
 			execution: effective,
 		};
-		this.journal.update(record.operationId, (current) => ({
-			...current,
+		this.journal.update(operationId, (existing) => ({
+			...existing,
 			phase: "session_started",
 			updatedAt: Date.now(),
+			session,
 			result,
 		}));
+		this.bindRuntimeSessionPersistence(operationId, session.sessionId);
 		return result;
 	}
 
-	private async reconcileWorktree(
-		options: RunOptions & { projectStart: ProjectStartRequest },
-		initialRecord: Extract<ProjectStartOperationRecord, { mode: "worktree" }>,
-		launch: LaunchProjectSession,
-	): Promise<RunResult> {
-		let record =
-			(this.journal.get(initialRecord.operationId) as
-				| Extract<ProjectStartOperationRecord, { mode: "worktree" }>
-				| undefined) ?? initialRecord;
+	private recordDurableSession(
+		operationId: string,
+		session: Session,
+		execution: SessionExecutionState,
+	): void {
+		const durable: DurableProjectSession = {
+			sessionId: session.id,
+			runId: session.runId,
+			workspaceId: session.workspace.id,
+			createdAt: session.startedAt,
+			execution,
+			...(session.runtimeSessionId ? { runtimeSessionId: session.runtimeSessionId } : {}),
+		};
+		this.journal.update(operationId, (current) => ({
+			...current,
+			phase: "session_recorded",
+			updatedAt: Date.now(),
+			session: durable,
+		}));
+		this.bindRuntimeSessionPersistence(operationId, session.id);
+	}
+
+	/**
+	 * A launcher that records nothing still produced exactly one session, and the
+	 * terminal record must name it. Production launches go through
+	 * `BaseExecutor`, which records the identity at its durable boundary instead.
+	 */
+	private durableSessionFor(
+		launched: RunResult,
+		execution: SessionExecutionState,
+	): DurableProjectSession {
+		const live = this.sessionManager.get(launched.sessionId);
+		return {
+			sessionId: launched.sessionId,
+			runId: launched.runId,
+			workspaceId: live?.workspace.id ?? launched.runId,
+			createdAt: live?.startedAt ?? Date.now(),
+			execution,
+			...(live?.runtimeSessionId ? { runtimeSessionId: live.runtimeSessionId } : {}),
+		};
+	}
+
+	private bindRuntimeSessionPersistence(operationId: string, sessionId: string): void {
+		this.sessionManager.bindRuntimeSessionPersistence(sessionId, (_id, runtimeSessionId) => {
+			const current = this.journal.get(operationId);
+			if (!current?.session || current.session.runtimeSessionId === runtimeSessionId) return;
+			this.journal.update(operationId, (record) =>
+				record.session
+					? {
+							...record,
+							session: { ...record.session, runtimeSessionId },
+							updatedAt: Date.now(),
+						}
+					: record,
+			);
+		});
+	}
+
+	private async failLaunch(
+		operationId: string,
+		prepared: ProjectStartOperationRecord,
+		error: unknown,
+		effective: SessionExecutionState,
+	): Promise<never> {
+		const record = this.journal.get(operationId) ?? prepared;
+		const message = describeError(error);
+		const createdSessionId =
+			(error instanceof ExecutorStartError ? error.sessionId : undefined) ??
+			record.session?.sessionId;
+		if (record.mode === "worktree") {
+			// Only a worktree this operation created, never launched and never
+			// recorded a session for can be removed. A failure that names a created
+			// session is launch evidence, so the worktree is kept even when it is
+			// otherwise exact and clean.
+			if (
+				record.phase === "launch_requested" &&
+				!record.session &&
+				createdSessionId === undefined &&
+				record.recordVersion === 2
+			) {
+				return this.rollbackWorktree(record, "RUNTIME_LAUNCH_FAILED", message);
+			}
+			return this.failWorktree(
+				record,
+				"RUNTIME_LAUNCH_FAILED",
+				message,
+				effective,
+				createdSessionId,
+			);
+		}
+		const retainedBranch = record.requestedBranch ?? undefined;
+		return this.fail(
+			record,
+			retainedBranch ? "retained" : "failed",
+			"RUNTIME_LAUNCH_FAILED",
+			message,
+			retainedBranch,
+			createdSessionId,
+			effective,
+		);
+	}
+
+	private failAmbiguousLaunch(record: ProjectStartOperationRecord): never {
+		const message = "Runtime launch may already have started; the operation will not launch again";
+		if (record.mode === "worktree") {
+			return this.failWorktree(
+				record,
+				"OPERATION_RETAINED",
+				message,
+				record.session?.execution,
+				record.session?.sessionId,
+			);
+		}
+		return this.fail(
+			record,
+			"retained",
+			"OPERATION_RETAINED",
+			message,
+			record.requestedBranch ?? undefined,
+			record.session?.sessionId,
+			record.session?.execution ?? this.bestKnownExecution(record),
+		);
+	}
+
+	/**
+	 * A terminal operation is immutable: replay exactly what was recorded and
+	 * create nothing.
+	 */
+	private replayTerminal(record: ProjectStartOperationRecord): RunResult | undefined {
 		if (record.phase === "failed" || record.phase === "retained") {
 			if (!record.failure) {
 				throw new ProjectStartError("OPERATION_RETAINED", "Operation has no replayable result");
@@ -593,189 +1023,133 @@ export class ProjectStartCoordinator {
 			throw terminalError(record.failure);
 		}
 		if (record.phase === "session_started") {
-			if (record.result && this.sessionManager.get(record.result.sessionId)) return record.result;
-			return this.failWorktree(
-				record,
-				"OPERATION_RETAINED",
-				"The recorded session is no longer present; the worktree was retained",
-				record.result?.execution,
-				record.result?.sessionId,
-			);
-		}
-		if (record.phase === "launch_requested") {
-			return this.failWorktree(
-				record,
-				"OPERATION_RETAINED",
-				"Runtime launch may already have started; the worktree was retained",
-				record.result?.execution,
-			);
-		}
-		if (record.phase === "worktree_created" || record.phase === "worktree_ready") {
-			return this.failWorktree(
-				record,
-				"OPERATION_RETAINED",
-				"Worktree preparation was interrupted; the worktree was retained for reconciliation",
-			);
-		}
-
-		if (record.phase === "recorded") {
-			let commit: string;
-			try {
-				commit = await this.managedWorktrees.resolveBase(
-					record.repositoryRoot,
-					record.worktree.selectedBaseRef,
-				);
-			} catch (error) {
-				return this.failManagedBeforeCreation(record, error);
+			if (!record.result) {
+				throw new ProjectStartError("OPERATION_RETAINED", "Operation has no replayable result");
 			}
-			if (commit !== record.worktree.selectedBaseCommit) {
-				return this.failManagedBeforeCreation(
-					record,
-					new ManagedWorktreeError(
-						"STALE_WORKTREE_BASE",
-						"The selected worktree base changed before creation",
-					),
-				);
-			}
-			try {
-				await this.managedWorktrees.create(
-					record.repositoryRoot,
-					record.worktree.destination,
-					record.worktree.selectedBaseCommit,
-					record.requestedBranch,
-				);
-			} catch (error) {
-				if (
-					error instanceof ManagedWorktreeError &&
-					(error.code === "INVALID_BRANCH" || error.code === "BRANCH_EXISTS")
-				) {
-					return this.failManagedBeforeCreation(record, error);
-				}
-				let pathExists = false;
-				try {
-					await lstat(record.worktree.destination);
-					pathExists = true;
-				} catch (inspectionError) {
-					pathExists = !isMissingPath(inspectionError);
-				}
-				let branchExists = false;
-				if (record.requestedBranch) {
-					try {
-						const branch = await this.runGit(record.repositoryRoot, [
-							"show-ref",
-							"--verify",
-							"--quiet",
-							`refs/heads/${record.requestedBranch}`,
-						]);
-						branchExists = branch.exitCode === 0;
-					} catch {
-						branchExists = true;
-					}
-				}
-				if (pathExists || branchExists) {
-					return this.failWorktree(
-						record,
-						"OPERATION_RETAINED",
-						error instanceof Error ? error.message : String(error),
-						undefined,
-						undefined,
-						pathExists,
-					);
-				}
-				return this.failManagedBeforeCreation(record, error);
-			}
-			record = this.journal.update(record.operationId, (current) => ({
-				...current,
-				phase: "worktree_created",
-				updatedAt: Date.now(),
-			})) as Extract<ProjectStartOperationRecord, { mode: "worktree" }>;
+			return record.result;
 		}
-
-		let effective: SessionExecutionState;
-		try {
-			const directory = await this.managedWorktrees.mapProject(
-				record.worktree.destination,
-				record.worktree.projectRelativePath,
-			);
-			const git = await this.inspectGit(directory, true);
-			if (
-				!git ||
-				resolve(git.repositoryRoot) !== resolve(record.worktree.destination) ||
-				git.head !== record.worktree.selectedBaseCommit ||
-				git.branch !== record.requestedBranch ||
-				git.detached !== (record.requestedBranch === null)
-			) {
-				throw new ManagedWorktreeError(
-					"WORKTREE_CREATE_FAILED",
-					"Created worktree does not match its recorded Git state",
-				);
-			}
-			effective = {
-				directory,
-				mode: "worktree",
-				git,
-				worktree: {
-					path: record.worktree.destination,
-					baseRef: record.worktree.selectedBaseRef,
-					baseCommit: record.worktree.selectedBaseCommit,
-				},
-			};
-		} catch (error) {
-			return this.failWorktree(
-				record,
-				error instanceof ManagedWorktreeError ? error.code : "OPERATION_RETAINED",
-				error instanceof Error ? error.message : String(error),
-			);
-		}
-		if (record.phase === "worktree_created") {
-			record = this.journal.update(record.operationId, (current) => ({
-				...current,
-				phase: "worktree_ready",
-				updatedAt: Date.now(),
-			})) as Extract<ProjectStartOperationRecord, { mode: "worktree" }>;
-		}
-		record = this.journal.update(record.operationId, (current) => ({
-			...current,
-			phase: "launch_requested",
-			updatedAt: Date.now(),
-		})) as Extract<ProjectStartOperationRecord, { mode: "worktree" }>;
-		let launched: RunResult;
-		try {
-			const { resumeSessionId: _resumeSessionId, ...freshOptions } = options;
-			launched = await launch(
-				{ ...freshOptions, workspace: effective.directory },
-				{ originProjectPath: record.originProjectPath, execution: effective },
-			);
-		} catch (error) {
-			return this.failWorktree(
-				record,
-				"RUNTIME_LAUNCH_FAILED",
-				error instanceof Error ? error.message : String(error),
-				effective,
-				error instanceof ExecutorStartError ? error.sessionId : undefined,
-			);
-		}
-		const result: RunResult = {
-			...launched,
-			operationId: record.operationId,
-			originProjectPath: record.originProjectPath,
-			execution: effective,
-		};
-		this.journal.update(record.operationId, (current) => ({
-			...current,
-			phase: "session_started",
-			updatedAt: Date.now(),
-			result,
-		}));
-		return result;
+		return undefined;
 	}
 
-	private failManagedBeforeCreation(
-		record: Extract<ProjectStartOperationRecord, { mode: "worktree" }>,
-		error: unknown,
-	): never {
+	private recordedWorktree(record: WorktreeOperationRecord): RecordedManagedWorktree {
+		return {
+			repositoryRoot: record.repositoryRoot,
+			destination: record.worktree.destination,
+			selectedBaseRef: record.worktree.selectedBaseRef,
+			selectedBaseCommit: record.worktree.selectedBaseCommit,
+			projectRelativePath: record.worktree.projectRelativePath,
+			requestedBranch: record.requestedBranch,
+		};
+	}
+
+	private describeTruth(truth: ManagedWorktreeTruth): string {
+		switch (truth.status) {
+			case "changed":
+			case "uncertain":
+				return `The recorded worktree could not be confirmed: ${truth.reason}`;
+			case "branch_only":
+				return "The requested branch exists without its worktree; nothing was reused or deleted";
+			case "absent":
+				return "The recorded worktree is missing";
+			default:
+				return "The recorded worktree was retained";
+		}
+	}
+
+	/**
+	 * Rollback of an exact, clean, unlaunched worktree. Intent is durable before
+	 * the first destructive command and the proof is repeated inside it.
+	 */
+	private async rollbackWorktree(
+		record: WorktreeOperationRecord,
+		code: string,
+		message: string,
+	): Promise<never> {
+		const truth = await this.managedWorktrees.inspectRecorded(this.recordedWorktree(record));
+		if (
+			truth.status !== "exact" ||
+			!truth.mapping.ok ||
+			!truth.selectedBaseMatches ||
+			!truth.clean
+		) {
+			return this.failWorktree(record, code, message);
+		}
+		const requested = this.journal.update(record.operationId, (current) => ({
+			...current,
+			phase: "rollback_requested",
+			updatedAt: Date.now(),
+			rollback: { requestedAt: Date.now(), code, message },
+		})) as WorktreeOperationRecord;
+		return this.finishRollback(requested);
+	}
+
+	/**
+	 * Continue a durably intended rollback from wherever it stopped. Every step
+	 * re-proves before acting; a changed or uncertain remainder is retained.
+	 */
+	private async finishRollback(record: WorktreeOperationRecord): Promise<never> {
+		const intent = record.rollback;
+		if (!intent) {
+			return this.failWorktree(
+				record,
+				"OPERATION_RETAINED",
+				"Rollback intent is missing; the worktree was retained",
+			);
+		}
+		const recorded = this.recordedWorktree(record);
+		let current = record;
+		if (current.phase === "rollback_requested") {
+			// The removal may already have run and only its phase write been lost.
+			// A provably absent worktree advances; it is not a reason to retain.
+			const before = await this.managedWorktrees.inspectRecorded(recorded);
+			const alreadyGone = before.status === "absent" || before.status === "branch_only";
+			const removal = alreadyGone
+				? ({ status: "removed" } as const)
+				: await this.managedWorktrees.rollbackExact(recorded);
+			if (removal.status === "retained") {
+				return this.failWorktree(
+					current,
+					intent.code,
+					`${intent.message} The worktree at ${recorded.destination} was kept: ${removal.reason}`,
+				);
+			}
+			current = this.journal.update(current.operationId, (existing) => ({
+				...existing,
+				phase: "worktree_removed",
+				updatedAt: Date.now(),
+			})) as WorktreeOperationRecord;
+		}
+		const branch = await this.managedWorktrees.deleteRollbackBranch(recorded);
+		if (branch.status === "retained") {
+			return this.failWorktree(
+				current,
+				intent.code,
+				`${intent.message} The worktree was removed, but the branch ${recorded.requestedBranch} was kept: ${branch.reason}`,
+				undefined,
+				undefined,
+				false,
+			);
+		}
+		const details: ProjectStartFailureDetails = {
+			operationId: current.operationId,
+			phase: "failed",
+			originProjectPath: current.originProjectPath,
+		};
+		this.journal.update(current.operationId, (existing) => {
+			const { rollback: _rollback, result: _result, ...rest } = existing;
+			return {
+				...rest,
+				phase: "failed",
+				updatedAt: Date.now(),
+				failure: { code: intent.code, message: intent.message, details },
+			};
+		});
+		throw new ProjectStartError(intent.code, intent.message, details);
+	}
+
+	private failManagedBeforeCreation(record: WorktreeOperationRecord, error: unknown): never {
 		const code = error instanceof ManagedWorktreeError ? error.code : "WORKTREE_CREATE_FAILED";
-		const message = error instanceof Error ? error.message : String(error);
+		const message = describeError(error);
 		const details: ProjectStartFailureDetails = {
 			operationId: record.operationId,
 			phase: "failed",
@@ -792,13 +1166,16 @@ export class ProjectStartCoordinator {
 	}
 
 	private failWorktree(
-		record: Extract<ProjectStartOperationRecord, { mode: "worktree" }>,
+		record: ProjectStartOperationRecord,
 		code: string,
 		message: string,
 		effectiveState?: SessionExecutionState,
 		createdSessionId?: string,
 		retainPath = true,
 	): never {
+		if (record.mode !== "worktree") {
+			throw new ProjectStartError(code, message);
+		}
 		const details: ProjectStartFailureDetails = {
 			operationId: record.operationId,
 			phase: "retained",
@@ -809,12 +1186,10 @@ export class ProjectStartCoordinator {
 			...(createdSessionId ? { createdSessionId } : {}),
 		};
 		const failure = { code, message, details };
-		this.journal.update(record.operationId, (current) => ({
-			...current,
-			phase: "retained",
-			updatedAt: Date.now(),
-			failure,
-		}));
+		this.journal.update(record.operationId, (current) => {
+			const { rollback: _rollback, result: _result, ...rest } = current;
+			return { ...rest, phase: "retained", updatedAt: Date.now(), failure };
+		});
 		throw new ProjectStartError(code, message, details);
 	}
 
@@ -1083,7 +1458,7 @@ export class ProjectStartCoordinator {
 		};
 		const failure: ProjectStartJournalFailure = { code, message, details };
 		this.journal.update(record.operationId, (current) => {
-			const { result: _result, ...rest } = current;
+			const { result: _result, rollback: _rollback, ...rest } = current;
 			return {
 				...rest,
 				phase,
@@ -1105,7 +1480,7 @@ export class ProjectStartCoordinator {
 				"OPERATION_RETAINED",
 				"The project is no longer registered; the prepared operation will not launch",
 				record.requestedBranch ?? undefined,
-				record.result?.sessionId,
+				record.result?.sessionId ?? record.session?.sessionId,
 				bestKnown,
 			);
 		}
@@ -1113,7 +1488,12 @@ export class ProjectStartCoordinator {
 		let git: GitCheckoutState | null;
 		try {
 			await this.requireDirectory(record.originProjectPath);
-			git = await this.inspectGit(record.originProjectPath, true);
+			// A non-Git project has no Git truth to reconcile; requiring it here
+			// would retain a prepared start that never touched a repository.
+			git =
+				record.repositoryRoot === null
+					? null
+					: await this.inspectGit(record.originProjectPath, true);
 		} catch (error) {
 			if (error instanceof ProjectStartError) {
 				return this.fail(
@@ -1122,7 +1502,7 @@ export class ProjectStartCoordinator {
 					"OPERATION_RETAINED",
 					"The prepared project could not be inspected; the operation will not launch",
 					record.requestedBranch ?? undefined,
-					record.result?.sessionId,
+					record.result?.sessionId ?? record.session?.sessionId,
 					bestKnown,
 				);
 			}
@@ -1135,7 +1515,7 @@ export class ProjectStartCoordinator {
 				"OPERATION_RETAINED",
 				"The prepared project is no longer a Git working repository",
 				record.requestedBranch ?? undefined,
-				record.result?.sessionId,
+				record.result?.sessionId ?? record.session?.sessionId,
 				bestKnown,
 			);
 		}
@@ -1153,6 +1533,7 @@ export class ProjectStartCoordinator {
 			return record.failure.details.effectiveState;
 		}
 		if (record.result?.execution) return record.result.execution;
+		if (record.session) return record.session.execution;
 		const branch =
 			record.requestedBranch && record.phase !== "branch_created"
 				? record.requestedBranch

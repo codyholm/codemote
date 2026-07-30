@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { SessionManager } from "./session";
-import type { Workspace } from "./types";
+import { SessionManager, SessionRestoreConflictError } from "./session";
+import type { Session, Workspace } from "./types";
 
 describe("SessionManager", () => {
 	const mockWorkspace: Workspace = {
@@ -8,6 +8,22 @@ describe("SessionManager", () => {
 		workingDir: "/tmp/test",
 		createdAt: Date.now(),
 	};
+
+	function recordedSession(): Session {
+		return {
+			id: "session-restored",
+			runId: "run-restored",
+			runtime: "claude",
+			status: "ended",
+			workspace: mockWorkspace,
+			startedAt: 1000,
+			endedAt: 2000,
+			lastActivityAt: 2000,
+			statusChangedAt: 2000,
+			originProjectPath: "/tmp/project",
+			execution: { directory: "/tmp/test", mode: "project_folder", git: null },
+		};
+	}
 
 	it("creates session with unique ID", () => {
 		const manager = new SessionManager();
@@ -246,5 +262,68 @@ describe("SessionManager", () => {
 		const manager = new SessionManager();
 
 		expect(() => manager.clearAttention("no-such-session")).not.toThrow();
+	});
+
+	it("restores a recorded session idempotently and refuses to replace a different one", () => {
+		const manager = new SessionManager();
+		const restored = manager.restore(recordedSession());
+
+		expect(restored.id).toBe("session-restored");
+		expect(manager.get("session-restored")?.status).toBe("ended");
+		expect(manager.restore(recordedSession())).toBe(restored);
+		expect(manager.list()).toHaveLength(1);
+
+		expect(() => manager.restore({ ...recordedSession(), runId: "run-different" })).toThrowError(
+			SessionRestoreConflictError,
+		);
+		expect(manager.get("session-restored")?.runId).toBe("run-restored");
+	});
+
+	it("persists a runtime session ID before accepting it, and keeps memory honest if that fails", () => {
+		const manager = new SessionManager();
+		const persisted: string[] = [];
+		const session = manager.create("claude", mockWorkspace);
+		manager.bindRuntimeSessionPersistence(session.id, (_id, runtimeSessionId) => {
+			persisted.push(runtimeSessionId);
+		});
+
+		manager.setRuntimeSessionId(session.id, "runtime-1");
+		expect(persisted).toEqual(["runtime-1"]);
+		expect(manager.get(session.id)?.runtimeSessionId).toBe("runtime-1");
+
+		// Re-recording the same ID needs no write.
+		manager.setRuntimeSessionId(session.id, "runtime-1");
+		expect(persisted).toEqual(["runtime-1"]);
+
+		const unbound = manager.create("codex", mockWorkspace);
+		manager.setRuntimeSessionId(unbound.id, "runtime-unbound");
+		expect(persisted).toEqual(["runtime-1"]);
+		expect(manager.get(unbound.id)?.runtimeSessionId).toBe("runtime-unbound");
+
+		const failing = manager.create("claude", mockWorkspace);
+		manager.bindRuntimeSessionPersistence(failing.id, () => {
+			throw new Error("journal unavailable");
+		});
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		expect(() => manager.setRuntimeSessionId(failing.id, "runtime-2")).not.toThrow();
+		expect(manager.get(failing.id)?.runtimeSessionId).toBeUndefined();
+		expect(errors).toHaveBeenCalled();
+		errors.mockRestore();
+	});
+
+	it("drops persistence binding with the session it belongs to", () => {
+		const manager = new SessionManager();
+		const persisted: string[] = [];
+		const session = manager.restore(recordedSession());
+		manager.bindRuntimeSessionPersistence(session.id, (_id, runtimeSessionId) => {
+			persisted.push(runtimeSessionId);
+		});
+
+		manager.remove(session.id);
+		expect(manager.get(session.id)).toBeUndefined();
+
+		manager.restore(recordedSession());
+		manager.setRuntimeSessionId(session.id, "runtime-after-remove");
+		expect(persisted).toEqual([]);
 	});
 });
