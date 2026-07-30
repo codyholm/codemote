@@ -1,4 +1,7 @@
 import type {
+	GitWorktreeBase,
+	ManagedWorktreeExecutionState,
+	ManagedWorktreeStartRequest,
 	ModelInfo,
 	PendingAttention,
 	ProjectStartFailureDetails,
@@ -12,11 +15,15 @@ import type {
 	SessionExecutionState,
 	SessionStatus,
 	StreamEvent,
+	WorktreeStartState,
 } from "@codemote/common";
 
 // Re-export common types
 export type {
 	ModelInfo,
+	GitWorktreeBase,
+	ManagedWorktreeExecutionState,
+	ManagedWorktreeStartRequest,
 	PendingAttention,
 	ProjectStartFailureDetails,
 	ProjectStartRequest,
@@ -29,6 +36,7 @@ export type {
 	SessionExecutionState,
 	SessionStatus,
 	StreamEvent,
+	WorktreeStartState,
 };
 
 /**
@@ -255,6 +263,8 @@ export interface UplinkConfig {
 	projectRegistryPath?: string;
 	/** Project-folder start operation journal path override */
 	projectStartJournalPath?: string;
+	/** Parent directory for machine-managed Git worktrees */
+	managedWorktreeRoot?: string;
 	/** Available runtime profiles */
 	runtimes: RuntimeType[];
 	/** Runtime-specific configurations */

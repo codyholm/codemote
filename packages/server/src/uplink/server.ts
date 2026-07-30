@@ -588,6 +588,9 @@ export class UplinkServer {
 				),
 				registry: this.projectRegistry,
 				sessionManager: this.sessionManager,
+				...(this.config.managedWorktreeRoot
+					? { managedWorktreeRoot: this.config.managedWorktreeRoot }
+					: {}),
 			});
 		}
 		return this.projectStartCoordinator;

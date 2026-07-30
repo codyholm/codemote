@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	type ManagedWorktreeOperationRecord,
+	type ProjectFolderStartOperationRecord,
 	ProjectStartJournal,
 	ProjectStartJournalError,
 	type ProjectStartOperationRecord,
@@ -23,8 +25,8 @@ describe("ProjectStartJournal", () => {
 	});
 
 	function record(
-		overrides: Partial<ProjectStartOperationRecord> = {},
-	): ProjectStartOperationRecord {
+		overrides: Partial<ProjectFolderStartOperationRecord> = {},
+	): ProjectFolderStartOperationRecord {
 		return {
 			operationId: "operation-1",
 			fingerprint: "fingerprint-1",
@@ -83,6 +85,58 @@ describe("ProjectStartJournal", () => {
 				operationId: "operation-1",
 				phase,
 				originProjectPath: join(fixtureDir, "project"),
+			},
+		};
+	}
+
+	function worktreeRecord(): ManagedWorktreeOperationRecord {
+		const originProjectPath = join(fixtureDir, "source", "packages", "nested");
+		const repositoryRoot = join(fixtureDir, "source");
+		const destination = join(fixtureDir, "managed", "source-operation");
+		return {
+			operationId: "worktree-1",
+			fingerprint: "fingerprint-worktree",
+			mode: "worktree",
+			originProjectPath,
+			runtime: "codex",
+			repositoryRoot,
+			observedHead: "abc123",
+			observedBranch: "main",
+			requestedBranch: "feature/worktree",
+			worktree: {
+				destination,
+				selectedBaseRef: "refs/heads/main",
+				selectedBaseCommit: "abc123",
+				projectRelativePath: join("packages", "nested"),
+			},
+			phase: "retained",
+			createdAt: 1000,
+			updatedAt: 2000,
+			failure: {
+				code: "RUNTIME_LAUNCH_FAILED",
+				message: "Runtime failed",
+				details: {
+					operationId: "worktree-1",
+					phase: "retained",
+					originProjectPath,
+					retainedBranch: "feature/worktree",
+					retainedWorktreePath: destination,
+					effectiveState: {
+						directory: join(destination, "packages", "nested"),
+						mode: "worktree",
+						git: {
+							repositoryRoot: destination,
+							head: "abc123",
+							branch: "feature/worktree",
+							detached: false,
+						},
+						worktree: {
+							path: destination,
+							baseRef: "refs/heads/main",
+							baseCommit: "abc123",
+						},
+					},
+				},
 			},
 		};
 	}
@@ -198,6 +252,102 @@ describe("ProjectStartJournal", () => {
 				},
 			}).failure,
 		);
+	});
+
+	it("round trips internally consistent Worktree ownership and retained state", () => {
+		const expected = worktreeRecord();
+		const journal = new ProjectStartJournal(journalPath);
+		journal.create(expected);
+
+		expect(new ProjectStartJournal(journalPath).get("worktree-1")).toMatchObject({
+			mode: "worktree",
+			phase: "retained",
+			worktree: {
+				destination: expected.worktree.destination,
+				projectRelativePath: join("packages", "nested"),
+			},
+			failure: { details: { retainedWorktreePath: expected.worktree.destination } },
+		});
+	});
+
+	it("rejects mismatched Worktree failure ownership and failed resource claims", async () => {
+		const withExecutionMutation = (
+			mutate: (
+				execution: Extract<
+					NonNullable<
+						NonNullable<ManagedWorktreeOperationRecord["failure"]>["details"]
+					>["effectiveState"],
+					{ mode: "worktree" }
+				>,
+			) => void,
+		): ManagedWorktreeOperationRecord => {
+			const value = worktreeRecord();
+			const execution = value.failure?.details?.effectiveState;
+			if (execution?.mode !== "worktree") throw new Error("Expected Worktree effective state");
+			mutate(execution);
+			return value;
+		};
+		const mismatchedOwnership = [
+			withExecutionMutation((execution) => {
+				execution.directory = join(execution.worktree.path, "other");
+			}),
+			withExecutionMutation((execution) => {
+				execution.worktree.path = join(fixtureDir, "other-worktree");
+			}),
+			withExecutionMutation((execution) => {
+				execution.worktree.baseRef = "refs/heads/other";
+			}),
+			withExecutionMutation((execution) => {
+				execution.worktree.baseCommit = "different";
+			}),
+			withExecutionMutation((execution) => {
+				execution.git.repositoryRoot = join(fixtureDir, "other-worktree");
+			}),
+			withExecutionMutation((execution) => {
+				execution.git.head = "different";
+			}),
+			withExecutionMutation((execution) => {
+				execution.git.branch = "feature/other";
+			}),
+			withExecutionMutation((execution) => {
+				execution.git.detached = true;
+			}),
+		];
+
+		const failedWithResources = worktreeRecord();
+		failedWithResources.phase = "failed";
+		if (!failedWithResources.failure?.details) throw new Error("Expected Worktree failure");
+		failedWithResources.failure.details.phase = "failed";
+
+		const retainedWithoutResources = worktreeRecord();
+		if (!retainedWithoutResources.failure?.details) throw new Error("Expected Worktree failure");
+		const {
+			retainedBranch: _retainedBranch,
+			retainedWorktreePath: _retainedWorktreePath,
+			effectiveState: _effectiveState,
+			...detailsWithoutResources
+		} = retainedWithoutResources.failure.details;
+		retainedWithoutResources.failure = {
+			...retainedWithoutResources.failure,
+			details: detailsWithoutResources,
+		};
+
+		for (const invalidRecord of [
+			...mismatchedOwnership,
+			failedWithResources,
+			retainedWithoutResources,
+		]) {
+			await mkdir(dirname(journalPath), { recursive: true });
+			await writeFile(
+				journalPath,
+				JSON.stringify({ version: 1, operations: [invalidRecord] }),
+				"utf8",
+			);
+			expectJournalError(
+				() => new ProjectStartJournal(journalPath),
+				"INVALID_PROJECT_START_JOURNAL",
+			);
+		}
 	});
 
 	it("writes private parent and file permissions where supported", async () => {

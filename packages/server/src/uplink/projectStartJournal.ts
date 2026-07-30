@@ -26,10 +26,9 @@ export interface ProjectStartJournalFailure {
 	details?: ProjectStartFailureDetails;
 }
 
-export interface ProjectStartOperationRecord {
+interface ProjectStartOperationBase {
 	operationId: string;
 	fingerprint: string;
-	mode: "project_folder";
 	originProjectPath: string;
 	runtime: RuntimeType;
 	repositoryRoot: string | null;
@@ -42,6 +41,25 @@ export interface ProjectStartOperationRecord {
 	result?: RunResult;
 	failure?: ProjectStartJournalFailure;
 }
+
+export interface ProjectFolderStartOperationRecord extends ProjectStartOperationBase {
+	mode: "project_folder";
+}
+
+export interface ManagedWorktreeOperationRecord extends ProjectStartOperationBase {
+	mode: "worktree";
+	repositoryRoot: string;
+	worktree: {
+		destination: string;
+		selectedBaseRef: string;
+		selectedBaseCommit: string;
+		projectRelativePath: string;
+	};
+}
+
+export type ProjectStartOperationRecord =
+	| ProjectFolderStartOperationRecord
+	| ManagedWorktreeOperationRecord;
 
 type ProjectStartJournalErrorCode =
 	| "INVALID_PROJECT_START_JOURNAL"
@@ -104,6 +122,8 @@ function phase(value: unknown): ProjectStartPhase {
 		value === "recorded" ||
 		value === "branch_created" ||
 		value === "branch_checked_out" ||
+		value === "worktree_created" ||
+		value === "worktree_ready" ||
 		value === "launch_requested" ||
 		value === "session_started" ||
 		value === "failed" ||
@@ -119,7 +139,9 @@ function parseExecution(value: unknown): SessionExecutionState {
 		return invalid("Invalid journal result execution");
 	}
 	const candidate = value as Record<string, unknown>;
-	if (candidate["mode"] !== "project_folder") invalid("Invalid journal result execution mode");
+	if (candidate["mode"] !== "project_folder" && candidate["mode"] !== "worktree") {
+		invalid("Invalid journal result execution mode");
+	}
 	const gitValue = candidate["git"];
 	let git: SessionExecutionState["git"] = null;
 	if (gitValue !== null) {
@@ -143,10 +165,26 @@ function parseExecution(value: unknown): SessionExecutionState {
 			detached,
 		};
 	}
-	return {
+	const base = {
 		directory: absolutePath(candidate["directory"], "directory"),
-		mode: "project_folder",
 		git,
+	};
+	if (candidate["mode"] === "project_folder") return { ...base, mode: "project_folder" };
+	if (!git) return invalid("Invalid Worktree journal result Git state");
+	const worktreeValue = candidate["worktree"];
+	if (!worktreeValue || typeof worktreeValue !== "object" || Array.isArray(worktreeValue)) {
+		return invalid("Invalid Worktree journal result ownership");
+	}
+	const worktree = worktreeValue as Record<string, unknown>;
+	return {
+		directory: base.directory,
+		git,
+		mode: "worktree",
+		worktree: {
+			path: absolutePath(worktree["path"], "execution.worktree.path"),
+			baseRef: requiredString(worktree["baseRef"], "execution.worktree.baseRef"),
+			baseCommit: requiredString(worktree["baseCommit"], "execution.worktree.baseCommit"),
+		},
 	};
 }
 
@@ -189,6 +227,12 @@ function parseFailureDetails(value: unknown): ProjectStartFailureDetails {
 	if (candidate["retainedBranch"] !== undefined) {
 		details.retainedBranch = requiredString(candidate["retainedBranch"], "failure.retainedBranch");
 	}
+	if (candidate["retainedWorktreePath"] !== undefined) {
+		details.retainedWorktreePath = absolutePath(
+			candidate["retainedWorktreePath"],
+			"failure.retainedWorktreePath",
+		);
+	}
 	if (candidate["createdSessionId"] !== undefined) {
 		details.createdSessionId = requiredString(
 			candidate["createdSessionId"],
@@ -213,20 +257,39 @@ function parseFailure(value: unknown): ProjectStartJournalFailure {
 	return failure;
 }
 
+function isConsistentWorktreeExecution(
+	record: ManagedWorktreeOperationRecord,
+	execution: SessionExecutionState,
+): boolean {
+	return (
+		execution.mode === "worktree" &&
+		execution.directory ===
+			resolve(record.worktree.destination, record.worktree.projectRelativePath) &&
+		execution.worktree.path === record.worktree.destination &&
+		execution.worktree.baseRef === record.worktree.selectedBaseRef &&
+		execution.worktree.baseCommit === record.worktree.selectedBaseCommit &&
+		execution.git.repositoryRoot === record.worktree.destination &&
+		execution.git.head === record.worktree.selectedBaseCommit &&
+		execution.git.branch === record.requestedBranch &&
+		execution.git.detached === (record.requestedBranch === null)
+	);
+}
+
 function parseRecord(value: unknown): ProjectStartOperationRecord {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		return invalid("Invalid project start operation record");
 	}
 	const candidate = value as Record<string, unknown>;
-	if (candidate["mode"] !== "project_folder") invalid("Invalid journal field: mode");
+	if (candidate["mode"] !== "project_folder" && candidate["mode"] !== "worktree") {
+		invalid("Invalid journal field: mode");
+	}
 	const repositoryRoot =
 		candidate["repositoryRoot"] === null
 			? null
 			: absolutePath(candidate["repositoryRoot"], "repositoryRoot");
-	const record: ProjectStartOperationRecord = {
+	const common = {
 		operationId: requiredString(candidate["operationId"], "operationId"),
 		fingerprint: requiredString(candidate["fingerprint"], "fingerprint"),
-		mode: "project_folder",
 		originProjectPath: absolutePath(candidate["originProjectPath"], "originProjectPath"),
 		runtime: runtime(candidate["runtime"]),
 		repositoryRoot,
@@ -237,6 +300,38 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 		createdAt: timestamp(candidate["createdAt"], "createdAt"),
 		updatedAt: timestamp(candidate["updatedAt"], "updatedAt"),
 	};
+	let record: ProjectStartOperationRecord;
+	if (candidate["mode"] === "project_folder") {
+		record = { ...common, mode: "project_folder" };
+	} else {
+		if (!repositoryRoot) invalid("Worktree operation is missing its source repository");
+		const value = candidate["worktree"];
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			return invalid("Invalid Worktree ownership record");
+		}
+		const worktree = value as Record<string, unknown>;
+		const projectRelativePath = worktree["projectRelativePath"];
+		if (typeof projectRelativePath !== "string") {
+			invalid("Invalid journal field: worktree.projectRelativePath");
+		}
+		if (isAbsolute(projectRelativePath) || projectRelativePath.split(/[\\/]/u).includes("..")) {
+			invalid("Invalid Worktree project relative path");
+		}
+		record = {
+			...common,
+			mode: "worktree",
+			repositoryRoot,
+			worktree: {
+				destination: absolutePath(worktree["destination"], "worktree.destination"),
+				selectedBaseRef: requiredString(worktree["selectedBaseRef"], "worktree.selectedBaseRef"),
+				selectedBaseCommit: requiredString(
+					worktree["selectedBaseCommit"],
+					"worktree.selectedBaseCommit",
+				),
+				projectRelativePath,
+			},
+		};
+	}
 	if (candidate["result"] !== undefined) record.result = parseResult(candidate["result"]);
 	if (candidate["failure"] !== undefined) record.failure = parseFailure(candidate["failure"]);
 	const hasResult = record.result !== undefined;
@@ -257,6 +352,7 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 		invalid("Non-Git journal record contains Git state");
 	}
 	if (
+		record.mode === "project_folder" &&
 		record.requestedBranch !== null &&
 		(record.phase === "branch_created" ||
 			record.phase === "branch_checked_out" ||
@@ -268,10 +364,19 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 		invalid("Branch operation is missing its repository or commit");
 	}
 	if (
+		record.mode === "project_folder" &&
 		(record.phase === "branch_created" || record.phase === "branch_checked_out") &&
 		record.requestedBranch === null
 	) {
 		invalid("Prepared branch phase is missing its requested branch");
+	}
+	if (
+		(record.mode === "worktree" &&
+			(record.phase === "branch_created" || record.phase === "branch_checked_out")) ||
+		(record.mode === "project_folder" &&
+			(record.phase === "worktree_created" || record.phase === "worktree_ready"))
+	) {
+		invalid("Journal phase does not match its start mode");
 	}
 	if (
 		record.result &&
@@ -283,10 +388,17 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 	}
 	if (record.result) {
 		const execution = record.result.execution;
-		if (!execution || execution.directory !== record.originProjectPath) {
+		if (!execution || execution.mode !== record.mode) {
+			invalid("Successful journal record has an inconsistent execution mode");
+		}
+		if (record.mode === "project_folder" && execution.directory !== record.originProjectPath) {
 			invalid("Successful journal record has an inconsistent execution directory");
 		}
-		if (record.repositoryRoot === null) {
+		if (record.mode === "worktree") {
+			if (!isConsistentWorktreeExecution(record, execution)) {
+				invalid("Successful Worktree journal record has inconsistent ownership");
+			}
+		} else if (record.repositoryRoot === null) {
 			if (execution.git !== null) {
 				invalid("Successful non-Git journal record contains Git execution state");
 			}
@@ -313,6 +425,7 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 		invalid("Terminal journal record has inconsistent failure details");
 	}
 	if (
+		record.mode === "project_folder" &&
 		record.failure?.details?.effectiveState &&
 		record.failure.details.effectiveState.directory !== record.originProjectPath
 	) {
@@ -323,6 +436,42 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 		record.failure.details.retainedBranch !== record.requestedBranch
 	) {
 		invalid("Terminal journal record has an inconsistent retained branch");
+	}
+	if (
+		record.mode === "worktree" &&
+		record.failure?.details?.retainedWorktreePath &&
+		record.failure.details.retainedWorktreePath !== record.worktree.destination
+	) {
+		invalid("Terminal journal record has an inconsistent retained worktree");
+	}
+	if (
+		record.mode === "worktree" &&
+		record.failure?.details?.effectiveState &&
+		!isConsistentWorktreeExecution(record, record.failure.details.effectiveState)
+	) {
+		invalid("Terminal Worktree record has inconsistent ownership");
+	}
+	if (
+		record.mode === "worktree" &&
+		record.phase === "failed" &&
+		record.failure?.details &&
+		(record.failure.details.retainedBranch !== undefined ||
+			record.failure.details.retainedWorktreePath !== undefined ||
+			record.failure.details.effectiveState !== undefined ||
+			record.failure.details.createdSessionId !== undefined)
+	) {
+		invalid("Failed Worktree record claims retained resources");
+	}
+	if (record.mode === "worktree" && record.phase === "retained" && record.failure?.details) {
+		const details = record.failure.details;
+		if (
+			(record.requestedBranch === null && details.retainedWorktreePath === undefined) ||
+			((details.effectiveState !== undefined || details.createdSessionId !== undefined) &&
+				details.retainedWorktreePath === undefined) ||
+			(details.retainedBranch === undefined && details.retainedWorktreePath === undefined)
+		) {
+			invalid("Retained Worktree record is missing retained resource ownership");
+		}
 	}
 	return record;
 }

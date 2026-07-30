@@ -31,12 +31,17 @@ describe("SessionManager", () => {
 		const manager = new SessionManager();
 		const execution = {
 			directory: "/tmp/project-worktree",
-			mode: "project_folder" as const,
+			mode: "worktree" as const,
 			git: {
 				repositoryRoot: "/tmp/project-worktree",
 				head: "abc123",
 				branch: "feature/session",
 				detached: false,
+			},
+			worktree: {
+				path: "/tmp/project-worktree",
+				baseRef: "refs/heads/main",
+				baseCommit: "abc123",
 			},
 		};
 

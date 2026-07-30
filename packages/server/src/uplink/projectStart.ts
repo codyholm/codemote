@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { stat } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { lstat, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import type {
 	GitCheckoutState,
 	ProjectStartFailureDetails,
@@ -12,6 +13,7 @@ import type {
 	SessionExecutionState,
 } from "@codemote/common";
 import { ExecutorStartError } from "./executor.js";
+import { ManagedWorktreeError, ManagedWorktreeService } from "./managedWorktree.js";
 import type { ProjectRegistry } from "./projectRegistry.js";
 import type {
 	ProjectStartJournal,
@@ -66,6 +68,7 @@ export interface ProjectStartCoordinatorOptions {
 	registry: ProjectRegistry;
 	sessionManager: SessionManager;
 	runGit?: GitCommandRunner;
+	managedWorktreeRoot?: string;
 }
 
 type LaunchProjectSession = (
@@ -287,6 +290,7 @@ export class ProjectStartCoordinator {
 	private readonly registry: ProjectRegistry;
 	private readonly sessionManager: SessionManager;
 	private readonly runGit: GitCommandRunner;
+	private readonly managedWorktrees: ManagedWorktreeService;
 	private readonly inFlight = new Map<string, InFlightOperation>();
 	private readonly repositoryTails = new Map<string, Promise<void>>();
 
@@ -295,17 +299,30 @@ export class ProjectStartCoordinator {
 		this.registry = options.registry;
 		this.sessionManager = options.sessionManager;
 		this.runGit = options.runGit ?? runGitCommand;
+		this.managedWorktrees = new ManagedWorktreeService(
+			this.runGit,
+			options.managedWorktreeRoot ?? join(homedir(), ".codemote", "worktrees"),
+		);
 	}
 
 	async inspect(projectPath: string): Promise<ProjectStartState> {
 		const normalizedPath = this.requireRegisteredPath(projectPath);
 		await this.requireDirectory(normalizedPath);
 		const git = await this.inspectGit(normalizedPath, false);
+		let worktree = null;
+		if (git) {
+			try {
+				worktree = await this.managedWorktrees.listBases(git.repositoryRoot);
+			} catch (error) {
+				throw this.mapManagedGitError(error);
+			}
+		}
 		return {
 			originProjectPath: normalizedPath,
 			mode: "project_folder",
 			directory: normalizedPath,
 			git,
+			worktree,
 		};
 	}
 
@@ -351,11 +368,70 @@ export class ProjectStartCoordinator {
 			const existing = record;
 			const lockKey = existing.repositoryRoot ?? existing.originProjectPath;
 			return this.withRepositoryLock(lockKey, () =>
-				this.reconcileAndLaunch(options, existing, launch, true),
+				existing.mode === "worktree"
+					? this.reconcileWorktree(options, existing, launch)
+					: this.reconcileAndLaunch(options, existing, launch, true),
 			);
 		}
 
 		const state = await this.inspect(request.originProjectPath);
+		if (request.mode === "worktree") {
+			if (!state.git) {
+				throw new ProjectStartError(
+					"INVALID_WORKTREE_BASE",
+					"This project is not in a Git working repository",
+				);
+			}
+			let commit: string;
+			try {
+				commit = await this.managedWorktrees.resolveBase(
+					state.git.repositoryRoot,
+					request.preparation.baseRef,
+				);
+			} catch (error) {
+				throw this.mapManagedGitError(error);
+			}
+			if (commit !== request.preparation.expectedCommit) {
+				throw new ProjectStartError(
+					"STALE_WORKTREE_BASE",
+					"The selected worktree base changed; refresh and start again",
+				);
+			}
+			let plan: Awaited<ReturnType<ManagedWorktreeService["plan"]>>;
+			try {
+				plan = await this.managedWorktrees.plan(
+					state.git.repositoryRoot,
+					request.originProjectPath,
+					request.operationId,
+				);
+			} catch (error) {
+				throw this.mapManagedError(error);
+			}
+			const now = Date.now();
+			const worktreeRecord = this.journal.create({
+				operationId: request.operationId,
+				fingerprint,
+				mode: "worktree",
+				originProjectPath: request.originProjectPath,
+				runtime: options.profile,
+				repositoryRoot: state.git.repositoryRoot,
+				observedHead: state.git.head,
+				observedBranch: state.git.branch,
+				requestedBranch: request.preparation.newBranch,
+				worktree: {
+					destination: plan.destination,
+					selectedBaseRef: request.preparation.baseRef,
+					selectedBaseCommit: request.preparation.expectedCommit,
+					projectRelativePath: plan.projectRelativePath,
+				},
+				phase: "recorded",
+				createdAt: now,
+				updatedAt: now,
+			}) as Extract<ProjectStartOperationRecord, { mode: "worktree" }>;
+			return this.withRepositoryLock(worktreeRecord.repositoryRoot, () =>
+				this.reconcileWorktree(options, worktreeRecord, launch),
+			);
+		}
 		const now = Date.now();
 		record = this.journal.create({
 			operationId: request.operationId,
@@ -499,6 +575,247 @@ export class ProjectStartCoordinator {
 			result,
 		}));
 		return result;
+	}
+
+	private async reconcileWorktree(
+		options: RunOptions & { projectStart: ProjectStartRequest },
+		initialRecord: Extract<ProjectStartOperationRecord, { mode: "worktree" }>,
+		launch: LaunchProjectSession,
+	): Promise<RunResult> {
+		let record =
+			(this.journal.get(initialRecord.operationId) as
+				| Extract<ProjectStartOperationRecord, { mode: "worktree" }>
+				| undefined) ?? initialRecord;
+		if (record.phase === "failed" || record.phase === "retained") {
+			if (!record.failure) {
+				throw new ProjectStartError("OPERATION_RETAINED", "Operation has no replayable result");
+			}
+			throw terminalError(record.failure);
+		}
+		if (record.phase === "session_started") {
+			if (record.result && this.sessionManager.get(record.result.sessionId)) return record.result;
+			return this.failWorktree(
+				record,
+				"OPERATION_RETAINED",
+				"The recorded session is no longer present; the worktree was retained",
+				record.result?.execution,
+				record.result?.sessionId,
+			);
+		}
+		if (record.phase === "launch_requested") {
+			return this.failWorktree(
+				record,
+				"OPERATION_RETAINED",
+				"Runtime launch may already have started; the worktree was retained",
+				record.result?.execution,
+			);
+		}
+		if (record.phase === "worktree_created" || record.phase === "worktree_ready") {
+			return this.failWorktree(
+				record,
+				"OPERATION_RETAINED",
+				"Worktree preparation was interrupted; the worktree was retained for reconciliation",
+			);
+		}
+
+		if (record.phase === "recorded") {
+			let commit: string;
+			try {
+				commit = await this.managedWorktrees.resolveBase(
+					record.repositoryRoot,
+					record.worktree.selectedBaseRef,
+				);
+			} catch (error) {
+				return this.failManagedBeforeCreation(record, error);
+			}
+			if (commit !== record.worktree.selectedBaseCommit) {
+				return this.failManagedBeforeCreation(
+					record,
+					new ManagedWorktreeError(
+						"STALE_WORKTREE_BASE",
+						"The selected worktree base changed before creation",
+					),
+				);
+			}
+			try {
+				await this.managedWorktrees.create(
+					record.repositoryRoot,
+					record.worktree.destination,
+					record.worktree.selectedBaseCommit,
+					record.requestedBranch,
+				);
+			} catch (error) {
+				if (
+					error instanceof ManagedWorktreeError &&
+					(error.code === "INVALID_BRANCH" || error.code === "BRANCH_EXISTS")
+				) {
+					return this.failManagedBeforeCreation(record, error);
+				}
+				let pathExists = false;
+				try {
+					await lstat(record.worktree.destination);
+					pathExists = true;
+				} catch (inspectionError) {
+					pathExists = !isMissingPath(inspectionError);
+				}
+				let branchExists = false;
+				if (record.requestedBranch) {
+					try {
+						const branch = await this.runGit(record.repositoryRoot, [
+							"show-ref",
+							"--verify",
+							"--quiet",
+							`refs/heads/${record.requestedBranch}`,
+						]);
+						branchExists = branch.exitCode === 0;
+					} catch {
+						branchExists = true;
+					}
+				}
+				if (pathExists || branchExists) {
+					return this.failWorktree(
+						record,
+						"OPERATION_RETAINED",
+						error instanceof Error ? error.message : String(error),
+						undefined,
+						undefined,
+						pathExists,
+					);
+				}
+				return this.failManagedBeforeCreation(record, error);
+			}
+			record = this.journal.update(record.operationId, (current) => ({
+				...current,
+				phase: "worktree_created",
+				updatedAt: Date.now(),
+			})) as Extract<ProjectStartOperationRecord, { mode: "worktree" }>;
+		}
+
+		let effective: SessionExecutionState;
+		try {
+			const directory = await this.managedWorktrees.mapProject(
+				record.worktree.destination,
+				record.worktree.projectRelativePath,
+			);
+			const git = await this.inspectGit(directory, true);
+			if (
+				!git ||
+				resolve(git.repositoryRoot) !== resolve(record.worktree.destination) ||
+				git.head !== record.worktree.selectedBaseCommit ||
+				git.branch !== record.requestedBranch ||
+				git.detached !== (record.requestedBranch === null)
+			) {
+				throw new ManagedWorktreeError(
+					"WORKTREE_CREATE_FAILED",
+					"Created worktree does not match its recorded Git state",
+				);
+			}
+			effective = {
+				directory,
+				mode: "worktree",
+				git,
+				worktree: {
+					path: record.worktree.destination,
+					baseRef: record.worktree.selectedBaseRef,
+					baseCommit: record.worktree.selectedBaseCommit,
+				},
+			};
+		} catch (error) {
+			return this.failWorktree(
+				record,
+				error instanceof ManagedWorktreeError ? error.code : "OPERATION_RETAINED",
+				error instanceof Error ? error.message : String(error),
+			);
+		}
+		if (record.phase === "worktree_created") {
+			record = this.journal.update(record.operationId, (current) => ({
+				...current,
+				phase: "worktree_ready",
+				updatedAt: Date.now(),
+			})) as Extract<ProjectStartOperationRecord, { mode: "worktree" }>;
+		}
+		record = this.journal.update(record.operationId, (current) => ({
+			...current,
+			phase: "launch_requested",
+			updatedAt: Date.now(),
+		})) as Extract<ProjectStartOperationRecord, { mode: "worktree" }>;
+		let launched: RunResult;
+		try {
+			const { resumeSessionId: _resumeSessionId, ...freshOptions } = options;
+			launched = await launch(
+				{ ...freshOptions, workspace: effective.directory },
+				{ originProjectPath: record.originProjectPath, execution: effective },
+			);
+		} catch (error) {
+			return this.failWorktree(
+				record,
+				"RUNTIME_LAUNCH_FAILED",
+				error instanceof Error ? error.message : String(error),
+				effective,
+				error instanceof ExecutorStartError ? error.sessionId : undefined,
+			);
+		}
+		const result: RunResult = {
+			...launched,
+			operationId: record.operationId,
+			originProjectPath: record.originProjectPath,
+			execution: effective,
+		};
+		this.journal.update(record.operationId, (current) => ({
+			...current,
+			phase: "session_started",
+			updatedAt: Date.now(),
+			result,
+		}));
+		return result;
+	}
+
+	private failManagedBeforeCreation(
+		record: Extract<ProjectStartOperationRecord, { mode: "worktree" }>,
+		error: unknown,
+	): never {
+		const code = error instanceof ManagedWorktreeError ? error.code : "WORKTREE_CREATE_FAILED";
+		const message = error instanceof Error ? error.message : String(error);
+		const details: ProjectStartFailureDetails = {
+			operationId: record.operationId,
+			phase: "failed",
+			originProjectPath: record.originProjectPath,
+		};
+		const failure = { code, message, details };
+		this.journal.update(record.operationId, (current) => ({
+			...current,
+			phase: "failed",
+			updatedAt: Date.now(),
+			failure,
+		}));
+		throw new ProjectStartError(code, message, details);
+	}
+
+	private failWorktree(
+		record: Extract<ProjectStartOperationRecord, { mode: "worktree" }>,
+		code: string,
+		message: string,
+		effectiveState?: SessionExecutionState,
+		createdSessionId?: string,
+		retainPath = true,
+	): never {
+		const details: ProjectStartFailureDetails = {
+			operationId: record.operationId,
+			phase: "retained",
+			originProjectPath: record.originProjectPath,
+			...(retainPath ? { retainedWorktreePath: record.worktree.destination } : {}),
+			...(record.requestedBranch ? { retainedBranch: record.requestedBranch } : {}),
+			...(effectiveState ? { effectiveState } : {}),
+			...(createdSessionId ? { createdSessionId } : {}),
+		};
+		const failure = { code, message, details };
+		this.journal.update(record.operationId, (current) => ({
+			...current,
+			phase: "retained",
+			updatedAt: Date.now(),
+			failure,
+		}));
+		throw new ProjectStartError(code, message, details);
 	}
 
 	private async createAndActivateBranch(
@@ -827,6 +1144,7 @@ export class ProjectStartCoordinator {
 			mode: "project_folder",
 			directory: record.originProjectPath,
 			git,
+			worktree: null,
 		};
 	}
 
@@ -863,9 +1181,9 @@ export class ProjectStartCoordinator {
 		if (
 			typeof request.operationId !== "string" ||
 			request.operationId.length === 0 ||
-			request.mode !== "project_folder" ||
 			typeof request.originProjectPath !== "string" ||
-			!isAbsolute(request.originProjectPath)
+			!isAbsolute(request.originProjectPath) ||
+			(request.mode !== "project_folder" && request.mode !== "worktree")
 		) {
 			throw new ProjectStartError("INVALID_PROJECT_START", "Invalid project start request");
 		}
@@ -886,7 +1204,44 @@ export class ProjectStartCoordinator {
 		if (!preparation || typeof preparation !== "object") {
 			throw new ProjectStartError("INVALID_PROJECT_START", "Invalid project preparation");
 		}
-		let normalizedPreparation: ProjectStartRequest["preparation"];
+		if (request.mode === "worktree") {
+			if (
+				preparation.type !== "create_worktree" ||
+				typeof preparation.baseRef !== "string" ||
+				!(
+					/^refs\/heads\/[^\s]+$/u.test(preparation.baseRef) ||
+					/^refs\/remotes\/[^/\s]+\/[^\s]+$/u.test(preparation.baseRef)
+				) ||
+				preparation.baseRef.endsWith("/HEAD") ||
+				typeof preparation.expectedCommit !== "string" ||
+				!/^[0-9a-fA-F]{40,64}$/u.test(preparation.expectedCommit) ||
+				!(
+					preparation.newBranch === null ||
+					(typeof preparation.newBranch === "string" && preparation.newBranch.length > 0)
+				)
+			) {
+				throw new ProjectStartError("INVALID_PROJECT_START", "Invalid worktree preparation");
+			}
+			return {
+				...options,
+				workspace: originProjectPath,
+				projectStart: {
+					operationId: request.operationId,
+					originProjectPath,
+					mode: "worktree",
+					preparation: {
+						type: "create_worktree",
+						baseRef: preparation.baseRef,
+						expectedCommit: preparation.expectedCommit.toLowerCase(),
+						newBranch: preparation.newBranch,
+					},
+				},
+			};
+		}
+		let normalizedPreparation: Extract<
+			ProjectStartRequest,
+			{ mode: "project_folder" }
+		>["preparation"];
 		if (preparation.type === "none") {
 			if (
 				"newBranch" in preparation ||
@@ -1048,6 +1403,22 @@ export class ProjectStartCoordinator {
 
 	private gitFailure(message: string): ProjectStartError {
 		return new ProjectStartError("GIT_COMMAND_FAILED", message);
+	}
+
+	private mapManagedError(error: unknown): ProjectStartError {
+		if (error instanceof ManagedWorktreeError) {
+			return new ProjectStartError(error.code, error.message);
+		}
+		return new ProjectStartError(
+			"WORKTREE_DESTINATION_UNAVAILABLE",
+			error instanceof Error ? error.message : String(error),
+		);
+	}
+
+	private mapManagedGitError(error: unknown): ProjectStartError {
+		return error instanceof ManagedWorktreeError
+			? new ProjectStartError(error.code, error.message)
+			: this.mapGitError(error);
 	}
 
 	private async withRepositoryLock<T>(key: string, task: () => Promise<T>): Promise<T> {

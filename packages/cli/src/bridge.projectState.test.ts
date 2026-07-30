@@ -951,8 +951,12 @@ describe("bridge project state", { timeout: 30000 }, () => {
 		}
 	});
 
-	it("forwards fresh project start success with origin and effective state", async () => {
+	it("forwards Worktree truth and continues the returned session without another start", async () => {
 		let startPayload: JsonRecord | null = null;
+		let startCount = 0;
+		let inputCount = 0;
+		const worktreePath = join(tempRepoDir, "managed", "worktree-1");
+		const effectiveDirectory = join(worktreePath, "packages", "nested");
 		uplinkWss.on("connection", (socket) => {
 			socket.on("message", (raw) => {
 				const command = JSON.parse(raw.toString()) as JsonRecord;
@@ -990,6 +994,7 @@ describe("bridge project state", { timeout: 30000 }, () => {
 					return;
 				}
 				if (type === "start_run") {
+					startCount += 1;
 					startPayload = command["payload"] as JsonRecord;
 					socket.send(
 						JSON.stringify({
@@ -1001,11 +1006,32 @@ describe("bridge project state", { timeout: 30000 }, () => {
 								operationId: "operation-success",
 								originProjectPath: tempRepoDir,
 								execution: {
-									directory: tempRepoDir,
-									mode: "project_folder",
-									git: null,
+									directory: effectiveDirectory,
+									mode: "worktree",
+									git: {
+										repositoryRoot: worktreePath,
+										head: "a".repeat(40),
+										branch: null,
+										detached: true,
+									},
+									worktree: {
+										path: worktreePath,
+										baseRef: "refs/heads/main",
+										baseCommit: "a".repeat(40),
+									},
 								},
 							},
+						}),
+					);
+					return;
+				}
+				if (type === "send_input") {
+					inputCount += 1;
+					socket.send(
+						JSON.stringify({
+							type: "input_sent",
+							requestId: command["requestId"],
+							payload: { sessionId: "project-session" },
 						}),
 					);
 				}
@@ -1035,12 +1061,16 @@ describe("bridge project state", { timeout: 30000 }, () => {
 						type: "new_session",
 						runtime: "opencode",
 						prompt: "fresh project start",
-						resumeSessionId: "ses_explicit_should_be_ignored",
 						projectStart: {
 							operationId: "operation-success",
 							originProjectPath: tempRepoDir,
-							mode: "project_folder",
-							preparation: { type: "none" },
+							mode: "worktree",
+							preparation: {
+								type: "create_worktree",
+								baseRef: "refs/heads/main",
+								expectedCommit: "a".repeat(40),
+								newBranch: null,
+							},
 						},
 					},
 				}),
@@ -1067,7 +1097,11 @@ describe("bridge project state", { timeout: 30000 }, () => {
 				success: true,
 				sessionId: "project-session",
 				originProjectPath: tempRepoDir,
-				execution: { directory: tempRepoDir, mode: "project_folder", git: null },
+				execution: {
+					directory: effectiveDirectory,
+					mode: "worktree",
+					worktree: { path: worktreePath, baseRef: "refs/heads/main" },
+				},
 			});
 			const projected = received
 				.filter((message) => message["type"] === "session_list")
@@ -1075,8 +1109,21 @@ describe("bridge project state", { timeout: 30000 }, () => {
 				.find((session) => session["id"] === "project-session");
 			expect(projected).toMatchObject({
 				originProjectPath: tempRepoDir,
-				execution: { directory: tempRepoDir, mode: "project_folder", git: null },
+				workspace: effectiveDirectory,
+				execution: {
+					directory: effectiveDirectory,
+					mode: "worktree",
+					worktree: { path: worktreePath, baseRef: "refs/heads/main" },
+				},
 			});
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "send_prompt", sessionId: "project-session", prompt: "continue" },
+				}),
+			);
+			await waitForCondition(() => inputCount === 1, 15_000);
+			expect(startCount).toBe(1);
 		} finally {
 			mobileSocket?.close();
 			await bridge.stop();
