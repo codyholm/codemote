@@ -7,7 +7,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import type {
 	ProjectStartFailureDetails,
 	ProjectStartPhase,
@@ -101,11 +101,6 @@ function absolutePath(value: unknown, field: string): string {
 	const path = requiredString(value, field);
 	if (!isAbsolute(path)) invalid(`Invalid journal field: ${field}`);
 	return resolve(path);
-}
-
-function contains(parent: string, child: string): boolean {
-	const path = relative(parent, child);
-	return path === "" || (!path.startsWith("..") && !isAbsolute(path));
 }
 
 function timestamp(value: unknown, field: string): number {
@@ -262,6 +257,24 @@ function parseFailure(value: unknown): ProjectStartJournalFailure {
 	return failure;
 }
 
+function isConsistentWorktreeExecution(
+	record: ManagedWorktreeOperationRecord,
+	execution: SessionExecutionState,
+): boolean {
+	return (
+		execution.mode === "worktree" &&
+		execution.directory ===
+			resolve(record.worktree.destination, record.worktree.projectRelativePath) &&
+		execution.worktree.path === record.worktree.destination &&
+		execution.worktree.baseRef === record.worktree.selectedBaseRef &&
+		execution.worktree.baseCommit === record.worktree.selectedBaseCommit &&
+		execution.git.repositoryRoot === record.worktree.destination &&
+		execution.git.head === record.worktree.selectedBaseCommit &&
+		execution.git.branch === record.requestedBranch &&
+		execution.git.detached === (record.requestedBranch === null)
+	);
+}
+
 function parseRecord(value: unknown): ProjectStartOperationRecord {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		return invalid("Invalid project start operation record");
@@ -382,17 +395,7 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 			invalid("Successful journal record has an inconsistent execution directory");
 		}
 		if (record.mode === "worktree") {
-			if (
-				execution.mode !== "worktree" ||
-				!contains(record.worktree.destination, execution.directory) ||
-				execution.worktree.path !== record.worktree.destination ||
-				execution.worktree.baseRef !== record.worktree.selectedBaseRef ||
-				execution.worktree.baseCommit !== record.worktree.selectedBaseCommit ||
-				execution.git.repositoryRoot !== record.worktree.destination ||
-				execution.git.head !== record.worktree.selectedBaseCommit ||
-				execution.git.branch !== record.requestedBranch ||
-				execution.git.detached !== (record.requestedBranch === null)
-			) {
+			if (!isConsistentWorktreeExecution(record, execution)) {
 				invalid("Successful Worktree journal record has inconsistent ownership");
 			}
 		} else if (record.repositoryRoot === null) {
@@ -444,17 +447,31 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 	if (
 		record.mode === "worktree" &&
 		record.failure?.details?.effectiveState &&
-		record.failure.details.effectiveState.mode !== "worktree"
+		!isConsistentWorktreeExecution(record, record.failure.details.effectiveState)
 	) {
-		invalid("Terminal Worktree record has an inconsistent execution mode");
+		invalid("Terminal Worktree record has inconsistent ownership");
 	}
 	if (
 		record.mode === "worktree" &&
-		record.failure?.details?.effectiveState?.mode === "worktree" &&
-		(!contains(record.worktree.destination, record.failure.details.effectiveState.directory) ||
-			record.failure.details.effectiveState.worktree.path !== record.worktree.destination)
+		record.phase === "failed" &&
+		record.failure?.details &&
+		(record.failure.details.retainedBranch !== undefined ||
+			record.failure.details.retainedWorktreePath !== undefined ||
+			record.failure.details.effectiveState !== undefined ||
+			record.failure.details.createdSessionId !== undefined)
 	) {
-		invalid("Terminal Worktree record has inconsistent ownership");
+		invalid("Failed Worktree record claims retained resources");
+	}
+	if (record.mode === "worktree" && record.phase === "retained" && record.failure?.details) {
+		const details = record.failure.details;
+		if (
+			(record.requestedBranch === null && details.retainedWorktreePath === undefined) ||
+			((details.effectiveState !== undefined || details.createdSessionId !== undefined) &&
+				details.retainedWorktreePath === undefined) ||
+			(details.retainedBranch === undefined && details.retainedWorktreePath === undefined)
+		) {
+			invalid("Retained Worktree record is missing retained resource ownership");
+		}
 	}
 	return record;
 }

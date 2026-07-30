@@ -336,6 +336,42 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		expect(launches).toBe(0);
 	});
 
+	it("fails an attached worktree start when its requested branch already exists", async () => {
+		const repository = await makeGitProject("existing-worktree-branch-repo");
+		const inspected = await coordinator().inspect(repository);
+		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		await git(repository, ["branch", "feature/already-exists"]);
+		const options = worktreeRequest(
+			repository,
+			"worktree-existing-branch",
+			base.ref,
+			base.commit,
+			"feature/already-exists",
+		);
+		let launches = 0;
+
+		const failure = await expectStartError(
+			coordinator().start(
+				options,
+				launcher(sessions, () => {
+					launches++;
+				}),
+			),
+			"BRANCH_EXISTS",
+		);
+
+		expect(failure.details?.phase).toBe("failed");
+		expect(failure.details?.retainedBranch).toBeUndefined();
+		expect(failure.details?.retainedWorktreePath).toBeUndefined();
+		expect(journal.get("worktree-existing-branch")?.phase).toBe("failed");
+		expect(await git(repository, ["worktree", "list", "--porcelain"])).not.toContain(
+			join(fixtureRoot, "managed"),
+		);
+		expect(launches).toBe(0);
+		expect(sessions.list()).toHaveLength(0);
+	});
+
 	it("ignores poisoned Git repository and config redirection variables", async () => {
 		const registered = await makeGitProject("registered");
 		const unrelated = await makeGitProject("unrelated");

@@ -645,6 +645,12 @@ export class ProjectStartCoordinator {
 					record.requestedBranch,
 				);
 			} catch (error) {
+				if (
+					error instanceof ManagedWorktreeError &&
+					(error.code === "INVALID_BRANCH" || error.code === "BRANCH_EXISTS")
+				) {
+					return this.failManagedBeforeCreation(record, error);
+				}
 				let pathExists = false;
 				try {
 					await lstat(record.worktree.destination);

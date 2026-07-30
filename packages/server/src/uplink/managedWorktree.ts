@@ -221,11 +221,33 @@ export class ManagedWorktreeService {
 				"Managed destination is inside a checkout or Git metadata",
 			);
 		}
-		const unrelated = await this.runGit(ancestor, ["rev-parse", "--show-toplevel"]);
+		const unrelated = await this.runGit(ancestor, [
+			"rev-parse",
+			"--is-inside-work-tree",
+			"--is-inside-git-dir",
+			"--is-bare-repository",
+		]);
 		if (unrelated.exitCode === 0) {
+			const membership = line(unrelated.stdout).split(/\r?\n/u);
+			if (
+				membership.length !== 3 ||
+				membership.some((value) => value !== "true" && value !== "false")
+			) {
+				throw new ManagedWorktreeError(
+					"WORKTREE_DESTINATION_UNAVAILABLE",
+					"Git returned invalid destination membership state",
+				);
+			}
+			if (!membership.includes("true")) return;
 			throw new ManagedWorktreeError(
 				"UNSAFE_WORKTREE_DESTINATION",
 				"Managed destination is inside an unrelated repository",
+			);
+		}
+		if (unrelated.exitCode !== 128) {
+			throw new ManagedWorktreeError(
+				"WORKTREE_DESTINATION_UNAVAILABLE",
+				"Git could not validate the managed destination",
 			);
 		}
 	}

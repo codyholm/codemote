@@ -185,4 +185,25 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 			code: "WORKTREE_PROJECT_PATH_UNSAFE",
 		});
 	});
+
+	it("rejects managed roots inside unrelated Git metadata and bare repositories", async () => {
+		const unrelated = join(fixtureRoot, "unrelated-metadata");
+		await mkdir(unrelated);
+		await git(["init", "-b", "main"], unrelated);
+		const metadataRoot = join(unrelated, ".git", "objects", "codemote");
+		const metadataService = new ManagedWorktreeService(runGitCommand, metadataRoot);
+
+		await expect(
+			metadataService.plan(repository, repository, "inside-git-metadata"),
+		).rejects.toMatchObject({ code: "UNSAFE_WORKTREE_DESTINATION" });
+
+		const bare = join(fixtureRoot, "unrelated-bare.git");
+		await git(["init", "--bare", bare], fixtureRoot);
+		const bareRoot = join(bare, "objects", "codemote");
+		const bareService = new ManagedWorktreeService(runGitCommand, bareRoot);
+
+		await expect(
+			bareService.plan(repository, repository, "inside-bare-repository"),
+		).rejects.toMatchObject({ code: "UNSAFE_WORKTREE_DESTINATION" });
+	});
 });
