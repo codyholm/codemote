@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { platform, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { ProjectStartState, RunOptions, RunResult } from "@codemote/common";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -142,6 +142,7 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 			runtimes: [],
 			projectRegistryPath: registryPath,
 			projectStartJournalPath: journalPath,
+			managedWorktreeRoot: join(fixtureRoot, "managed"),
 		});
 		const internals = server as unknown as ServerInternals;
 		controlled = new ControlledExecutor(
@@ -197,6 +198,30 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		};
 	}
 
+	function worktreeStartPayload(
+		operationId: string,
+		baseRef: string,
+		expectedCommit: string,
+		newBranch: string | null = null,
+	): Record<string, unknown> {
+		return {
+			profile: "codex",
+			workspace: project,
+			initialPrompt: "managed worktree",
+			projectStart: {
+				operationId,
+				originProjectPath: project,
+				mode: "worktree",
+				preparation: {
+					type: "create_worktree",
+					baseRef,
+					expectedCommit,
+					newBranch,
+				},
+			},
+		};
+	}
+
 	it("correlates Git and non-Git capability inspection", async () => {
 		const gitState = await state();
 		expect(gitState.originProjectPath).toBe(project);
@@ -229,6 +254,34 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		expect(projectAware.type).toBe("run_started");
 		expect((projectAware.payload as RunResult).execution?.git).toBeNull();
 		expect(controlled.starts).toBe(2);
+	});
+
+	it("starts one managed worktree beneath the configured root and continues it by session ID", async () => {
+		const current = await state();
+		const base = current.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const started = await client.request(
+			{ type: "start_run", payload: worktreeStartPayload("worktree-start", base.ref, base.commit) },
+			"worktree-start",
+		);
+		expect(started.type).toBe("run_started");
+		const result = started.payload as RunResult;
+		if (result.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+		expect(await realpath(dirname(result.execution.worktree.path))).toBe(
+			await realpath(join(fixtureRoot, "managed")),
+		);
+		expect(result.execution.directory).toBe(result.execution.worktree.path);
+		expect(result.execution.git.detached).toBe(true);
+		expect(await git(project, ["branch", "--show-current"])).toBe("main");
+		expect(controlled.starts).toBe(1);
+
+		const input = await client.request(
+			{ type: "send_input", payload: { sessionId: result.sessionId, input: "continue" } },
+			"worktree-input",
+		);
+		expect(input.type).toBe("input_sent");
+		expect(controlled.inputs).toBe(1);
+		expect(controlled.starts).toBe(1);
 	});
 
 	it("creates a branch, returns effective state, replays success, and sends input without preparation", async () => {

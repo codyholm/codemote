@@ -3,7 +3,12 @@ import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/
 import { platform, tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import type { ProjectStartRequest, RunOptions, RunResult } from "@codemote/common";
+import type {
+	ProjectFolderStartPreparation,
+	ProjectStartRequest,
+	RunOptions,
+	RunResult,
+} from "@codemote/common";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ExecutorStartError } from "./executor.js";
 import { ProjectRegistry } from "./projectRegistry.js";
@@ -61,6 +66,7 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 			journal,
 			registry,
 			sessionManager: sessions,
+			managedWorktreeRoot: join(fixtureRoot, "managed"),
 			...overrides,
 		});
 	}
@@ -68,7 +74,7 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 	function request(
 		project: string,
 		operationId: string,
-		preparation: ProjectStartRequest["preparation"] = { type: "none" },
+		preparation: ProjectFolderStartPreparation = { type: "none" },
 		overrides: Partial<RunOptions> = {},
 	): RunOptions {
 		return {
@@ -100,6 +106,31 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		};
 	}
 
+	function worktreeRequest(
+		project: string,
+		operationId: string,
+		baseRef: string,
+		expectedCommit: string,
+		newBranch: string | null = null,
+	): RunOptions {
+		return {
+			profile: "codex",
+			workspace: project,
+			initialPrompt: "Test the managed worktree",
+			projectStart: {
+				operationId,
+				originProjectPath: project,
+				mode: "worktree",
+				preparation: {
+					type: "create_worktree",
+					baseRef,
+					expectedCommit,
+					newBranch,
+				},
+			},
+		};
+	}
+
 	async function expectStartError(
 		action: Promise<unknown> | (() => unknown | Promise<unknown>),
 		code: ProjectStartError["code"],
@@ -118,7 +149,7 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 	function branchPreparation(
 		state: Awaited<ReturnType<ProjectStartCoordinator["inspect"]>>,
 		newBranch: string,
-	): ProjectStartRequest["preparation"] {
+	): ProjectFolderStartPreparation {
 		if (!state.git?.head) throw new Error("Expected committed Git fixture");
 		return {
 			type: "create_branch",
@@ -150,6 +181,7 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 			mode: "project_folder",
 			directory: nonGit,
 			git: null,
+			worktree: null,
 		});
 		const nestedState = await service.inspect(nested);
 		expect(nestedState.originProjectPath).toBe(nested);
@@ -157,6 +189,151 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		expect(nestedState.git?.repositoryRoot).toBe(await git(repo, ["rev-parse", "--show-toplevel"]));
 		expect(nestedState.git?.branch).toBe("main");
 		expect(await git(repo, ["status", "--porcelain=v1"])).toBe("");
+	});
+
+	it("launches detached and attached managed worktrees with origin and effective truth", async () => {
+		const repository = await makeGitProject("worktree-repo");
+		const nested = join(repository, "packages", "nested");
+		await mkdir(nested, { recursive: true });
+		await writeFile(join(nested, "committed.txt"), "nested\n");
+		await git(repository, ["add", "."]);
+		await git(repository, ["commit", "--no-gpg-sign", "-m", "nested"]);
+		registry.add("Nested worktree", nested);
+		await writeFile(join(repository, "tracked.txt"), "dirty\n");
+		await writeFile(join(repository, "untracked.txt"), "local\n");
+		await writeFile(join(repository, "ignored.txt"), "ignored-local\n");
+		const sourceHead = await git(repository, ["rev-parse", "HEAD"]);
+		const state = await coordinator().inspect(nested);
+		const base = state.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const launches: Array<{ options: RunOptions; context: SessionStartContext }> = [];
+		const service = coordinator();
+		const first = await service.start(
+			worktreeRequest(nested, "worktree-detached", base.ref, base.commit),
+			launcher(sessions, (options, context) => launches.push({ options, context })),
+		);
+
+		expect(first.originProjectPath).toBe(nested);
+		expect(first.execution?.mode).toBe("worktree");
+		if (first.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+		expect(first.execution.directory).toBe(
+			join(first.execution.worktree.path, "packages", "nested"),
+		);
+		expect(first.execution.git.head).toBe(sourceHead);
+		expect(first.execution.git.detached).toBe(true);
+		expect(launches[0]?.options.workspace).toBe(first.execution.directory);
+		expect(launches[0]?.options.resumeSessionId).toBeUndefined();
+		expect(launches[0]?.context.originProjectPath).toBe(nested);
+		expect(await git(repository, ["rev-parse", "HEAD"])).toBe(sourceHead);
+		expect(await readFile(join(repository, "tracked.txt"), "utf8")).toBe("dirty\n");
+		await expect(
+			readFile(join(first.execution.worktree.path, "untracked.txt"), "utf8"),
+		).rejects.toThrow();
+		await expect(
+			readFile(join(first.execution.worktree.path, "ignored.txt"), "utf8"),
+		).rejects.toThrow();
+		expect(
+			await service.start(
+				worktreeRequest(nested, "worktree-detached", base.ref, base.commit),
+				launcher(),
+			),
+		).toEqual(first);
+
+		const attached = await service.start(
+			worktreeRequest(repository, "worktree-attached", base.ref, base.commit, "feature/managed"),
+			launcher(),
+		);
+		if (attached.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+		expect(attached.execution.git.branch).toBe("feature/managed");
+		expect(attached.execution.git.detached).toBe(false);
+		expect(await git(repository, ["branch", "--show-current"])).toBe("main");
+	});
+
+	it("retains a created worktree when mapping or runtime launch fails", async () => {
+		const repository = await makeGitProject("retained-worktree-repo");
+		const missingNested = join(repository, "packages", "not-committed");
+		await mkdir(missingNested, { recursive: true });
+		registry.add("Missing nested", missingNested);
+		const inspected = await coordinator().inspect(missingNested);
+		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		let launches = 0;
+		await expectStartError(
+			coordinator().start(
+				worktreeRequest(
+					repository,
+					"worktree-stale-base",
+					base.ref,
+					"0".repeat(base.commit.length),
+				),
+				async () => {
+					launches += 1;
+					throw new Error("must not launch");
+				},
+			),
+			"STALE_WORKTREE_BASE",
+		);
+		expect(launches).toBe(0);
+		const mappingError = await expectStartError(
+			coordinator().start(
+				worktreeRequest(missingNested, "worktree-mapping-failure", base.ref, base.commit),
+				async () => {
+					launches += 1;
+					throw new Error("must not launch");
+				},
+			),
+			"WORKTREE_PROJECT_PATH_MISSING",
+		);
+		expect(launches).toBe(0);
+		expect(mappingError.details?.retainedWorktreePath).toBeTruthy();
+		expect(journal.get("worktree-mapping-failure")?.phase).toBe("retained");
+
+		const launchService = coordinator();
+		const launchError = await expectStartError(
+			launchService.start(
+				worktreeRequest(repository, "worktree-launch-failure", base.ref, base.commit),
+				async () => {
+					throw new ExecutorStartError("Runtime unavailable", "run-created", "session-created");
+				},
+			),
+			"RUNTIME_LAUNCH_FAILED",
+		);
+		expect(launchError.details).toMatchObject({
+			phase: "retained",
+			createdSessionId: "session-created",
+		});
+		expect(launchError.details?.retainedWorktreePath).toBeTruthy();
+	});
+
+	it("retains an interrupted prepared worktree for restart reconciliation", async () => {
+		const repository = await makeGitProject("interrupted-worktree-repo");
+		const inspected = await coordinator().inspect(repository);
+		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const options = worktreeRequest(
+			repository,
+			"worktree-interrupted-ready",
+			base.ref,
+			base.commit,
+		);
+		const first = await coordinator().start(options, launcher());
+		if (first.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+		rewritePhase("worktree-interrupted-ready", "worktree_ready");
+		let launches = 0;
+
+		const retained = await expectStartError(
+			coordinator({ sessionManager: new SessionManager() }).start(
+				options,
+				launcher(new SessionManager(), () => {
+					launches++;
+				}),
+			),
+			"OPERATION_RETAINED",
+		);
+
+		expect(retained.details?.retainedWorktreePath).toBe(first.execution.worktree.path);
+		expect(journal.get("worktree-interrupted-ready")?.phase).toBe("retained");
+		expect(launches).toBe(0);
 	});
 
 	it("ignores poisoned Git repository and config redirection variables", async () => {
@@ -244,6 +421,7 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 					mode: "project_folder",
 					directory: nonGit,
 					git: null,
+					worktree: null,
 				});
 			} finally {
 				for (const [key, value] of Object.entries(inherited)) {

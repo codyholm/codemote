@@ -179,5 +179,58 @@ describe("decodeMobileInbound", () => {
 			});
 			expect(decodeMobileInbound({ type: "get_project_start_state", projectPath: "" })).toBeNull();
 		});
+
+		it("accepts strict detached and attached Worktree requests", () => {
+			const worktree = {
+				operationId: "worktree-1",
+				originProjectPath: "/tmp/project",
+				mode: "worktree",
+				preparation: {
+					type: "create_worktree",
+					baseRef: "refs/remotes/origin/main",
+					expectedCommit: "a".repeat(40),
+					newBranch: null,
+				},
+			};
+			expect(decodeMobileInbound({ ...base, projectStart: worktree })).toMatchObject({
+				projectStart: worktree,
+			});
+			expect(
+				decodeMobileInbound({
+					...base,
+					projectStart: {
+						...worktree,
+						preparation: { ...worktree.preparation, newBranch: "feature/mobile" },
+					},
+				}),
+			).toMatchObject({
+				projectStart: { preparation: { newBranch: "feature/mobile" } },
+			});
+		});
+
+		it("rejects malformed Worktree fields", () => {
+			const preparation = {
+				type: "create_worktree",
+				baseRef: "refs/heads/main",
+				expectedCommit: "b".repeat(40),
+				newBranch: null,
+			};
+			const worktree = {
+				operationId: "worktree-1",
+				originProjectPath: "/tmp/project",
+				mode: "worktree",
+				preparation,
+			};
+			for (const projectStart of [
+				{ ...worktree, originProjectPath: "relative" },
+				{ ...worktree, preparation: { ...preparation, baseRef: "main" } },
+				{ ...worktree, preparation: { ...preparation, baseRef: "refs/remotes/origin/HEAD" } },
+				{ ...worktree, preparation: { ...preparation, expectedCommit: "short" } },
+				{ ...worktree, preparation: { ...preparation, newBranch: "" } },
+				{ ...worktree, preparation: { ...preparation, unexpected: true } },
+			]) {
+				expect(decodeMobileInbound({ ...base, projectStart })).toBeNull();
+			}
+		});
 	});
 });

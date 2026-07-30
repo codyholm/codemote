@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	type ProjectFolderStartOperationRecord,
 	ProjectStartJournal,
 	ProjectStartJournalError,
 	type ProjectStartOperationRecord,
@@ -23,8 +24,8 @@ describe("ProjectStartJournal", () => {
 	});
 
 	function record(
-		overrides: Partial<ProjectStartOperationRecord> = {},
-	): ProjectStartOperationRecord {
+		overrides: Partial<ProjectFolderStartOperationRecord> = {},
+	): ProjectFolderStartOperationRecord {
 		return {
 			operationId: "operation-1",
 			fingerprint: "fingerprint-1",
@@ -198,6 +199,66 @@ describe("ProjectStartJournal", () => {
 				},
 			}).failure,
 		);
+	});
+
+	it("round trips internally consistent Worktree ownership and retained state", () => {
+		const origin = join(fixtureDir, "source", "packages", "nested");
+		const repositoryRoot = join(fixtureDir, "source");
+		const destination = join(fixtureDir, "managed", "source-operation");
+		const journal = new ProjectStartJournal(journalPath);
+		journal.create({
+			operationId: "worktree-1",
+			fingerprint: "fingerprint-worktree",
+			mode: "worktree",
+			originProjectPath: origin,
+			runtime: "codex",
+			repositoryRoot,
+			observedHead: "abc123",
+			observedBranch: "main",
+			requestedBranch: "feature/worktree",
+			worktree: {
+				destination,
+				selectedBaseRef: "refs/heads/main",
+				selectedBaseCommit: "abc123",
+				projectRelativePath: join("packages", "nested"),
+			},
+			phase: "retained",
+			createdAt: 1000,
+			updatedAt: 2000,
+			failure: {
+				code: "RUNTIME_LAUNCH_FAILED",
+				message: "Runtime failed",
+				details: {
+					operationId: "worktree-1",
+					phase: "retained",
+					originProjectPath: origin,
+					retainedBranch: "feature/worktree",
+					retainedWorktreePath: destination,
+					effectiveState: {
+						directory: join(destination, "packages", "nested"),
+						mode: "worktree",
+						git: {
+							repositoryRoot: destination,
+							head: "abc123",
+							branch: "feature/worktree",
+							detached: false,
+						},
+						worktree: {
+							path: destination,
+							baseRef: "refs/heads/main",
+							baseCommit: "abc123",
+						},
+					},
+				},
+			},
+		});
+
+		expect(new ProjectStartJournal(journalPath).get("worktree-1")).toMatchObject({
+			mode: "worktree",
+			phase: "retained",
+			worktree: { destination, projectRelativePath: join("packages", "nested") },
+			failure: { details: { retainedWorktreePath: destination } },
+		});
 	});
 
 	it("writes private parent and file permissions where supported", async () => {

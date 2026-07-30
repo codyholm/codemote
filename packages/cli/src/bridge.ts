@@ -1,7 +1,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { WebSocket } from "ws";
 
 import { decodeBase64, decrypt, encodeBase64, encrypt, generateKeyPair } from "./encryption.js";
@@ -1613,7 +1613,7 @@ export async function startRelayUplinkBridge(
 		const originProjectPath = started.payload.originProjectPath ?? existing?.originProjectPath;
 		const execution = started.payload.execution ?? existing?.execution;
 		const workspacePath =
-			existing?.workspace ?? execution?.directory ?? workspace ?? projectStart?.originProjectPath;
+			execution?.directory ?? existing?.workspace ?? workspace ?? projectStart?.originProjectPath;
 		sessions.set(sessionId, {
 			id: sessionId,
 			runtime,
@@ -2465,8 +2465,8 @@ function decodeProjectStartRequest(value: unknown): ProjectStartRequest | null {
 		typeof operationId !== "string" ||
 		operationId.length === 0 ||
 		typeof originProjectPath !== "string" ||
-		originProjectPath.length === 0 ||
-		candidate["mode"] !== "project_folder" ||
+		!isAbsolute(originProjectPath) ||
+		(candidate["mode"] !== "project_folder" && candidate["mode"] !== "worktree") ||
 		typeof preparationValue !== "object" ||
 		preparationValue === null ||
 		Array.isArray(preparationValue)
@@ -2475,6 +2475,39 @@ function decodeProjectStartRequest(value: unknown): ProjectStartRequest | null {
 	}
 
 	const preparation = preparationValue as Record<string, unknown>;
+	if (candidate["mode"] === "worktree") {
+		if (
+			preparation["type"] !== "create_worktree" ||
+			typeof preparation["baseRef"] !== "string" ||
+			!(
+				/^refs\/heads\/[^\s]+$/u.test(preparation["baseRef"]) ||
+				/^refs\/remotes\/[^/\s]+\/[^\s]+$/u.test(preparation["baseRef"])
+			) ||
+			preparation["baseRef"].endsWith("/HEAD") ||
+			typeof preparation["expectedCommit"] !== "string" ||
+			!/^[0-9a-fA-F]{40,64}$/u.test(preparation["expectedCommit"]) ||
+			!(
+				preparation["newBranch"] === null ||
+				(typeof preparation["newBranch"] === "string" && preparation["newBranch"].length > 0)
+			) ||
+			Object.keys(preparation).some(
+				(key) => !["type", "baseRef", "expectedCommit", "newBranch"].includes(key),
+			)
+		) {
+			return null;
+		}
+		return {
+			operationId,
+			originProjectPath,
+			mode: "worktree",
+			preparation: {
+				type: "create_worktree",
+				baseRef: preparation["baseRef"],
+				expectedCommit: preparation["expectedCommit"],
+				newBranch: preparation["newBranch"],
+			},
+		};
+	}
 	if (preparation["type"] === "none") {
 		if (
 			"newBranch" in preparation ||
