@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, stat } from "node:fs/promises";
+import { lstat, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import type {
@@ -18,6 +18,7 @@ import {
 	ManagedWorktreeService,
 	type ManagedWorktreeTruth,
 	type RecordedManagedWorktree,
+	containedIn,
 } from "./managedWorktree.js";
 import type { ProjectRegistry } from "./projectRegistry.js";
 import type {
@@ -424,13 +425,7 @@ export class ProjectStartCoordinator {
 	private async restoreDurableSession(record: ProjectStartOperationRecord): Promise<void> {
 		const durable = record.session;
 		if (!durable) return;
-		try {
-			if (!(await stat(durable.execution.directory)).isDirectory()) return;
-		} catch {
-			// The recorded directory no longer resolves safely; the journal keeps the
-			// human-readable mapping and replay still names it.
-			return;
-		}
+		if (!(await this.resolvesToRecordedDirectory(durable.execution))) return;
 		const workspace = this.workspaceManager.restore({
 			id: durable.workspaceId,
 			workingDir: durable.execution.directory,
@@ -451,6 +446,36 @@ export class ProjectStartCoordinator {
 			execution: durable.execution,
 		});
 		this.bindRuntimeSessionPersistence(record.operationId, durable.sessionId);
+	}
+
+	/**
+	 * Prove the recorded effective directory is still the same real directory
+	 * before anything is rehydrated against it.
+	 *
+	 * A path that has become a symlink is refused outright: restoring it would
+	 * publish a session, workspace and diff surface pointing wherever the link
+	 * now leads. A Worktree record additionally carries canonical paths by
+	 * construction, so its directory must both resolve to itself and stay inside
+	 * the recorded worktree root. Refusing costs only discovery — the recorded
+	 * result still replays and names the path.
+	 */
+	private async resolvesToRecordedDirectory(execution: SessionExecutionState): Promise<boolean> {
+		try {
+			if ((await lstat(execution.directory)).isSymbolicLink()) return false;
+			if (!(await stat(execution.directory)).isDirectory()) return false;
+			if (execution.mode !== "worktree") return true;
+			const canonicalDirectory = await realpath(execution.directory);
+			const canonicalRoot = await realpath(execution.worktree.path);
+			return (
+				canonicalDirectory === execution.directory &&
+				canonicalRoot === execution.worktree.path &&
+				containedIn(canonicalRoot, canonicalDirectory)
+			);
+		} catch {
+			// The recorded directory no longer resolves safely; the journal keeps the
+			// human-readable mapping and replay still names it.
+			return false;
+		}
 	}
 
 	start(options: RunOptions, launch: LaunchProjectSession): Promise<RunResult> {
@@ -1043,7 +1068,7 @@ export class ProjectStartCoordinator {
 			case "branch_only":
 				return "The requested branch exists without its worktree; nothing was reused or deleted";
 			case "absent":
-				return "The recorded worktree is no longer present; nothing was reused or deleted";
+				return "The recorded worktree is no longer present; nothing was reused or deleted. Start again to prepare a new one";
 			default:
 				return "The recorded worktree was retained";
 		}
@@ -1057,7 +1082,11 @@ export class ProjectStartCoordinator {
 	private failFromTruth(record: WorktreeOperationRecord, truth: ManagedWorktreeTruth): never {
 		const message = this.describeTruth(truth);
 		if (truth.status === "absent") {
-			return this.failTerminal(record, "OPERATION_RETAINED", message);
+			// Nothing survives, so this is a changed machine rather than retained
+			// state: `OPERATION_RETAINED` would send the phone to inspect a
+			// directory that is gone, while this code already reads as
+			// "project changed, refresh and start again".
+			return this.failTerminal(record, "STALE_PROJECT_STATE", message);
 		}
 		return this.failWorktree(
 			record,

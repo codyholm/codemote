@@ -80,7 +80,8 @@ function line(value: string): string {
 	return value.replace(/[\r\n]+$/u, "");
 }
 
-function contained(parent: string, child: string): boolean {
+/** Whether `child` is `parent` itself or lies beneath it, on canonical paths. */
+export function containedIn(parent: string, child: string): boolean {
 	const path = relative(parent, child);
 	return path === "" || (!path.startsWith("..") && !isAbsolute(path));
 }
@@ -208,7 +209,7 @@ export class ManagedWorktreeService {
 	): Promise<ManagedWorktreePlan> {
 		const canonicalRepository = await realpath(repositoryRoot);
 		const canonicalOrigin = await realpath(originProjectPath);
-		if (!contained(canonicalRepository, canonicalOrigin)) {
+		if (!containedIn(canonicalRepository, canonicalOrigin)) {
 			throw new ManagedWorktreeError(
 				"WORKTREE_PROJECT_PATH_UNSAFE",
 				"Registered project is outside its source repository",
@@ -261,7 +262,7 @@ export class ManagedWorktreeService {
 			if (field.startsWith("worktree "))
 				unsafe.push(await realpath(field.slice("worktree ".length)));
 		}
-		if (unsafe.some((path) => contained(path, canonicalDestination))) {
+		if (unsafe.some((path) => containedIn(path, canonicalDestination))) {
 			throw new ManagedWorktreeError(
 				"UNSAFE_WORKTREE_DESTINATION",
 				"Managed destination is inside a checkout or Git metadata",
@@ -379,6 +380,17 @@ export class ManagedWorktreeService {
 					};
 				}
 				return { status: "branch_only" };
+			}
+
+			// The directory is gone but Git still registers it. Say exactly that,
+			// rather than letting the next command fail on the missing directory and
+			// report an unhelpful inspection error. Nothing here removes the stale
+			// registration; clearing it is the owner's call.
+			if (!canonicalDestination) {
+				return {
+					status: "changed",
+					reason: `The recorded worktree directory ${recorded.destination} is missing while ${recorded.repositoryRoot} still registers it; \`git worktree prune\` clears the stale registration once you are sure the directory is gone for good`,
+				};
 			}
 
 			const mismatch = this.registrationMismatch(recorded, registered, branchRef, tip);
@@ -528,7 +540,7 @@ export class ManagedWorktreeService {
 		}
 		const canonicalRoot = await realpath(destination);
 		const canonicalProject = await realpath(candidate);
-		if (!contained(canonicalRoot, canonicalProject)) {
+		if (!containedIn(canonicalRoot, canonicalProject)) {
 			throw new ManagedWorktreeError(
 				"WORKTREE_PROJECT_PATH_UNSAFE",
 				"Registered project path escapes the managed worktree",

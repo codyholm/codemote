@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -1513,7 +1513,7 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		expect(journal.get("legacy-success")?.phase).toBe("session_started");
 	});
 
-	it("reports a vanished worktree as failed instead of claiming to retain it", async () => {
+	it("reports a vanished worktree as a changed project rather than retained state", async () => {
 		const repository = await makeGitProject("vanished-worktree-repo");
 		const inspected = await coordinator().inspect(repository);
 		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
@@ -1527,7 +1527,51 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		await git(repository, ["worktree", "prune"]);
 		let launches = 0;
 
+		// Nothing of this operation survives, so the phone must be told the project
+		// changed, not sent to inspect retained state that does not exist.
 		const failure = await expectStartError(
+			coordinator({
+				sessionManager: new SessionManager(),
+				workspaceManager: new WorkspaceManager(fixtureRoot),
+			}).start(
+				options,
+				launcher(new SessionManager(), () => {
+					launches++;
+				}),
+			),
+			"STALE_PROJECT_STATE",
+		);
+
+		expect(launches).toBe(0);
+		expect(failure.details).toEqual({
+			operationId: "worktree-vanished",
+			phase: "failed",
+			originProjectPath: repository,
+		});
+		expect(journal.get("worktree-vanished")?.phase).toBe("failed");
+	});
+
+	it("names a stale registration when the worktree directory was deleted without pruning", async () => {
+		const repository = await makeGitProject("stale-registration-repo");
+		const inspected = await coordinator().inspect(repository);
+		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const options = worktreeRequest(
+			repository,
+			"worktree-stale-registration",
+			base.ref,
+			base.commit,
+			"feature/stale-registration",
+		);
+		const first = await coordinator().start(options, launcher());
+		if (first.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+		const destination = first.execution.worktree.path;
+
+		rewritePhase("worktree-stale-registration", "worktree_ready");
+		await rm(destination, { recursive: true, force: true });
+		let launches = 0;
+
+		const retained = await expectStartError(
 			coordinator({
 				sessionManager: new SessionManager(),
 				workspaceManager: new WorkspaceManager(fixtureRoot),
@@ -1541,13 +1585,100 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		);
 
 		expect(launches).toBe(0);
-		// Nothing of this operation survives, so nothing may be reported as kept.
-		expect(failure.details).toEqual({
-			operationId: "worktree-vanished",
-			phase: "failed",
-			originProjectPath: repository,
+		expect(retained.message).toContain(destination);
+		expect(retained.message).toContain("still registers it");
+		expect(retained.message).not.toContain("Failed to inspect local Git refs");
+		expect(retained.details?.retainedWorktreePath).toBe(destination);
+		// Fail closed: the stale registration and the branch are left exactly as found.
+		expect(await worktreeRegistrations(repository, destination)).toBe(1);
+		expect(
+			await git(repository, ["rev-parse", "--verify", "refs/heads/feature/stale-registration"]),
+		).toBe(base.commit);
+	});
+
+	it("refuses to restore a completed session through a substituted symlink", async () => {
+		const repo = await makeGitProject("symlink-restore");
+		const options = request(repo, "symlink-restore");
+		const completed = await coordinator().start(options, launcher());
+
+		// A valid, unchanged directory restores.
+		const goodSessions = new SessionManager();
+		const goodWorkspaces = new WorkspaceManager(fixtureRoot);
+		await coordinator({
+			sessionManager: goodSessions,
+			workspaceManager: goodWorkspaces,
+		}).reconcileOnStartup();
+		expect(goodSessions.get(completed.sessionId)?.status).toBe("ended");
+		expect(goodWorkspaces.list()).toHaveLength(1);
+
+		// Replace the recorded directory with a link to somewhere else entirely.
+		const substitute = join(fixtureRoot, "substitute");
+		await mkdir(substitute, { recursive: true });
+		await rm(repo, { recursive: true, force: true });
+		await symlink(substitute, repo);
+
+		const restartedSessions = new SessionManager();
+		const restartedWorkspaces = new WorkspaceManager(fixtureRoot);
+		const restarted = coordinator({
+			sessionManager: restartedSessions,
+			workspaceManager: restartedWorkspaces,
 		});
-		expect(journal.get("worktree-vanished")?.phase).toBe("failed");
+		await restarted.reconcileOnStartup();
+
+		expect(restartedSessions.list()).toHaveLength(0);
+		expect(restartedWorkspaces.list()).toHaveLength(0);
+		// The recorded result still replays and still names the recorded path.
+		let launches = 0;
+		const replay = await restarted.start(
+			options,
+			launcher(restartedSessions, () => {
+				launches++;
+			}),
+		);
+		expect(replay).toEqual(completed);
+		expect(launches).toBe(0);
+	});
+
+	it("restores a completed Worktree session only while its directory stays inside the worktree", async () => {
+		const repository = await makeGitProject("worktree-restore");
+		const nested = join(repository, "packages", "nested");
+		await mkdir(nested, { recursive: true });
+		await writeFile(join(nested, "committed.txt"), "nested\n", "utf8");
+		await git(repository, ["add", "."]);
+		await git(repository, ["commit", "--no-gpg-sign", "-m", "nested"]);
+		registry.add("Nested restore", nested);
+		const inspected = await coordinator().inspect(nested);
+		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const options = worktreeRequest(nested, "worktree-restore", base.ref, base.commit);
+		const completed = await coordinator().start(options, launcher());
+		if (completed.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+
+		const goodSessions = new SessionManager();
+		await coordinator({
+			sessionManager: goodSessions,
+			workspaceManager: new WorkspaceManager(fixtureRoot),
+		}).reconcileOnStartup();
+		const restored = goodSessions.get(completed.sessionId);
+		expect(restored?.status).toBe("ended");
+		expect(restored?.execution?.directory).toBe(completed.execution.directory);
+		expect(restored?.originProjectPath).toBe(nested);
+
+		// Point the mapped project directory outside the recorded worktree.
+		const outside = join(fixtureRoot, "outside-worktree");
+		await mkdir(outside, { recursive: true });
+		await rm(completed.execution.directory, { recursive: true, force: true });
+		await symlink(outside, completed.execution.directory);
+
+		const escapedSessions = new SessionManager();
+		const escapedWorkspaces = new WorkspaceManager(fixtureRoot);
+		await coordinator({
+			sessionManager: escapedSessions,
+			workspaceManager: escapedWorkspaces,
+		}).reconcileOnStartup();
+
+		expect(escapedSessions.list()).toHaveLength(0);
+		expect(escapedWorkspaces.list()).toHaveLength(0);
 	});
 
 	it("retains a version-1 launch boundary that could already have entered the runtime", async () => {

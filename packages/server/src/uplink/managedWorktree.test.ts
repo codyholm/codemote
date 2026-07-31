@@ -237,6 +237,43 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		expect(await failing.inspectRecorded(recorded)).toMatchObject({ status: "uncertain" });
 	});
 
+	it("classifies a deleted directory that Git still registers, without pruning it", async () => {
+		const commit = await git(["rev-parse", "HEAD"]);
+		const service = new ManagedWorktreeService(runGitCommand, managedRoot);
+		const plan = await service.plan(repository, repository, "stale");
+		const recorded = {
+			repositoryRoot: repository,
+			destination: plan.destination,
+			selectedBaseRef: "refs/heads/main",
+			selectedBaseCommit: commit,
+			projectRelativePath: plan.projectRelativePath,
+			requestedBranch: "feature/stale",
+		};
+		await service.create(repository, recorded.destination, commit, recorded.requestedBranch);
+
+		// Deleted the way a person does it: `rm -rf`, no `git worktree prune`.
+		await rm(recorded.destination, { recursive: true, force: true });
+		const truth = await service.inspectRecorded(recorded);
+
+		// Not absent — Git still holds the registration — and the reason has to name
+		// the path and the condition, not surface a generic inspection failure.
+		expect(truth.status).toBe("changed");
+		if (truth.status !== "changed") throw new Error("Expected changed truth");
+		expect(truth.reason).toContain(recorded.destination);
+		expect(truth.reason).toContain(repository);
+		expect(truth.reason).toContain("git worktree prune");
+		expect(truth.reason).not.toContain("Failed to inspect local Git refs");
+
+		// Inspection is read-only: the registration and branch survive untouched.
+		expect(await git(["worktree", "list", "--porcelain"])).toContain(recorded.destination);
+		expect(await git(["rev-parse", "--verify", "refs/heads/feature/stale"])).toBe(commit);
+
+		// Rollback still refuses, because the proof cannot pass.
+		expect(await service.rollbackExact(recorded)).toMatchObject({ status: "retained" });
+		expect(await git(["worktree", "list", "--porcelain"])).toContain(recorded.destination);
+		expect(await git(["rev-parse", "--verify", "refs/heads/feature/stale"])).toBe(commit);
+	});
+
 	it("removes only an exact clean worktree and only its unmoved branch", async () => {
 		const commit = await git(["rev-parse", "HEAD"]);
 		const service = new ManagedWorktreeService(runGitCommand, managedRoot);
