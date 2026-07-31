@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { platform, tmpdir } from "node:os";
@@ -72,9 +73,16 @@ class ControlledExecutor extends BaseExecutor {
 	readonly type = "codex" as const;
 	starts = 0;
 	inputs = 0;
+	/** Identity the base executor handed to runtime-specific code, in order. */
+	readonly started: Array<{ sessionId: string; runId: string; workspaceId: string }> = [];
 
-	protected async doStartRun(_session: Session, options: RunOptions): Promise<void> {
+	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
 		this.starts++;
+		this.started.push({
+			sessionId: session.id,
+			runId: session.runId,
+			workspaceId: session.workspace.id,
+		});
 		if (options.initialPrompt === "fail launch") throw new Error("Controlled launch failure");
 	}
 
@@ -167,6 +175,31 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 			maxBuffer: 64 * 1024,
 		});
 		return result.stdout.trim();
+	}
+
+	function readJournal(): { version: number; operations: Array<Record<string, unknown>> } {
+		return JSON.parse(readFileSync(journalPath, "utf8")) as {
+			version: number;
+			operations: Array<Record<string, unknown>>;
+		};
+	}
+
+	/**
+	 * Leave the journal at the durable state an interruption at `phase` would
+	 * have produced, dropping what that phase could not yet have recorded.
+	 */
+	function rewindTo(operationId: string, phase: string): Record<string, unknown> {
+		const file = readJournal();
+		let rewound: Record<string, unknown> | undefined;
+		file.operations = file.operations.map((operation) => {
+			if (operation["operationId"] !== operationId) return operation;
+			const { result: _result, ...rest } = operation;
+			rewound = { ...rest, phase };
+			return rewound;
+		});
+		if (!rewound) throw new Error(`Operation not found in journal: ${operationId}`);
+		writeFileSync(journalPath, JSON.stringify(file), "utf8");
+		return rewound;
 	}
 
 	/**
@@ -645,6 +678,95 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		expect(sessions[0]?.execution?.directory).toBe(firstResult.execution.directory);
 		expect(sessions[0]?.originProjectPath).toBe(project);
 		expect(await git(project, ["branch", "--show-current"])).toBe("main");
+	});
+
+	it("relaunches a recorded session through the real executor exactly once after restart", async () => {
+		const payload = startPayload(
+			"session-recorded-restart",
+			"prepared",
+			{ type: "none" },
+			plainProject,
+		);
+		const first = await client.request({ type: "start_run", payload }, "session-recorded-first");
+		const firstResult = first.payload as RunResult;
+		expect(first.type).toBe("run_started");
+
+		// Rewind to the boundary where the session identity was durable but the
+		// runtime call had not been made, exactly as an interruption leaves it.
+		await server.stop();
+		const recorded = rewindTo("session-recorded-restart", "session_recorded");
+		const durable = recorded["session"] as {
+			sessionId: string;
+			runId: string;
+			workspaceId: string;
+		};
+		expect(durable.sessionId).toBe(firstResult.sessionId);
+
+		const { client: restartedClient, executor } = await restartServer({ stopExisting: false });
+		const resumed = await restartedClient.request(
+			{ type: "start_run", payload },
+			"session-recorded-resume",
+		);
+
+		expect(resumed.type).toBe("run_started");
+		const resumedResult = resumed.payload as RunResult;
+		expect(resumedResult.sessionId).toBe(durable.sessionId);
+		expect(resumedResult.runId).toBe(durable.runId);
+		// The base executor reused the recorded identity rather than allocating a
+		// new one, and entered runtime code exactly once.
+		expect(executor.starts).toBe(1);
+		expect(executor.started).toEqual([
+			{
+				sessionId: durable.sessionId,
+				runId: durable.runId,
+				workspaceId: durable.workspaceId,
+			},
+		]);
+
+		const sessions = (
+			await restartedClient.request({ type: "list_sessions" }, "session-recorded-sessions")
+		).payload as Session[];
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0]?.id).toBe(durable.sessionId);
+		expect(sessions[0]?.workspace.id).toBe(durable.workspaceId);
+
+		// Both durable callbacks were crossed in order: the journal's own
+		// transition rules admit `session_started` only by way of
+		// `runtime_launch_requested`, which in turn requires `session_recorded`.
+		const journal = readJournal();
+		expect(journal.operations).toHaveLength(1);
+		expect(journal.operations[0]?.["phase"]).toBe("session_started");
+		expect(journal.operations[0]?.["session"]).toMatchObject(durable);
+	});
+
+	it("discards the session when a durable launch boundary cannot be written", async () => {
+		const payload = startPayload(
+			"boundary-write-failure",
+			"prepared",
+			{ type: "none" },
+			plainProject,
+		);
+		await client.request({ type: "start_run", payload }, "boundary-first");
+
+		await server.stop();
+		rewindTo("boundary-write-failure", "session_recorded");
+		const { client: restartedClient, executor } = await restartServer({ stopExisting: false });
+		// Make the next journal write fail while the executor is mid-launch.
+		await mkdir(`${journalPath}.tmp`, { recursive: true });
+
+		const response = await restartedClient.request(
+			{ type: "start_run", payload },
+			"boundary-write-failure",
+		);
+
+		expect(response.type).toBe("error");
+		expect((response.payload as { code: string }).code).toBe("PROJECT_START_JOURNAL_IO");
+		// Runtime code never ran, and no phantom session was left discoverable.
+		expect(executor.starts).toBe(0);
+		const sessions = (
+			await restartedClient.request({ type: "list_sessions" }, "boundary-write-sessions")
+		).payload as Session[];
+		expect(sessions).toHaveLength(0);
 	});
 
 	it("retains a worktree whose runtime launch may already have started, across restart", async () => {

@@ -352,6 +352,17 @@ export class ManagedWorktreeService {
 		try {
 			const registrations = await this.listRegistrations(recorded.repositoryRoot);
 			const canonicalDestination = await this.canonicalOrNull(recorded.destination);
+			const normalizedDestination = resolve(recorded.destination);
+			// The recorded destination is canonical by construction, so a path that
+			// now resolves elsewhere is a substitution — even when it lands on
+			// another registered worktree at the same commit and branch. Adopting,
+			// launching into or removing through it would act on the wrong checkout.
+			if (canonicalDestination !== null && canonicalDestination !== normalizedDestination) {
+				return {
+					status: "changed",
+					reason: `The recorded worktree destination ${normalizedDestination} now resolves to ${canonicalDestination}`,
+				};
+			}
 			const registered = await this.findRegistration(
 				registrations,
 				recorded.destination,

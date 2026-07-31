@@ -237,6 +237,42 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		expect(await failing.inspectRecorded(recorded)).toMatchObject({ status: "uncertain" });
 	});
 
+	it("refuses to treat a destination symlinked onto another worktree as exact", async () => {
+		const commit = await git(["rev-parse", "HEAD"]);
+		const service = new ManagedWorktreeService(runGitCommand, managedRoot);
+		const recordedPlan = await service.plan(repository, repository, "recorded");
+		const otherPlan = await service.plan(repository, repository, "other");
+		const recorded = {
+			repositoryRoot: repository,
+			destination: recordedPlan.destination,
+			selectedBaseRef: "refs/heads/main",
+			selectedBaseCommit: commit,
+			projectRelativePath: recordedPlan.projectRelativePath,
+			requestedBranch: null,
+		};
+		// Two registered worktrees of the same repository, detached at the same
+		// commit: by every value except identity, they look interchangeable.
+		await service.create(repository, recorded.destination, commit, null);
+		await service.create(repository, otherPlan.destination, commit, null);
+		expect(await service.inspectRecorded(recorded)).toMatchObject({ status: "exact" });
+
+		await rm(recorded.destination, { recursive: true, force: true });
+		await symlink(otherPlan.destination, recorded.destination);
+		const truth = await service.inspectRecorded(recorded);
+
+		expect(truth.status).toBe("changed");
+		if (truth.status !== "changed") throw new Error("Expected changed truth");
+		expect(truth.reason).toContain(recorded.destination);
+		expect(truth.reason).toContain(otherPlan.destination);
+
+		// Rollback must not act through the link: the other worktree, its
+		// registration and its contents are untouched.
+		expect(await service.rollbackExact(recorded)).toMatchObject({ status: "retained" });
+		expect(existsSync(otherPlan.destination)).toBe(true);
+		expect(await git(["worktree", "list", "--porcelain"])).toContain(otherPlan.destination);
+		expect(await git(["rev-parse", "HEAD"], otherPlan.destination)).toBe(commit);
+	});
+
 	it("classifies a deleted directory that Git still registers, without pruning it", async () => {
 		const commit = await git(["rev-parse", "HEAD"]);
 		const service = new ManagedWorktreeService(runGitCommand, managedRoot);

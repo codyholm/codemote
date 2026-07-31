@@ -312,6 +312,27 @@ function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** Terminate a fragment so a composed failure message reads as prose. */
+function sentence(text: string): string {
+	const trimmed = text.trim();
+	return /[.!?]$/u.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+/**
+ * Why an otherwise exact worktree still cannot be removed. Ordered so the
+ * caller hears the most specific reason first.
+ */
+function rollbackBlockedBy(
+	truth: Extract<ManagedWorktreeTruth, { status: "exact" }>,
+): string | null {
+	if (!truth.mapping.ok) return truth.mapping.message;
+	if (!truth.selectedBaseMatches) {
+		return "the selected base no longer resolves to the recorded commit";
+	}
+	if (!truth.clean) return "it contains local changes";
+	return null;
+}
+
 function terminalError(failure: ProjectStartJournalFailure): ProjectStartError {
 	return new ProjectStartError(failure.code, failure.message, failure.details);
 }
@@ -1078,9 +1099,20 @@ export class ProjectStartCoordinator {
 	 * End an operation on inspection truth that cannot advance, naming only the
 	 * resources that actually exist: a provably absent worktree retains nothing,
 	 * and branch-only residue retains the branch rather than a missing path.
+	 *
+	 * `prefix` carries the failure that brought the operation here — a runtime
+	 * launch error, say — so the caller reads both what went wrong and what the
+	 * machine found when it looked.
 	 */
-	private failFromTruth(record: WorktreeOperationRecord, truth: ManagedWorktreeTruth): never {
-		const message = this.describeTruth(truth);
+	private failFromTruth(
+		record: WorktreeOperationRecord,
+		truth: ManagedWorktreeTruth,
+		code = "OPERATION_RETAINED",
+		prefix?: string,
+	): never {
+		const message = prefix
+			? `${sentence(prefix)} ${this.describeTruth(truth)}`
+			: this.describeTruth(truth);
 		if (truth.status === "absent") {
 			// Nothing survives, so this is a changed machine rather than retained
 			// state: `OPERATION_RETAINED` would send the phone to inspect a
@@ -1090,7 +1122,7 @@ export class ProjectStartCoordinator {
 		}
 		return this.failWorktree(
 			record,
-			"OPERATION_RETAINED",
+			code,
 			message,
 			undefined,
 			undefined,
@@ -1108,13 +1140,19 @@ export class ProjectStartCoordinator {
 		message: string,
 	): Promise<never> {
 		const truth = await this.managedWorktrees.inspectRecorded(this.recordedWorktree(record));
-		if (
-			truth.status !== "exact" ||
-			!truth.mapping.ok ||
-			!truth.selectedBaseMatches ||
-			!truth.clean
-		) {
-			return this.failWorktree(record, code, message);
+		// The same reporting rules as any other non-advancing truth: name only the
+		// resources that exist, and say what the inspection found rather than
+		// leaving the caller with the launch error alone.
+		if (truth.status !== "exact") {
+			return this.failFromTruth(record, truth, code, message);
+		}
+		const blocked = rollbackBlockedBy(truth);
+		if (blocked) {
+			return this.failWorktree(
+				record,
+				code,
+				`${sentence(message)} The worktree at ${record.worktree.destination} was kept: ${blocked}`,
+			);
 		}
 		const requested = this.journal.update(record.operationId, (current) => ({
 			...current,

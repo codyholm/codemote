@@ -666,6 +666,63 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		}
 	});
 
+	it("reports what the rollback window actually found when the worktree is already gone", async () => {
+		const repository = await makeGitProject("rollback-window-repo");
+		const inspected = await coordinator().inspect(repository);
+		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+
+		// The worktree disappears between preparation and the failed launch, so the
+		// rollback proof runs against nothing.
+		const vanished = await expectStartError(
+			coordinator().start(
+				worktreeRequest(repository, "rollback-window-absent", base.ref, base.commit),
+				failBeforeSession(async (directory) => {
+					await rm(directory, { recursive: true, force: true });
+					await git(repository, ["worktree", "prune"]);
+				}),
+			),
+			"STALE_PROJECT_STATE",
+		);
+
+		expect(vanished.message).toContain("Runtime binary is missing");
+		expect(vanished.message).toContain("no longer present");
+		expect(vanished.details).toEqual({
+			operationId: "rollback-window-absent",
+			phase: "failed",
+			originProjectPath: repository,
+		});
+		expect(journal.get("rollback-window-absent")?.phase).toBe("failed");
+
+		// Only the request-owned branch survives: retain that, not a missing path.
+		const branchOnly = await expectStartError(
+			coordinator().start(
+				worktreeRequest(
+					repository,
+					"rollback-window-branch",
+					base.ref,
+					base.commit,
+					"feature/rollback-window",
+				),
+				failBeforeSession(async (directory) => {
+					await rm(directory, { recursive: true, force: true });
+					await git(repository, ["worktree", "prune"]);
+				}),
+			),
+			"RUNTIME_LAUNCH_FAILED",
+		);
+
+		expect(branchOnly.message).toContain("Runtime binary is missing");
+		expect(branchOnly.message).toContain("branch exists without its worktree");
+		expect(branchOnly.details?.retainedBranch).toBe("feature/rollback-window");
+		expect(branchOnly.details?.retainedWorktreePath).toBeUndefined();
+		// Nothing was deleted on this path, so the branch is still where it was.
+		expect(
+			await git(repository, ["rev-parse", "--verify", "refs/heads/feature/rollback-window"]),
+		).toBe(base.commit);
+		expect(journal.get("rollback-window-branch")?.phase).toBe("retained");
+	});
+
 	it("finishes an interrupted rollback from durable intent and retains a moved branch", async () => {
 		const repository = await makeGitProject("rollback-resume-repo");
 		const inspected = await coordinator().inspect(repository);
