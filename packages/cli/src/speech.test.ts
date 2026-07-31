@@ -4,9 +4,11 @@ import { type Server, createServer } from "node:net";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { type SpeechConfig, type SpeechServerHandle, createSpeechServer } from "@codemote/server";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type ServerHandle, startServer } from "./server.js";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ServerConfig, ServerHandle } from "./server.js";
 import { runSpeechSubcommand } from "./speech.js";
+
+type StartServer = (config: ServerConfig) => Promise<ServerHandle>;
 
 function makeWav(frames: number): Buffer {
 	const payload = Buffer.alloc(frames * 2);
@@ -36,6 +38,10 @@ describe.skipIf(platform() === "win32")("codemote speech", { timeout: 30000 }, (
 	let logs: string[];
 	let errors: string[];
 	let stubs: { kokoroBin: string; whisperBin: string; playerBin: string; modelDir: string };
+	let suiteMachineStateDir: string | null = null;
+	let originalHome: string | undefined;
+	let originalUserProfile: string | undefined;
+	let startServerImplementation: StartServer | null = null;
 
 	async function writeStub(name: string, body: string): Promise<string> {
 		const path = join(testDir, name);
@@ -43,6 +49,31 @@ describe.skipIf(platform() === "win32")("codemote speech", { timeout: 30000 }, (
 		await chmod(path, 0o755);
 		return path;
 	}
+
+	beforeAll(async () => {
+		originalHome = process.env["HOME"];
+		originalUserProfile = process.env["USERPROFILE"];
+		suiteMachineStateDir = await mkdtemp(join(tmpdir(), "cli-speech-suite-"));
+		process.env["HOME"] = suiteMachineStateDir;
+		process.env["USERPROFILE"] = suiteMachineStateDir;
+		({ startServer: startServerImplementation } = await import("./server.js"));
+	});
+
+	afterAll(async () => {
+		if (originalHome === undefined) {
+			Reflect.deleteProperty(process.env, "HOME");
+		} else {
+			process.env["HOME"] = originalHome;
+		}
+		if (originalUserProfile === undefined) {
+			Reflect.deleteProperty(process.env, "USERPROFILE");
+		} else {
+			process.env["USERPROFILE"] = originalUserProfile;
+		}
+		if (suiteMachineStateDir) {
+			await rm(suiteMachineStateDir, { recursive: true, force: true });
+		}
+	});
 
 	beforeEach(async () => {
 		servers = [];
@@ -218,6 +249,21 @@ exit 0`,
 		let handle: ServerHandle | null = null;
 		let blocker: Server | null = null;
 
+		async function startCombinedServer(port: number): Promise<ServerHandle> {
+			if (!suiteMachineStateDir || !startServerImplementation) {
+				throw new Error("Speech suite machine state is not initialized");
+			}
+			return startServerImplementation({
+				port,
+				repoPath: testDir,
+				pairingStorePath: join(testDir, "trusted-pairings.json"),
+				projectRegistryPath: join(testDir, "projects.json"),
+				projectStartJournalPath: join(testDir, "project-start-operations.json"),
+				managedWorktreeRoot: join(testDir, "managed-worktrees"),
+				tlsDir: join(testDir, "tls"),
+			});
+		}
+
 		afterEach(async () => {
 			if (handle) {
 				await handle.stop();
@@ -230,7 +276,7 @@ exit 0`,
 		});
 
 		it("starts the speech service on the relay port plus two", async () => {
-			handle = await startServer({ port: relayPort });
+			handle = await startCombinedServer(relayPort);
 
 			const discovery = JSON.parse(await readFile(discoveryFilePath, "utf8")) as {
 				port: number;
@@ -245,7 +291,7 @@ exit 0`,
 			blocker = createServer();
 			await new Promise<void>((resolve) => blocker?.listen(relayPort + 12, "127.0.0.1", resolve));
 
-			handle = await startServer({ port: relayPort + 10 });
+			handle = await startCombinedServer(relayPort + 10);
 
 			expect(handle.pin).toMatch(/^\d{6}$/);
 			expect(logs.join("\n")).toContain("[Server] Speech service unavailable:");
@@ -258,7 +304,7 @@ exit 0`,
 			vi.stubEnv("CODEMOTE_SPEECH_PORT", "not-a-port");
 			vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-			handle = await startServer({ port: relayPort + 30 });
+			handle = await startCombinedServer(relayPort + 30);
 
 			const discovery = JSON.parse(await readFile(discoveryFilePath, "utf8")) as { port: number };
 			expect(discovery.port).toBe(relayPort + 32);
@@ -267,7 +313,7 @@ exit 0`,
 		it("skips the speech service entirely when CODEMOTE_SPEECH=0", async () => {
 			vi.stubEnv("CODEMOTE_SPEECH", "0");
 
-			handle = await startServer({ port: relayPort + 20 });
+			handle = await startCombinedServer(relayPort + 20);
 
 			expect(handle.pin).toMatch(/^\d{6}$/);
 			expect(logs.join("\n")).not.toContain("Speech service");
