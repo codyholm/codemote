@@ -198,14 +198,31 @@ export class ManagedWorktreeService {
 		if (!isSelectableBaseRef(ref) || ref.endsWith("/HEAD")) {
 			throw new ManagedWorktreeError("INVALID_WORKTREE_BASE", "Worktree base must be a branch ref");
 		}
-		const result = await this.runGit(repositoryRoot, ["rev-parse", "--verify", `${ref}^{commit}`]);
-		if (result.exitCode !== 0 || !line(result.stdout)) {
+		const result = await this.runGit(repositoryRoot, [
+			"for-each-ref",
+			"--format=%(refname)%00%(objectname)%00%(objecttype)%00%(symref)",
+			ref,
+		]);
+		const exact = result.stdout
+			.split("\n")
+			.filter((row) => row.length > 0)
+			.map((row) => row.split("\0"))
+			.filter(([actualRef]) => actualRef === ref);
+		const [actualRef, commit, objectType, symref = ""] = exact[0] ?? [];
+		if (
+			result.exitCode !== 0 ||
+			exact.length !== 1 ||
+			actualRef !== ref ||
+			objectType !== "commit" ||
+			!commit ||
+			symref !== ""
+		) {
 			throw new ManagedWorktreeError(
 				"INVALID_WORKTREE_BASE",
 				`Worktree base is unavailable: ${ref}`,
 			);
 		}
-		return line(result.stdout);
+		return commit;
 	}
 
 	async plan(
@@ -213,6 +230,12 @@ export class ManagedWorktreeService {
 		originProjectPath: string,
 		operationId: string,
 	): Promise<ManagedWorktreePlan> {
+		if (!isAbsolute(this.managedRoot)) {
+			throw new ManagedWorktreeError(
+				"UNSAFE_WORKTREE_DESTINATION",
+				"Managed worktree root must be an absolute path",
+			);
+		}
 		const canonicalRepository = await realpath(repositoryRoot);
 		const canonicalOrigin = await realpath(originProjectPath);
 		if (!containedIn(canonicalRepository, canonicalOrigin)) {

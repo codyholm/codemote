@@ -136,12 +136,28 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		expect(state.defaultBaseRef).toBeNull();
 	});
 
-	it("rejects stale bases, collisions, unrelated repository roots, and missing mappings", async () => {
+	it("resolves only exact locally known branch refs", async () => {
 		const service = new ManagedWorktreeService(runGitCommand, managedRoot);
 		const commit = await git(["rev-parse", "HEAD"]);
+		await expect(service.resolveBase(repository, "refs/heads/main")).resolves.toBe(commit);
 		await expect(service.resolveBase(repository, "refs/tags/missing")).rejects.toMatchObject({
 			code: "INVALID_WORKTREE_BASE",
 		});
+		await expect(service.resolveBase(repository, "refs/heads/main~0")).rejects.toMatchObject({
+			code: "INVALID_WORKTREE_BASE",
+		});
+	});
+
+	it("rejects a relative managed worktree root", async () => {
+		const relativeRoot = new ManagedWorktreeService(runGitCommand, "relative-managed-root");
+		await expect(relativeRoot.plan(repository, repository, "relative-root")).rejects.toMatchObject({
+			code: "UNSAFE_WORKTREE_DESTINATION",
+		});
+	});
+
+	it("rejects stale bases, collisions, unrelated repository roots, and missing mappings", async () => {
+		const service = new ManagedWorktreeService(runGitCommand, managedRoot);
+		const commit = await git(["rev-parse", "HEAD"]);
 		const invalidBranch = await service.plan(repository, repository, "invalid-branch");
 		await expect(
 			service.create(repository, invalidBranch.destination, commit, "invalid branch"),
