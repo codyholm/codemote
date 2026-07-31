@@ -53,7 +53,13 @@ export type ManagedWorktreeTruth =
 	| { status: "absent" }
 	/** Registration and directory are provably gone; the exact branch remains. */
 	| { status: "branch_only" }
-	| { status: "changed"; reason: string }
+	/**
+	 * `retainsDestination` is false only when the recorded destination is provably
+	 * gone: no directory, no registration naming it, nothing for the owner to
+	 * inspect there. A caller reporting retained resources must not name the path
+	 * in that case, though a surviving branch is still worth naming.
+	 */
+	| { status: "changed"; reason: string; retainsDestination: boolean }
 	| { status: "uncertain"; reason: string }
 	| {
 			status: "exact";
@@ -361,6 +367,7 @@ export class ManagedWorktreeService {
 				return {
 					status: "changed",
 					reason: `The recorded worktree destination ${normalizedDestination} now resolves to ${canonicalDestination}`,
+					retainsDestination: true,
 				};
 			}
 			const registered = await this.findRegistration(
@@ -375,12 +382,15 @@ export class ManagedWorktreeService {
 					return {
 						status: "changed",
 						reason: `A directory exists at ${recorded.destination} without a matching worktree registration`,
+						retainsDestination: true,
 					};
 				}
 				if (registrations.some((entry) => branchRef !== null && entry.branch === branchRef)) {
 					return {
 						status: "changed",
 						reason: `The requested branch is checked out in another worktree: ${recorded.requestedBranch}`,
+						// Destination absent and unregistered: only the branch survives.
+						retainsDestination: false,
 					};
 				}
 				if (tip === null) return { status: "absent" };
@@ -388,6 +398,8 @@ export class ManagedWorktreeService {
 					return {
 						status: "changed",
 						reason: `The requested branch moved away from the recorded commit: ${recorded.requestedBranch}`,
+						// Destination absent and unregistered: only the branch survives.
+						retainsDestination: false,
 					};
 				}
 				return { status: "branch_only" };
@@ -401,17 +413,20 @@ export class ManagedWorktreeService {
 				return {
 					status: "changed",
 					reason: `The recorded worktree directory ${recorded.destination} is missing while ${recorded.repositoryRoot} still registers it; \`git worktree prune\` clears the stale registration once you are sure the directory is gone for good`,
+					// The stale registration still names the path, so it is inspectable.
+					retainsDestination: true,
 				};
 			}
 
 			const mismatch = this.registrationMismatch(recorded, registered, branchRef, tip);
-			if (mismatch) return { status: "changed", reason: mismatch };
+			if (mismatch) return { status: "changed", reason: mismatch, retainsDestination: true };
 			const common = await this.commonGitDirectory(recorded.destination);
 			const sourceCommon = await this.commonGitDirectory(recorded.repositoryRoot);
 			if (common !== sourceCommon) {
 				return {
 					status: "changed",
 					reason: "The recorded worktree belongs to a different repository",
+					retainsDestination: true,
 				};
 			}
 

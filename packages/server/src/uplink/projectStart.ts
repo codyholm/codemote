@@ -1120,14 +1120,12 @@ export class ProjectStartCoordinator {
 			// "project changed, refresh and start again".
 			return this.failTerminal(record, "STALE_PROJECT_STATE", message);
 		}
-		return this.failWorktree(
-			record,
-			code,
-			message,
-			undefined,
-			undefined,
-			truth.status !== "branch_only",
-		);
+		// `changed` spans both a destination the owner can still inspect and one
+		// that is provably gone with only its branch left elsewhere, so the
+		// inspection says which rather than the message being pattern-matched.
+		const retainsPath =
+			truth.status === "changed" ? truth.retainsDestination : truth.status !== "branch_only";
+		return this.failWorktree(record, code, message, undefined, undefined, retainsPath);
 	}
 
 	/**

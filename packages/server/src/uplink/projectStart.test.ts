@@ -1653,6 +1653,83 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		).toBe(base.commit);
 	});
 
+	it("names only the surviving branch when the destination is gone but the branch is not", async () => {
+		const repository = await makeGitProject("branch-survives-repo");
+		const inspected = await coordinator().inspect(repository);
+		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+
+		// The branch this operation created is now checked out somewhere else.
+		const elsewhere = worktreeRequest(
+			repository,
+			"branch-checked-out-elsewhere",
+			base.ref,
+			base.commit,
+			"feature/moved-elsewhere",
+		);
+		const first = await coordinator().start(elsewhere, launcher());
+		if (first.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+		await git(repository, ["worktree", "remove", "--force", first.execution.worktree.path]);
+		const relocated = join(fixtureRoot, "relocated-worktree");
+		await git(repository, ["worktree", "add", relocated, "feature/moved-elsewhere"]);
+		rewritePhase("branch-checked-out-elsewhere", "worktree_ready");
+		let launches = 0;
+
+		const retained = await expectStartError(
+			coordinator({
+				sessionManager: new SessionManager(),
+				workspaceManager: new WorkspaceManager(fixtureRoot),
+			}).start(
+				elsewhere,
+				launcher(new SessionManager(), () => {
+					launches++;
+				}),
+			),
+			"OPERATION_RETAINED",
+		);
+
+		expect(launches).toBe(0);
+		expect(retained.message).toContain("checked out in another worktree");
+		expect(retained.details?.retainedBranch).toBe("feature/moved-elsewhere");
+		// The recorded destination is gone, so it must not be named as retained.
+		expect(retained.details?.retainedWorktreePath).toBeUndefined();
+		expect(existsSync(first.execution.worktree.path)).toBe(false);
+		expect(existsSync(relocated)).toBe(true);
+
+		// The same rule on the startup path, for a branch whose tip has moved.
+		const moved = worktreeRequest(
+			repository,
+			"branch-tip-moved",
+			base.ref,
+			base.commit,
+			"feature/moved-tip",
+		);
+		const second = await coordinator().start(moved, launcher());
+		if (second.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+		await git(repository, ["worktree", "remove", "--force", second.execution.worktree.path]);
+		await writeFile(join(repository, "tracked.txt"), "advanced\n", "utf8");
+		await git(repository, ["add", "tracked.txt"]);
+		await git(repository, ["commit", "--no-gpg-sign", "-m", "advanced"]);
+		const movedCommit = await git(repository, ["rev-parse", "HEAD"]);
+		await git(repository, ["update-ref", "refs/heads/feature/moved-tip", movedCommit]);
+		rewritePhase("branch-tip-moved", "worktree_ready");
+
+		await coordinator({
+			sessionManager: new SessionManager(),
+			workspaceManager: new WorkspaceManager(fixtureRoot),
+		}).reconcileOnStartup();
+
+		const record = journal.get("branch-tip-moved");
+		expect(record?.phase).toBe("retained");
+		expect(record?.failure?.message).toContain("moved away from the recorded commit");
+		expect(record?.failure?.details?.retainedBranch).toBe("feature/moved-tip");
+		expect(record?.failure?.details?.retainedWorktreePath).toBeUndefined();
+		expect(existsSync(second.execution.worktree.path)).toBe(false);
+		expect(await git(repository, ["rev-parse", "--verify", "refs/heads/feature/moved-tip"])).toBe(
+			movedCommit,
+		);
+	});
+
 	it("refuses to restore a completed session through a substituted symlink", async () => {
 		const repo = await makeGitProject("symlink-restore");
 		const options = request(repo, "symlink-restore");

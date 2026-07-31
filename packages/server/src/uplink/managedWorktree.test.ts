@@ -235,6 +235,15 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 			throw new Error("git unavailable");
 		}, managedRoot);
 		expect(await failing.inspectRecorded(recorded)).toMatchObject({ status: "uncertain" });
+
+		// A destination that is provably gone says so, so a caller reporting
+		// retained resources does not name a path that no longer exists.
+		await git(["worktree", "remove", "--force", recorded.destination]);
+		await git(["update-ref", "refs/heads/feature/truth", otherCommit]);
+		expect(await service.inspectRecorded(recorded)).toMatchObject({
+			status: "changed",
+			retainsDestination: false,
+		});
 	});
 
 	it("refuses to treat a destination symlinked onto another worktree as exact", async () => {
