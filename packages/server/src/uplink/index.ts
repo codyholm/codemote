@@ -10,6 +10,10 @@ export type {
 	ProjectStartFailureDetails,
 	ProjectStartRequest,
 	ProjectStartState,
+	GitWorktreeBase,
+	ManagedWorktreeExecutionState,
+	ManagedWorktreeStartRequest,
+	WorktreeStartState,
 	RunOptions,
 	RunResult,
 	WorkspaceConfig,
@@ -46,6 +50,7 @@ export type { OpenCodeConfig, ClaudeConfig, CodexConfig, GeminiConfig } from "./
 
 // Server
 export { UplinkServer } from "./server.js";
+export { ManagedWorktreeService } from "./managedWorktree.js";
 
 // Config
 export { loadConfig, validateConfig } from "./config.js";

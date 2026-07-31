@@ -183,10 +183,17 @@ export {
 
 export type {
 	GitCheckoutState,
+	GitWorktreeBase,
+	ManagedWorktreeExecutionState,
+	ManagedWorktreeStartRequest,
+	ProjectFolderExecutionState,
+	ProjectFolderStartPreparation,
+	ProjectFolderStartRequest,
 	ProjectStartFailureDetails,
 	ProjectStartPhase,
 	ProjectStartPreparation,
 	ProjectStartRequest,
 	ProjectStartState,
 	SessionExecutionState,
+	WorktreeStartState,
 } from "./projectStart.js";

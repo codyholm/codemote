@@ -145,6 +145,7 @@ export class UplinkServer {
 		}
 
 		await this.refreshCaches();
+		await this.recoverProjectStarts();
 
 		return new Promise((resolve, reject) => {
 			const wss = new WebSocketServer({
@@ -579,6 +580,25 @@ export class UplinkServer {
 		return this.dynamicModels.get(runtime) ?? RUNTIME_MODELS[runtime];
 	}
 
+	/**
+	 * Recover durable Git-aware starts before any command is accepted.
+	 *
+	 * A journal this build cannot read is remembered rather than fatal: pairing,
+	 * sessions and every unrelated command keep working, and only Project-start
+	 * requests report the structured journal error.
+	 */
+	private async recoverProjectStarts(): Promise<void> {
+		try {
+			await this.getProjectStartCoordinator().reconcileOnStartup();
+		} catch (error) {
+			if (error instanceof ProjectStartJournalError) {
+				console.error("Project start journal is unusable:", error.message);
+				return;
+			}
+			console.error("Project start recovery failed:", error);
+		}
+	}
+
 	private getProjectStartCoordinator(): ProjectStartCoordinator {
 		if (!this.projectStartCoordinator) {
 			this.projectStartCoordinator = new ProjectStartCoordinator({
@@ -588,6 +608,10 @@ export class UplinkServer {
 				),
 				registry: this.projectRegistry,
 				sessionManager: this.sessionManager,
+				workspaceManager: this.workspaceManager,
+				...(this.config.managedWorktreeRoot
+					? { managedWorktreeRoot: this.config.managedWorktreeRoot }
+					: {}),
 			});
 		}
 		return this.projectStartCoordinator;

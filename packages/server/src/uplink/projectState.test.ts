@@ -184,12 +184,17 @@ describe("buildProjectState", () => {
 		const effective = resolve("/tmp/effective-checkout");
 		const execution = {
 			directory: effective,
-			mode: "project_folder" as const,
+			mode: "worktree" as const,
 			git: {
 				repositoryRoot: effective,
 				head: "abc123",
 				branch: "feature/session",
 				detached: false,
+			},
+			worktree: {
+				path: effective,
+				baseRef: "refs/heads/main",
+				baseCommit: "abc123",
 			},
 		};
 		const agg = buildProjectState(

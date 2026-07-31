@@ -81,6 +81,8 @@ export interface ServerConfig {
 	projectRegistryPath?: string;
 	/** Override path for durable project-folder start operations */
 	projectStartJournalPath?: string;
+	/** Parent directory for machine-managed Git worktrees */
+	managedWorktreeRoot?: string;
 	/** Override directory for the local TLS certificate and key */
 	tlsDir?: string;
 	/** Runtime types to enable in uplink */
@@ -201,6 +203,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		repoPath,
 		projectRegistryPath,
 		projectStartJournalPath,
+		managedWorktreeRoot,
 		tlsDir,
 		runtimes,
 		pairingStorePath,
@@ -305,6 +308,9 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	}
 	if (projectStartJournalPath) {
 		uplinkConfig.projectStartJournalPath = projectStartJournalPath;
+	}
+	if (managedWorktreeRoot) {
+		uplinkConfig.managedWorktreeRoot = managedWorktreeRoot;
 	}
 
 	const uplink = new UplinkServer(uplinkConfig);
