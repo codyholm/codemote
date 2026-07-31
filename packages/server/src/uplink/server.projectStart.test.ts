@@ -3,10 +3,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { platform, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { ProjectStartState, RunOptions, RunResult } from "@codemote/common";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import type { EventBus } from "./events.js";
 import { BaseExecutor } from "./executor.js";
@@ -28,16 +28,34 @@ interface UplinkMessage {
 
 class TestClient {
 	private readonly messages: UplinkMessage[] = [];
-	private readonly waiters = new Map<string, (message: UplinkMessage) => void>();
+	private readonly waiters = new Map<
+		string,
+		{
+			resolve: (message: UplinkMessage) => void;
+			reject: (error: Error) => void;
+			timeout: NodeJS.Timeout;
+		}
+	>();
 
 	private constructor(private readonly socket: WebSocket) {
 		socket.on("message", (data) => {
 			const message = JSON.parse(data.toString()) as UplinkMessage;
 			this.messages.push(message);
 			if (message.requestId) {
-				this.waiters.get(message.requestId)?.(message);
-				this.waiters.delete(message.requestId);
+				const waiter = this.waiters.get(message.requestId);
+				if (waiter) {
+					clearTimeout(waiter.timeout);
+					waiter.resolve(message);
+					this.waiters.delete(message.requestId);
+				}
 			}
+		});
+		socket.on("close", () => {
+			for (const [requestId, waiter] of this.waiters) {
+				clearTimeout(waiter.timeout);
+				waiter.reject(new Error(`Socket closed before response for ${requestId}`));
+			}
+			this.waiters.clear();
 		});
 	}
 
@@ -52,20 +70,27 @@ class TestClient {
 
 	request(command: Record<string, unknown>, requestId: string): Promise<UplinkMessage> {
 		return new Promise((resolvePromise, reject) => {
-			const timeout = setTimeout(
-				() => reject(new Error(`Timed out waiting for ${requestId}`)),
-				20_000,
-			);
-			this.waiters.set(requestId, (message) => {
+			const timeout = setTimeout(() => {
+				this.waiters.delete(requestId);
+				reject(new Error(`Timed out waiting for ${requestId}`));
+			}, 20_000);
+			this.waiters.set(requestId, { resolve: resolvePromise, reject, timeout });
+			try {
+				this.socket.send(JSON.stringify({ ...command, requestId }));
+			} catch (error) {
 				clearTimeout(timeout);
-				resolvePromise(message);
-			});
-			this.socket.send(JSON.stringify({ ...command, requestId }));
+				this.waiters.delete(requestId);
+				reject(error instanceof Error ? error : new Error(String(error)));
+			}
 		});
 	}
 
-	close(): void {
-		this.socket.close();
+	async close(): Promise<void> {
+		if (this.socket.readyState === WebSocket.CLOSED) return;
+		await new Promise<void>((resolvePromise) => {
+			this.socket.once("close", () => resolvePromise());
+			this.socket.close();
+		});
 	}
 }
 
@@ -75,8 +100,38 @@ class ControlledExecutor extends BaseExecutor {
 	inputs = 0;
 	/** Identity the base executor handed to runtime-specific code, in order. */
 	readonly started: Array<{ sessionId: string; runId: string; workspaceId: string }> = [];
+	private nextGate:
+		| { entered: () => void; released: Promise<void>; release: () => void }
+		| undefined;
+
+	holdNextStart(): { entered: Promise<void>; release: () => void } {
+		let enter: (() => void) | undefined;
+		let releasePromise: (() => void) | undefined;
+		const entered = new Promise<void>((resolvePromise) => {
+			enter = resolvePromise;
+		});
+		const released = new Promise<void>((resolvePromise) => {
+			releasePromise = resolvePromise;
+		});
+		let releasedAlready = false;
+		const release = (): void => {
+			if (releasedAlready) return;
+			releasedAlready = true;
+			releasePromise?.();
+		};
+		this.nextGate = {
+			entered: () => enter?.(),
+			released,
+			release,
+		};
+		return { entered, release };
+	}
 
 	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
+		const gate = this.nextGate;
+		this.nextGate = undefined;
+		gate?.entered();
+		if (gate) await gate.released;
 		this.starts++;
 		this.started.push({
 			sessionId: session.id,
@@ -119,6 +174,7 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 	let project: string;
 	let plainProject: string;
 	let journalPath: string;
+	let port: number;
 	let server: UplinkServer;
 	let client: TestClient;
 	let controlled: ControlledExecutor;
@@ -142,7 +198,7 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		const registry = new ProjectRegistry(registryPath);
 		registry.add("Git Project", project);
 		registry.add("Plain Project", plainProject);
-		const port = await reserveFreePort();
+		port = await reserveFreePort();
 		server = new UplinkServer({
 			port,
 			host: "127.0.0.1",
@@ -164,7 +220,7 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 	});
 
 	afterEach(async () => {
-		client?.close();
+		await client?.close();
 		await server?.stop();
 		await rm(fixtureRoot, { recursive: true, force: true });
 	});
@@ -177,11 +233,104 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		return result.stdout.trim();
 	}
 
+	async function createFakeGitFixture(): Promise<{
+		bin: string;
+		pidFile: string;
+		realGit: string;
+	}> {
+		const bin = join(fixtureRoot, "fake-git-bin");
+		const pidFile = join(fixtureRoot, "git.pid");
+		await mkdir(bin, { recursive: true });
+		const realGit = (await execFileAsync("which", ["git"], { encoding: "utf8" })).stdout.trim();
+		await writeFile(
+			join(bin, "git"),
+			[
+				"#!/bin/sh",
+				'if [ "$CODEMOTE_TEST_BLOCK_GIT" = "1" ]; then',
+				'\tprintf "%s" "$$" > "$CODEMOTE_TEST_GIT_PID_FILE"',
+				'\tchild=""',
+				'\tcleanup() { if [ -n "$child" ]; then kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; rm -f "$CODEMOTE_TEST_GIT_PID_FILE"; exit 0; }',
+				"\ttrap cleanup TERM INT EXIT",
+				'\twhile :; do sleep 1 & child="$!"; wait "$child"; child=""; done',
+				"fi",
+				'exec "$CODEMOTE_TEST_REAL_GIT" "$@"',
+				"",
+			].join("\n"),
+			"utf8",
+		);
+		await chmod(join(bin, "git"), 0o755);
+		return { bin, pidFile, realGit };
+	}
+
+	async function waitForFile(path: string): Promise<void> {
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline) {
+			try {
+				await readFile(path, "utf8");
+				return;
+			} catch {
+				// The fake Git wrapper has not started yet.
+			}
+			await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		}
+		throw new Error(`Timed out waiting for ${path}`);
+	}
+
+	function isPidAlive(pid: number): boolean {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	async function waitForPidGone(pid: number, timeoutMs = 5_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (!isPidAlive(pid)) return;
+			await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		}
+		throw new Error(`Timed out waiting for PID ${pid} to exit`);
+	}
+
+	async function cleanupFixturePid(pid: number): Promise<void> {
+		if (!isPidAlive(pid)) return;
+		process.kill(pid, "SIGTERM");
+		try {
+			await waitForPidGone(pid, 250);
+			return;
+		} catch {
+			// Escalate only the exact fixture PID when cooperative cleanup fails.
+		}
+		if (isPidAlive(pid)) process.kill(pid, "SIGKILL");
+		await waitForPidGone(pid);
+	}
+
 	function readJournal(): { version: number; operations: Array<Record<string, unknown>> } {
 		return JSON.parse(readFileSync(journalPath, "utf8")) as {
 			version: number;
 			operations: Array<Record<string, unknown>>;
 		};
+	}
+
+	async function waitForJournalPhase(
+		operationId: string,
+		phase: string,
+	): Promise<Record<string, unknown>> {
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline) {
+			try {
+				const operation = readJournal().operations.find(
+					(candidate) => candidate["operationId"] === operationId,
+				);
+				if (operation?.["phase"] === phase) return operation;
+			} catch {
+				// The first durable write may not have happened yet.
+			}
+			await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		}
+		throw new Error(`Timed out waiting for ${operationId} to reach ${phase}`);
 	}
 
 	/**
@@ -209,9 +358,9 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 	async function restartServer(
 		options: { stopExisting?: boolean } = {},
 	): Promise<{ client: TestClient; executor: ControlledExecutor }> {
-		client.close();
+		await client.close();
 		if (options.stopExisting !== false) await server.stop();
-		const port = await reserveFreePort();
+		port = await reserveFreePort();
 		server = new UplinkServer({
 			port,
 			host: "127.0.0.1",
@@ -295,6 +444,88 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		const plainState = await state(plainProject);
 		expect(plainState.originProjectPath).toBe(plainProject);
 		expect(plainState.git).toBeNull();
+	});
+
+	it.skipIf(platform() === "win32")(
+		"cancels a blocked start-state inspection when its Uplink connection closes",
+		async () => {
+			const fake = await createFakeGitFixture();
+			const inherited = {
+				PATH: process.env["PATH"],
+				CODEMOTE_TEST_REAL_GIT: process.env["CODEMOTE_TEST_REAL_GIT"],
+				CODEMOTE_TEST_GIT_PID_FILE: process.env["CODEMOTE_TEST_GIT_PID_FILE"],
+				CODEMOTE_TEST_BLOCK_GIT: process.env["CODEMOTE_TEST_BLOCK_GIT"],
+			};
+			const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+			let pid: number | undefined;
+
+			try {
+				process.env["PATH"] = `${fake.bin}${delimiter}${inherited.PATH ?? ""}`;
+				process.env["CODEMOTE_TEST_REAL_GIT"] = fake.realGit;
+				process.env["CODEMOTE_TEST_GIT_PID_FILE"] = fake.pidFile;
+				process.env["CODEMOTE_TEST_BLOCK_GIT"] = "1";
+				const pending = client.request(
+					{ type: "get_project_start_state", payload: { projectPath: project } },
+					"disconnect-inspection",
+				);
+				await waitForFile(fake.pidFile);
+				pid = Number(await readFile(fake.pidFile, "utf8"));
+				const closed = expect(pending).rejects.toThrow("Socket closed before response");
+				await client.close();
+				await closed;
+				if (!Number.isInteger(pid) || pid <= 0) throw new Error("Invalid fake Git PID");
+				await waitForPidGone(pid);
+				expect(
+					errorLog.mock.calls.some(([message]) => message === "Uplink WS command failed:"),
+				).toBe(false);
+			} finally {
+				if (pid !== undefined) await cleanupFixturePid(pid);
+				errorLog.mockRestore();
+				for (const [key, value] of Object.entries(inherited)) {
+					if (value === undefined) delete process.env[key];
+					else process.env[key] = value;
+				}
+			}
+
+			client = await TestClient.connect(port);
+			const pong = await client.request({ type: "ping" }, "after-inspection-disconnect");
+			expect(pong.type).toBe("pong");
+		},
+	);
+
+	it("keeps an accepted durable Start alive after response loss and replays one result", async () => {
+		const current = await state();
+		const base = current.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const payload = worktreeStartPayload("response-loss", base.ref, base.commit);
+		const gate = controlled.holdNextStart();
+		const pending = client.request({ type: "start_run", payload }, "response-loss");
+		const closed = expect(pending).rejects.toThrow("Socket closed before response");
+
+		try {
+			await gate.entered;
+			await client.close();
+			await closed;
+		} finally {
+			gate.release();
+		}
+
+		await waitForJournalPhase("response-loss", "session_started");
+		client = await TestClient.connect(port);
+		const replay = await client.request({ type: "start_run", payload }, "response-loss-replay");
+		expect(replay.type).toBe("run_started");
+		expect(controlled.starts).toBe(1);
+		expect(readJournal().operations).toHaveLength(1);
+		expect((server as unknown as ServerInternals).sessionManager.list()).toHaveLength(1);
+		const result = replay.payload as RunResult;
+		const execution = result.execution;
+		if (!execution || execution.mode !== "worktree")
+			throw new Error("Expected managed worktree result");
+		const worktreePath = execution.worktree.path;
+		const worktrees = await git(project, ["worktree", "list", "--porcelain"]);
+		expect(
+			worktrees.split("\n").filter((line) => line === `worktree ${worktreePath}`),
+		).toHaveLength(1);
 	});
 
 	it("preserves legacy starts and starts project-aware non-Git sessions", async () => {

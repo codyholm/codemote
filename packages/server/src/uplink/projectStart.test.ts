@@ -10,7 +10,7 @@ import type {
 	RunOptions,
 	RunResult,
 } from "@codemote/common";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ExecutorStartError } from "./executor.js";
 import { ProjectRegistry } from "./projectRegistry.js";
 import { ProjectStartCoordinator, ProjectStartError, runGitCommand } from "./projectStart.js";
@@ -61,6 +61,75 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		await git(project, ["commit", "--no-gpg-sign", "-m", "fixture"]);
 		registry.add(name, project);
 		return resolve(project);
+	}
+
+	async function createFakeGitFixture(): Promise<{
+		bin: string;
+		pidFile: string;
+		realGit: string;
+	}> {
+		const bin = join(fixtureRoot, "fake-git-bin");
+		const pidFile = join(fixtureRoot, "git.pid");
+		await mkdir(bin, { recursive: true });
+		const realGit = (await execFileAsync("which", ["git"], { encoding: "utf8" })).stdout.trim();
+		await writeFile(
+			join(bin, "git"),
+			[
+				"#!/bin/sh",
+				'if [ "$CODEMOTE_TEST_BLOCK_GIT" = "1" ]; then',
+				'\tprintf "%s" "$$" > "$CODEMOTE_TEST_GIT_PID_FILE"',
+				'\tchild=""',
+				'\tcleanup() { if [ -n "$child" ]; then kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; rm -f "$CODEMOTE_TEST_GIT_PID_FILE"; exit 0; }',
+				"\ttrap cleanup TERM INT EXIT",
+				'\twhile :; do sleep 1 & child="$!"; wait "$child"; child=""; done',
+				"fi",
+				'exec "$CODEMOTE_TEST_REAL_GIT" "$@"',
+				"",
+			].join("\n"),
+			"utf8",
+		);
+		await chmod(join(bin, "git"), 0o755);
+		return { bin, pidFile, realGit };
+	}
+
+	async function waitForFile(path: string): Promise<void> {
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline) {
+			if (existsSync(path)) return;
+			await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		}
+		throw new Error(`Timed out waiting for ${path}`);
+	}
+
+	function isPidAlive(pid: number): boolean {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	async function waitForPidGone(pid: number, timeoutMs = 5_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (!isPidAlive(pid)) return;
+			await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		}
+		throw new Error(`Timed out waiting for PID ${pid} to exit`);
+	}
+
+	async function cleanupFixturePid(pid: number): Promise<void> {
+		if (!isPidAlive(pid)) return;
+		process.kill(pid, "SIGTERM");
+		try {
+			await waitForPidGone(pid, 250);
+			return;
+		} catch {
+			// Escalate only the exact fixture PID when cooperative cleanup fails.
+		}
+		if (isPidAlive(pid)) process.kill(pid, "SIGKILL");
+		await waitForPidGone(pid);
 	}
 
 	function coordinator(
@@ -1010,6 +1079,87 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		);
 		expect((await runGitCommand(repo, ["status", "--porcelain=v1"])).exitCode).toBe(0);
 	});
+
+	it.skipIf(platform() === "win32")(
+		"rejects pre-aborted inspection before spawning Git",
+		async () => {
+			const repo = await makeGitProject("pre-aborted");
+			const fake = await createFakeGitFixture();
+			const inherited = {
+				PATH: process.env["PATH"],
+				CODEMOTE_TEST_REAL_GIT: process.env["CODEMOTE_TEST_REAL_GIT"],
+				CODEMOTE_TEST_GIT_PID_FILE: process.env["CODEMOTE_TEST_GIT_PID_FILE"],
+				CODEMOTE_TEST_BLOCK_GIT: process.env["CODEMOTE_TEST_BLOCK_GIT"],
+			};
+			const controller = new AbortController();
+			controller.abort();
+
+			try {
+				process.env["PATH"] = `${fake.bin}${delimiter}${inherited.PATH ?? ""}`;
+				process.env["CODEMOTE_TEST_REAL_GIT"] = fake.realGit;
+				process.env["CODEMOTE_TEST_GIT_PID_FILE"] = fake.pidFile;
+				process.env["CODEMOTE_TEST_BLOCK_GIT"] = "1";
+
+				await expect(runGitCommand(repo, ["status"], undefined, controller.signal)).rejects.toThrow(
+					"Git command was aborted",
+				);
+				expect(existsSync(fake.pidFile)).toBe(false);
+
+				await expectStartError(coordinator().inspect(repo, controller.signal), "OPERATION_ABORTED");
+				expect(sessions.list()).toHaveLength(0);
+				expect(journal.list()).toHaveLength(0);
+				expect(existsSync(fake.pidFile)).toBe(false);
+			} finally {
+				for (const [key, value] of Object.entries(inherited)) {
+					if (value === undefined) delete process.env[key];
+					else process.env[key] = value;
+				}
+			}
+		},
+	);
+
+	it.skipIf(platform() === "win32")(
+		"terminates and reaps an in-flight Git inspection on abort",
+		async () => {
+			const repo = await makeGitProject("aborted");
+			const fake = await createFakeGitFixture();
+			const inherited = {
+				PATH: process.env["PATH"],
+				CODEMOTE_TEST_REAL_GIT: process.env["CODEMOTE_TEST_REAL_GIT"],
+				CODEMOTE_TEST_GIT_PID_FILE: process.env["CODEMOTE_TEST_GIT_PID_FILE"],
+				CODEMOTE_TEST_BLOCK_GIT: process.env["CODEMOTE_TEST_BLOCK_GIT"],
+			};
+			const controller = new AbortController();
+			const addListener = vi.spyOn(controller.signal, "addEventListener");
+			const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+			let pid: number | undefined;
+
+			try {
+				process.env["PATH"] = `${fake.bin}${delimiter}${inherited.PATH ?? ""}`;
+				process.env["CODEMOTE_TEST_REAL_GIT"] = fake.realGit;
+				process.env["CODEMOTE_TEST_GIT_PID_FILE"] = fake.pidFile;
+				process.env["CODEMOTE_TEST_BLOCK_GIT"] = "1";
+				const command = runGitCommand(repo, ["status"], undefined, controller.signal);
+				await waitForFile(fake.pidFile);
+				pid = Number(await readFile(fake.pidFile, "utf8"));
+				expect(pid).toBeGreaterThan(0);
+				controller.abort();
+				await expect(command).rejects.toThrow("Git command was aborted");
+				expect(isPidAlive(pid)).toBe(false);
+				const abortListener = addListener.mock.calls.find(([type]) => type === "abort")?.[1];
+				expect(abortListener).toBeTypeOf("function");
+				expect(removeListener).toHaveBeenCalledWith("abort", abortListener);
+			} finally {
+				if (pid !== undefined) await cleanupFixturePid(pid);
+				for (const [key, value] of Object.entries(inherited)) {
+					if (value === undefined) delete process.env[key];
+					else process.env[key] = value;
+				}
+			}
+
+			expect((await runGitCommand(repo, ["status", "--porcelain=v1"])).exitCode).toBe(0);
+		},
+	);
 
 	it("rejects unregistered, missing, conflicting-directory, and resume requests", async () => {
 		const missing = join(fixtureRoot, "missing");

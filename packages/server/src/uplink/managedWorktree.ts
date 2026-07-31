@@ -129,13 +129,17 @@ export class ManagedWorktreeService {
 		private readonly managedRoot: string,
 	) {}
 
-	async listBases(repositoryRoot: string): Promise<WorktreeStartState> {
-		const result = await this.git(repositoryRoot, [
-			"for-each-ref",
-			"--format=%(refname)%00%(objectname)%00%(objecttype)%00%(upstream)%00%(symref)",
-			"refs/heads",
-			"refs/remotes",
-		]);
+	async listBases(repositoryRoot: string, signal?: AbortSignal): Promise<WorktreeStartState> {
+		const result = await this.git(
+			repositoryRoot,
+			[
+				"for-each-ref",
+				"--format=%(refname)%00%(objectname)%00%(objecttype)%00%(upstream)%00%(symref)",
+				"refs/heads",
+				"refs/remotes",
+			],
+			signal,
+		);
 		const candidates: Array<GitWorktreeBase & { upstream: string }> = [];
 		const symbolicDefaults: Array<{ ref: string; target: string }> = [];
 		for (const row of result.stdout.split("\n")) {
@@ -598,8 +602,8 @@ export class ManagedWorktreeService {
 		return canonicalProject;
 	}
 
-	private async git(cwd: string, args: string[]): Promise<GitCommandResult> {
-		const result = await this.runGit(cwd, args);
+	private async git(cwd: string, args: string[], signal?: AbortSignal): Promise<GitCommandResult> {
+		const result = await this.runGit(cwd, args, undefined, signal);
 		if (result.exitCode !== 0) {
 			throw new ManagedWorktreeError("INVALID_WORKTREE_BASE", "Failed to inspect local Git refs");
 		}

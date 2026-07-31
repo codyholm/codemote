@@ -208,17 +208,47 @@ export class UplinkServer {
 	private handleConnection(ws: WebSocket): void {
 		this.clients.add(ws);
 		console.log("Client connected");
+		const inspectionControllers = new Set<AbortController>();
+		let disposed = false;
+		const sendIfOpen = (payload: UplinkResponse): void => {
+			if (disposed || ws.readyState !== WebSocket.OPEN) return;
+			try {
+				ws.send(JSON.stringify(payload), (error) => {
+					if (error && ws.readyState === WebSocket.OPEN) {
+						console.error("Uplink WS response failed:", error);
+					}
+				});
+			} catch (error) {
+				if (ws.readyState === WebSocket.OPEN) {
+					console.error("Uplink WS response failed:", error);
+				}
+			}
+		};
+		const dispose = (): void => {
+			if (disposed) return;
+			disposed = true;
+			for (const controller of inspectionControllers) controller.abort();
+			inspectionControllers.clear();
+			this.clients.delete(ws);
+		};
 
 		ws.on("message", async (data) => {
 			let requestId: string | undefined;
+			let controller: AbortController | undefined;
 			try {
 				const command = JSON.parse(data.toString()) as UplinkCommand;
 				requestId = command.requestId;
-				const response = await this.handleCommand(command);
-				ws.send(JSON.stringify(response));
+				if (command.type === "get_project_start_state") {
+					controller = new AbortController();
+					inspectionControllers.add(controller);
+				}
+				const response = await this.handleCommand(command, controller?.signal);
+				sendIfOpen(response);
 			} catch (error) {
 				const safe = this.toSafeError(error);
-				console.error("Uplink WS command failed:", error);
+				if (!(disposed && safe.code === "OPERATION_ABORTED")) {
+					console.error("Uplink WS command failed:", error);
+				}
 				const errorResponse: UplinkResponse = {
 					type: "error",
 					payload: safe,
@@ -226,18 +256,22 @@ export class UplinkServer {
 				if (requestId) {
 					errorResponse.requestId = requestId;
 				}
-				ws.send(JSON.stringify(errorResponse));
+				sendIfOpen(errorResponse);
+			} finally {
+				if (controller) inspectionControllers.delete(controller);
 			}
 		});
 
 		ws.on("close", () => {
-			this.clients.delete(ws);
+			dispose();
 			console.log("Client disconnected");
 		});
 
 		ws.on("error", (error) => {
-			console.error("WebSocket error:", error);
-			this.clients.delete(ws);
+			if (ws.readyState === WebSocket.OPEN) {
+				console.error("WebSocket error:", error);
+			}
+			dispose();
 		});
 	}
 
@@ -282,16 +316,22 @@ export class UplinkServer {
 		return { message: "Request failed", code: "COMMAND_FAILED" };
 	}
 
-	private async handleCommand(command: UplinkCommand): Promise<UplinkResponse> {
+	private async handleCommand(
+		command: UplinkCommand,
+		signal?: AbortSignal,
+	): Promise<UplinkResponse> {
 		const { requestId } = command;
-		const response = await this.handleCommandInner(command);
+		const response = await this.handleCommandInner(command, signal);
 		if (requestId) {
 			response.requestId = requestId;
 		}
 		return response;
 	}
 
-	private async handleCommandInner(command: UplinkCommand): Promise<UplinkResponse> {
+	private async handleCommandInner(
+		command: UplinkCommand,
+		signal?: AbortSignal,
+	): Promise<UplinkResponse> {
 		switch (command.type) {
 			case "ping":
 				return { type: "pong" };
@@ -305,7 +345,10 @@ export class UplinkServer {
 			case "get_project_start_state":
 				return {
 					type: "project_start_state",
-					payload: await this.getProjectStartCoordinator().inspect(command.payload.projectPath),
+					payload: await this.getProjectStartCoordinator().inspect(
+						command.payload.projectPath,
+						signal,
+					),
 				};
 
 			case "list_projects":

@@ -52,12 +52,15 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		await git(["update-ref", "refs/remotes/upstream/other", head]);
 		await git(["symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/other"]);
 		const commands: string[][] = [];
-		const service = new ManagedWorktreeService(async (cwd, args, input) => {
+		const signal = new AbortController().signal;
+		let forwardedSignal: AbortSignal | undefined;
+		const service = new ManagedWorktreeService(async (cwd, args, input, receivedSignal) => {
 			commands.push(args);
-			return runGitCommand(cwd, args, input);
+			forwardedSignal = receivedSignal;
+			return runGitCommand(cwd, args, input, receivedSignal);
 		}, managedRoot);
 
-		const state = await service.listBases(repository);
+		const state = await service.listBases(repository, signal);
 
 		expect(state.bases).toEqual(
 			expect.arrayContaining([
@@ -76,6 +79,7 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		expect(state.defaultBaseRef).toBe("refs/heads/main");
 		expect(commands.flat()).not.toContain("fetch");
 		expect(commands.flat()).not.toContain("ls-remote");
+		expect(forwardedSignal).toBe(signal);
 	});
 
 	it("creates detached and attached worktrees at the recorded commit and maps a nested project", async () => {

@@ -73,6 +73,7 @@ export type GitCommandRunner = (
 	cwd: string,
 	args: string[],
 	input?: string,
+	signal?: AbortSignal,
 ) => Promise<GitCommandResult>;
 
 export interface ProjectStartCoordinatorOptions {
@@ -102,6 +103,7 @@ type ProjectStartErrorCode =
 	| "PROJECT_PATH_UNAVAILABLE"
 	| "GIT_UNAVAILABLE"
 	| "GIT_TIMEOUT"
+	| "OPERATION_ABORTED"
 	| "GIT_COMMAND_FAILED"
 	| "INVALID_BRANCH"
 	| "BRANCH_EXISTS"
@@ -125,7 +127,7 @@ export class ProjectStartError extends Error {
 
 class GitProcessError extends Error {
 	constructor(
-		readonly kind: "unavailable" | "timeout" | "output_limit" | "spawn",
+		readonly kind: "unavailable" | "timeout" | "aborted" | "output_limit" | "spawn",
 		message: string,
 	) {
 		super(message);
@@ -155,7 +157,11 @@ export function runGitCommand(
 	cwd: string,
 	args: string[],
 	input?: string,
+	signal?: AbortSignal,
 ): Promise<GitCommandResult> {
+	if (signal?.aborted) {
+		return Promise.reject(new GitProcessError("aborted", "Git command was aborted"));
+	}
 	return new Promise((resolvePromise, reject) => {
 		let stdout = "";
 		let stderr = "";
@@ -175,6 +181,7 @@ export function runGitCommand(
 			clearTimeout(timeout);
 			if (hardKillTimer) clearTimeout(hardKillTimer);
 			if (reapTimer) clearTimeout(reapTimer);
+			signal?.removeEventListener("abort", onAbort);
 		};
 
 		const finishError = (error: GitProcessError): void => {
@@ -201,6 +208,10 @@ export function runGitCommand(
 				if (!settled) child.kill("SIGKILL");
 			}, GIT_TERMINATE_GRACE_MS);
 			reapTimer = setTimeout(() => finishError(error), GIT_REAP_TIMEOUT_MS);
+		};
+
+		const onAbort = (): void => {
+			terminate(new GitProcessError("aborted", "Git command was aborted"));
 		};
 
 		function onStdout(chunk: Buffer): void {
@@ -247,6 +258,10 @@ export function runGitCommand(
 			clearTimers();
 			resolvePromise({ exitCode: code ?? 1, stdout, stderr });
 		});
+		if (signal) {
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) onAbort();
+		}
 		try {
 			if (input !== undefined) child.stdin.end(input);
 			else child.stdin.end();
@@ -359,14 +374,14 @@ export class ProjectStartCoordinator {
 		);
 	}
 
-	async inspect(projectPath: string): Promise<ProjectStartState> {
+	async inspect(projectPath: string, signal?: AbortSignal): Promise<ProjectStartState> {
 		const normalizedPath = this.requireRegisteredPath(projectPath);
 		await this.requireDirectory(normalizedPath);
-		const git = await this.inspectGit(normalizedPath, false);
+		const git = await this.inspectGit(normalizedPath, false, signal);
 		let worktree = null;
 		if (git) {
 			try {
-				worktree = await this.managedWorktrees.listBases(git.repositoryRoot);
+				worktree = await this.managedWorktrees.listBases(git.repositoryRoot, signal);
 			} catch (error) {
 				throw this.mapManagedGitError(error);
 			}
@@ -1791,10 +1806,16 @@ export class ProjectStartCoordinator {
 	private async inspectGit(
 		projectPath: string,
 		requireGit: boolean,
+		signal?: AbortSignal,
 	): Promise<GitCheckoutState | null> {
 		let inside: GitCommandResult;
 		try {
-			inside = await this.runGit(projectPath, ["rev-parse", "--is-inside-work-tree"]);
+			inside = await this.runGit(
+				projectPath,
+				["rev-parse", "--is-inside-work-tree"],
+				undefined,
+				signal,
+			);
 		} catch (error) {
 			if (error instanceof GitProcessError && error.kind === "unavailable" && !requireGit) {
 				return null;
@@ -1807,15 +1828,33 @@ export class ProjectStartCoordinator {
 		}
 		if (trimLine(inside.stdout) !== "true") return null;
 
-		const bare = await this.git(projectPath, ["rev-parse", "--is-bare-repository"], requireGit);
+		const bare = await this.git(
+			projectPath,
+			["rev-parse", "--is-bare-repository"],
+			requireGit,
+			undefined,
+			signal,
+		);
 		if (bare.exitCode !== 0) throw this.gitFailure("Failed to inspect repository type");
 		if (trimLine(bare.stdout) === "true") return null;
 
-		const rootResult = await this.git(projectPath, ["rev-parse", "--show-toplevel"], requireGit);
+		const rootResult = await this.git(
+			projectPath,
+			["rev-parse", "--show-toplevel"],
+			requireGit,
+			undefined,
+			signal,
+		);
 		if (rootResult.exitCode !== 0) throw this.gitFailure("Failed to locate repository root");
 		const repositoryRoot = resolve(trimLine(rootResult.stdout));
 
-		const headResult = await this.git(projectPath, ["rev-parse", "--verify", "HEAD"], requireGit);
+		const headResult = await this.git(
+			projectPath,
+			["rev-parse", "--verify", "HEAD"],
+			requireGit,
+			undefined,
+			signal,
+		);
 		let head: string | null;
 		if (headResult.exitCode === 0) head = trimLine(headResult.stdout);
 		else if (headResult.exitCode === 128) head = null;
@@ -1825,6 +1864,8 @@ export class ProjectStartCoordinator {
 			projectPath,
 			["symbolic-ref", "--quiet", "--short", "HEAD"],
 			requireGit,
+			undefined,
+			signal,
 		);
 		let branch: string | null;
 		if (branchResult.exitCode === 0) branch = trimLine(branchResult.stdout);
@@ -1844,9 +1885,10 @@ export class ProjectStartCoordinator {
 		args: string[],
 		requireGit: boolean,
 		input?: string,
+		signal?: AbortSignal,
 	): Promise<GitCommandResult> {
 		try {
-			return await this.runGit(cwd, args, input);
+			return await this.runGit(cwd, args, input, signal);
 		} catch (error) {
 			if (error instanceof GitProcessError && error.kind === "unavailable" && !requireGit) {
 				return { exitCode: 127, stdout: "", stderr: "Git unavailable" };
@@ -1862,6 +1904,9 @@ export class ProjectStartCoordinator {
 			}
 			if (error.kind === "timeout") {
 				return new ProjectStartError("GIT_TIMEOUT", "Git inspection timed out");
+			}
+			if (error.kind === "aborted") {
+				return new ProjectStartError("OPERATION_ABORTED", "Project start inspection was aborted");
 			}
 		}
 		return this.gitFailure("Git inspection failed");
