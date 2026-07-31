@@ -188,6 +188,40 @@ function journalPhase(
 }
 
 /**
+ * Every phase change this writer is allowed to record, keyed by current phase.
+ * Re-recording the same phase is always allowed; it is how a record is
+ * re-timestamped or given a late runtime-native session ID.
+ *
+ * The table exists so no future path can skip a durable boundary: a session
+ * cannot appear without a prepared launch, a runtime launch cannot be recorded
+ * without a session, and a terminal record can never be reopened. Loading is
+ * unaffected, so records written by older builds stay readable.
+ */
+const ALLOWED_TRANSITIONS: Record<ProjectStartJournalPhase, readonly ProjectStartJournalPhase[]> = {
+	recorded: ["branch_created", "worktree_created", "launch_requested", "failed", "retained"],
+	branch_created: ["branch_checked_out", "failed", "retained"],
+	branch_checked_out: ["launch_requested", "failed", "retained"],
+	worktree_created: ["worktree_ready", "failed", "retained"],
+	worktree_ready: ["launch_requested", "failed", "retained"],
+	// `session_started` direct from here covers a launch callback that recorded
+	// no session of its own; it still ends as exactly one recorded session.
+	launch_requested: [
+		"session_recorded",
+		"session_started",
+		"rollback_requested",
+		"failed",
+		"retained",
+	],
+	session_recorded: ["runtime_launch_requested", "failed", "retained"],
+	runtime_launch_requested: ["session_started", "failed", "retained"],
+	rollback_requested: ["worktree_removed", "failed", "retained"],
+	worktree_removed: ["failed", "retained"],
+	session_started: [],
+	failed: [],
+	retained: [],
+};
+
+/**
  * The phase a caller is allowed to see. Internal boundaries collapse onto the
  * landed protocol value that carries the same meaning for the phone.
  */
@@ -498,14 +532,17 @@ function parseRecord(
 	if (hasFailure !== isTerminal) {
 		invalid("Journal failure must exist only for a failed or retained operation");
 	}
-	const requiresSession =
+	const carriesSession =
 		record.phase === "session_recorded" ||
 		record.phase === "runtime_launch_requested" ||
 		record.phase === "session_started";
-	if (requiresSession && !record.session) {
+	// Only this writer's records are required to carry a session. A landed
+	// version-1 success recorded its result before durable session identity
+	// existed, and must stay loadable and replayable after the upgrade.
+	if (carriesSession && record.recordVersion === 2 && !record.session) {
 		invalid("Journal phase is missing its durable session identity");
 	}
-	if (record.session && !requiresSession && !isTerminal) {
+	if (record.session && !carriesSession && !isTerminal) {
 		invalid("Journal phase cannot carry a durable session identity");
 	}
 	const requiresRollback =
@@ -568,9 +605,9 @@ function parseRecord(
 	if (record.result) {
 		assertConsistentExecution(record, record.result.execution);
 		if (
-			!record.session ||
-			record.session.sessionId !== record.result.sessionId ||
-			record.session.runId !== record.result.runId
+			record.session &&
+			(record.session.sessionId !== record.result.sessionId ||
+				record.session.runId !== record.result.runId)
 		) {
 			invalid("Successful journal record has an inconsistent durable session identity");
 		}
@@ -721,6 +758,12 @@ export class ProjectStartJournal {
 				"OPERATION_CONFLICT",
 				"Project start operation ID cannot change",
 			);
+		}
+		if (
+			updated.phase !== current.phase &&
+			!ALLOWED_TRANSITIONS[current.phase].includes(updated.phase)
+		) {
+			invalid(`Invalid journal phase transition: ${current.phase} to ${updated.phase}`);
 		}
 		const candidate = [...this.operations];
 		candidate[index] = updated;

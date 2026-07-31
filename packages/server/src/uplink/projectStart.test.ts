@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -199,13 +199,37 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		};
 	}
 
+	/**
+	 * Replace the journal file with the durable state an interruption would have
+	 * left, then reload it.
+	 *
+	 * Written through the file rather than `update()` on purpose: an interruption
+	 * leaves an older document behind, it does not perform a backwards phase
+	 * transition, and the journal refuses those.
+	 */
+	function rewriteJournalFile(
+		operationId: string,
+		mutate: (operation: Record<string, unknown>) => Record<string, unknown>,
+	): void {
+		const path = join(fixtureRoot, "machine", "operations.json");
+		const file = JSON.parse(readFileSync(path, "utf8")) as {
+			version: number;
+			operations: Array<Record<string, unknown>>;
+		};
+		file.operations = file.operations.map((operation) =>
+			operation["operationId"] === operationId ? mutate(operation) : operation,
+		);
+		writeFileSync(path, JSON.stringify(file), "utf8");
+		journal = new ProjectStartJournal(path);
+	}
+
 	/** Put an operation into a durable rollback phase, as an interruption would. */
 	function rewriteRollbackPhase(
 		operationId: string,
 		phase: "rollback_requested" | "worktree_removed",
 	): void {
-		journal.update(operationId, (current) => {
-			const { result: _result, failure: _failure, session: _session, ...rest } = current;
+		rewriteJournalFile(operationId, (operation) => {
+			const { result: _result, failure: _failure, session: _session, ...rest } = operation;
 			return {
 				...rest,
 				phase,
@@ -225,17 +249,23 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		return listed.split("\n").filter((line) => line === `worktree ${path}`).length;
 	}
 
-	/** Rewrite the journal as a landed version-1 file, as an older build wrote it. */
-	async function downgradeToVersionOne(): Promise<void> {
+	/**
+	 * Rewrite the journal exactly as the landed version-1 writer left it: no file
+	 * or record version, and none of the payloads that version could not record.
+	 */
+	function downgradeToVersionOne(): void {
 		const path = join(fixtureRoot, "machine", "operations.json");
-		const file = JSON.parse(await readFile(path, "utf8")) as {
+		const file = JSON.parse(readFileSync(path, "utf8")) as {
 			operations: Array<Record<string, unknown>>;
 		};
-		await writeFile(
+		writeFileSync(
 			path,
 			JSON.stringify({
 				version: 1,
-				operations: file.operations.map(({ recordVersion: _recordVersion, ...rest }) => rest),
+				operations: file.operations.map(
+					({ recordVersion: _recordVersion, session: _session, rollback: _rollback, ...rest }) =>
+						rest,
+				),
 			}),
 			"utf8",
 		);
@@ -247,8 +277,14 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 	 * phase would have left, dropping anything the phase could not have recorded.
 	 */
 	function rewritePhase(operationId: string, phase: ProjectStartOperationRecord["phase"]): void {
-		journal.update(operationId, (current) => {
-			const { result: _result, failure: _failure, rollback: _rollback, session, ...rest } = current;
+		rewriteJournalFile(operationId, (operation) => {
+			const {
+				result: _result,
+				failure: _failure,
+				rollback: _rollback,
+				session,
+				...rest
+			} = operation;
 			const carriesSession =
 				phase === "session_recorded" ||
 				phase === "runtime_launch_requested" ||
@@ -1336,13 +1372,191 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		expect(restartedWorkspaces.get(restoredSession?.workspace.id ?? "")?.workingDir).toBe(repo);
 	});
 
+	it("resumes an interrupted non-Git start at both durable launch boundaries", async () => {
+		const plain = join(fixtureRoot, "plain-restart");
+		await mkdir(plain);
+		registry.add("Plain restart", plain);
+		const options = request(plain, "plain-restart");
+		const first = await coordinator().start(options, launcher());
+		expect(first.execution?.git).toBeNull();
+
+		// A project that was never in Git has no Git truth to reconcile, so a
+		// prepared start must resume rather than report a lost repository.
+		rewritePhase("plain-restart", "launch_requested");
+		const preparedSessions = new SessionManager();
+		let launches = 0;
+		const prepared = await coordinator({
+			sessionManager: preparedSessions,
+			workspaceManager: new WorkspaceManager(fixtureRoot),
+		}).start(
+			options,
+			launcher(preparedSessions, () => {
+				launches++;
+			}),
+		);
+
+		expect(launches).toBe(1);
+		expect(prepared.execution).toEqual({ directory: plain, mode: "project_folder", git: null });
+		expect(prepared.originProjectPath).toBe(plain);
+		expect(preparedSessions.list()).toHaveLength(1);
+		expect(journal.get("plain-restart")?.phase).toBe("session_started");
+
+		// Interrupted after the session was recorded: reuse those exact identities.
+		rewritePhase("plain-restart", "session_recorded");
+		const reusedSessions = new SessionManager();
+		const reused = await coordinator({
+			sessionManager: reusedSessions,
+			workspaceManager: new WorkspaceManager(fixtureRoot),
+		}).start(options, launcher(reusedSessions));
+
+		expect(reused.sessionId).toBe(prepared.sessionId);
+		expect(reused.runId).toBe(prepared.runId);
+		expect(reused.execution).toEqual(prepared.execution);
+		expect(reusedSessions.list()).toHaveLength(1);
+	});
+
+	it("resumes a Worktree start at its session boundary and never launches it twice", async () => {
+		const repository = await makeGitProject("worktree-session-boundary");
+		const inspected = await coordinator().inspect(repository);
+		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const options = worktreeRequest(
+			repository,
+			"worktree-session-boundary",
+			base.ref,
+			base.commit,
+			"feature/session-boundary",
+		);
+		const first = await coordinator().start(options, launcher());
+		if (first.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+		const destination = first.execution.worktree.path;
+		const expectedRefs = "refs/heads/feature/session-boundary\nrefs/heads/main";
+
+		// Interrupted after the session was recorded but before the runtime call.
+		rewritePhase("worktree-session-boundary", "session_recorded");
+		const restartedSessions = new SessionManager();
+		let launches = 0;
+		const resumed = await coordinator({
+			sessionManager: restartedSessions,
+			workspaceManager: new WorkspaceManager(fixtureRoot),
+		}).start(
+			options,
+			launcher(restartedSessions, () => {
+				launches++;
+			}),
+		);
+
+		expect(launches).toBe(1);
+		expect(resumed.sessionId).toBe(first.sessionId);
+		expect(resumed.runId).toBe(first.runId);
+		expect(resumed.execution).toEqual(first.execution);
+		expect(restartedSessions.list()).toHaveLength(1);
+		expect(await worktreeRegistrations(repository, destination)).toBe(1);
+		expect(await git(repository, ["for-each-ref", "--format=%(refname)", "refs/heads"])).toBe(
+			expectedRefs,
+		);
+
+		// Interrupted where the runtime call may already have run: never repeat it.
+		rewritePhase("worktree-session-boundary", "runtime_launch_requested");
+		let ambiguousLaunches = 0;
+		const retained = await expectStartError(
+			coordinator({
+				sessionManager: new SessionManager(),
+				workspaceManager: new WorkspaceManager(fixtureRoot),
+			}).start(
+				options,
+				launcher(new SessionManager(), () => {
+					ambiguousLaunches++;
+				}),
+			),
+			"OPERATION_RETAINED",
+		);
+
+		expect(ambiguousLaunches).toBe(0);
+		expect(retained.details?.createdSessionId).toBe(first.sessionId);
+		expect(retained.details?.retainedWorktreePath).toBe(destination);
+		expect(retained.details?.retainedBranch).toBe("feature/session-boundary");
+		expect(existsSync(destination)).toBe(true);
+		expect(await worktreeRegistrations(repository, destination)).toBe(1);
+		expect(await git(repository, ["for-each-ref", "--format=%(refname)", "refs/heads"])).toBe(
+			expectedRefs,
+		);
+	});
+
+	it("replays a version-1 completed start after upgrade without relaunching", async () => {
+		const repo = await makeGitProject("legacy-success");
+		const options = request(repo, "legacy-success");
+		const first = await coordinator().start(options, launcher());
+		downgradeToVersionOne();
+		expect(journal.get("legacy-success")?.recordVersion).toBe(1);
+		expect(journal.get("legacy-success")?.session).toBeUndefined();
+
+		const restartedSessions = new SessionManager();
+		const restarted = coordinator({
+			sessionManager: restartedSessions,
+			workspaceManager: new WorkspaceManager(fixtureRoot),
+		});
+		await restarted.reconcileOnStartup();
+		let launches = 0;
+		const replay = await restarted.start(
+			options,
+			launcher(restartedSessions, () => {
+				launches++;
+			}),
+		);
+
+		expect(replay).toEqual(first);
+		expect(launches).toBe(0);
+		// The landed record has no workspace identity to restore, so discovery is
+		// not rehydrated; the recorded result is still authoritative.
+		expect(restartedSessions.list()).toHaveLength(0);
+		expect(journal.get("legacy-success")?.phase).toBe("session_started");
+	});
+
+	it("reports a vanished worktree as failed instead of claiming to retain it", async () => {
+		const repository = await makeGitProject("vanished-worktree-repo");
+		const inspected = await coordinator().inspect(repository);
+		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const options = worktreeRequest(repository, "worktree-vanished", base.ref, base.commit);
+		const first = await coordinator().start(options, launcher());
+		if (first.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+
+		rewritePhase("worktree-vanished", "worktree_ready");
+		await rm(first.execution.worktree.path, { recursive: true, force: true });
+		await git(repository, ["worktree", "prune"]);
+		let launches = 0;
+
+		const failure = await expectStartError(
+			coordinator({
+				sessionManager: new SessionManager(),
+				workspaceManager: new WorkspaceManager(fixtureRoot),
+			}).start(
+				options,
+				launcher(new SessionManager(), () => {
+					launches++;
+				}),
+			),
+			"OPERATION_RETAINED",
+		);
+
+		expect(launches).toBe(0);
+		// Nothing of this operation survives, so nothing may be reported as kept.
+		expect(failure.details).toEqual({
+			operationId: "worktree-vanished",
+			phase: "failed",
+			originProjectPath: repository,
+		});
+		expect(journal.get("worktree-vanished")?.phase).toBe("failed");
+	});
+
 	it("retains a version-1 launch boundary that could already have entered the runtime", async () => {
 		const repo = await makeGitProject("legacy-launch");
 		const state = await coordinator().inspect(repo);
 		const options = request(repo, "legacy-launch", branchPreparation(state, "feature/legacy"));
 		await coordinator().start(options, launcher());
 		rewritePhase("legacy-launch", "launch_requested");
-		await downgradeToVersionOne();
+		downgradeToVersionOne();
 		let launches = 0;
 
 		const retained = await expectStartError(

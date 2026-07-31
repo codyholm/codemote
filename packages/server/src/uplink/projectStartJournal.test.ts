@@ -207,7 +207,7 @@ describe("ProjectStartJournal", () => {
 
 	it("atomically updates a complete record", async () => {
 		const journal = new ProjectStartJournal(journalPath);
-		journal.create(record());
+		journal.create(record({ phase: "runtime_launch_requested", session: durableSession() }));
 		journal.update("operation-1", (current) => ({
 			...current,
 			phase: "session_started",
@@ -274,6 +274,112 @@ describe("ProjectStartJournal", () => {
 		expect((JSON.parse(await readFile(journalPath, "utf8")) as { version: number }).version).toBe(
 			2,
 		);
+	});
+
+	it("keeps a landed version-1 successful record loadable and replayable", async () => {
+		const { recordVersion: _recordVersion, ...legacy } = record({ phase: "session_started" });
+		await mkdir(dirname(journalPath), { recursive: true });
+		await writeFile(
+			journalPath,
+			JSON.stringify({ version: 1, operations: [{ ...legacy, result: terminalResult() }] }),
+			"utf8",
+		);
+
+		const loaded = new ProjectStartJournal(journalPath).get("operation-1");
+
+		// The landed writer recorded no durable session, so requiring one here
+		// would make a completed operation unreadable after the upgrade.
+		expect(loaded?.recordVersion).toBe(1);
+		expect(loaded?.phase).toBe("session_started");
+		expect(loaded?.session).toBeUndefined();
+		expect(loaded?.result?.sessionId).toBe("session-1");
+
+		// This writer's own successful records must still carry that identity.
+		await writeFile(
+			journalPath,
+			JSON.stringify({
+				version: 2,
+				operations: [{ ...record({ phase: "session_started" }), result: terminalResult() }],
+			}),
+			"utf8",
+		);
+		expectJournalError(() => new ProjectStartJournal(journalPath), "INVALID_PROJECT_START_JOURNAL");
+	});
+
+	it("rejects a phase change that skips a durable boundary or reopens a terminal record", () => {
+		const journal = new ProjectStartJournal(journalPath);
+		journal.create(record());
+
+		expectJournalError(
+			() =>
+				journal.update("operation-1", (current) => ({
+					...current,
+					phase: "session_recorded",
+					session: durableSession(),
+					updatedAt: 2000,
+				})),
+			"INVALID_PROJECT_START_JOURNAL",
+		);
+		expect(journal.get("operation-1")?.phase).toBe("recorded");
+
+		for (const phase of ["branch_created", "branch_checked_out", "launch_requested"] as const) {
+			journal.update("operation-1", (current) => ({ ...current, phase, updatedAt: 2000 }));
+		}
+		journal.update("operation-1", (current) => ({
+			...current,
+			phase: "session_recorded",
+			session: durableSession(),
+			updatedAt: 2000,
+		}));
+		expectJournalError(
+			() =>
+				journal.update("operation-1", (current) => ({
+					...current,
+					phase: "session_started",
+					result: terminalResult(),
+					updatedAt: 3000,
+				})),
+			"INVALID_PROJECT_START_JOURNAL",
+		);
+		journal.update("operation-1", (current) => ({
+			...current,
+			phase: "runtime_launch_requested",
+			updatedAt: 3000,
+		}));
+		journal.update("operation-1", (current) => ({
+			...current,
+			phase: "session_started",
+			result: terminalResult(),
+			updatedAt: 4000,
+		}));
+
+		// A late runtime-native ID is the same phase written again, which is allowed.
+		journal.update("operation-1", (current) =>
+			current.session
+				? {
+						...current,
+						session: { ...current.session, runtimeSessionId: "runtime-native-1" },
+						updatedAt: 5000,
+					}
+				: current,
+		);
+		expect(journal.get("operation-1")?.session?.runtimeSessionId).toBe("runtime-native-1");
+
+		expectJournalError(
+			() =>
+				journal.update("operation-1", (current) => {
+					const { result: _result, ...rest } = current;
+					return {
+						...rest,
+						phase: "retained",
+						updatedAt: 6000,
+						failure: terminalFailure("retained"),
+					};
+				}),
+			"INVALID_PROJECT_START_JOURNAL",
+		);
+		expect(journal.get("operation-1")?.phase).toBe("session_started");
+		expect(journal.get("operation-1")?.result?.sessionId).toBe("session-1");
 	});
 
 	it("rejects version-2 phases and payloads inside a version-1 file", async () => {

@@ -401,7 +401,7 @@ export class ProjectStartCoordinator {
 		await this.withRepositoryLock(record.repositoryRoot, async () => {
 			const truth = await this.managedWorktrees.inspectRecorded(this.recordedWorktree(record));
 			if (truth.status !== "exact") {
-				this.failWorktree(record, "OPERATION_RETAINED", this.describeTruth(truth));
+				this.failFromTruth(record, truth);
 			}
 			if (!truth.mapping.ok) {
 				this.failWorktree(record, truth.mapping.code, truth.mapping.message);
@@ -698,7 +698,7 @@ export class ProjectStartCoordinator {
 
 		const truth = await this.managedWorktrees.inspectRecorded(this.recordedWorktree(record));
 		if (truth.status !== "exact") {
-			return this.failWorktree(record, "OPERATION_RETAINED", this.describeTruth(truth));
+			return this.failFromTruth(record, truth);
 		}
 		if (!truth.mapping.ok) {
 			return this.failWorktree(record, truth.mapping.code, truth.mapping.message);
@@ -801,14 +801,7 @@ export class ProjectStartCoordinator {
 		const truth = await this.managedWorktrees.inspectRecorded(this.recordedWorktree(record));
 		if (truth.status === "absent") return this.createRecordedWorktree(record);
 		if (truth.status !== "exact") {
-			return this.failWorktree(
-				record,
-				"OPERATION_RETAINED",
-				this.describeTruth(truth),
-				undefined,
-				undefined,
-				truth.status !== "branch_only",
-			);
+			return this.failFromTruth(record, truth);
 		}
 		return this.journal.update(record.operationId, (current) => ({
 			...current,
@@ -1050,10 +1043,30 @@ export class ProjectStartCoordinator {
 			case "branch_only":
 				return "The requested branch exists without its worktree; nothing was reused or deleted";
 			case "absent":
-				return "The recorded worktree is missing";
+				return "The recorded worktree is no longer present; nothing was reused or deleted";
 			default:
 				return "The recorded worktree was retained";
 		}
+	}
+
+	/**
+	 * End an operation on inspection truth that cannot advance, naming only the
+	 * resources that actually exist: a provably absent worktree retains nothing,
+	 * and branch-only residue retains the branch rather than a missing path.
+	 */
+	private failFromTruth(record: WorktreeOperationRecord, truth: ManagedWorktreeTruth): never {
+		const message = this.describeTruth(truth);
+		if (truth.status === "absent") {
+			return this.failTerminal(record, "OPERATION_RETAINED", message);
+		}
+		return this.failWorktree(
+			record,
+			"OPERATION_RETAINED",
+			message,
+			undefined,
+			undefined,
+			truth.status !== "branch_only",
+		);
 	}
 
 	/**
@@ -1148,20 +1161,25 @@ export class ProjectStartCoordinator {
 	}
 
 	private failManagedBeforeCreation(record: WorktreeOperationRecord, error: unknown): never {
-		const code = error instanceof ManagedWorktreeError ? error.code : "WORKTREE_CREATE_FAILED";
-		const message = describeError(error);
+		return this.failTerminal(
+			record,
+			error instanceof ManagedWorktreeError ? error.code : "WORKTREE_CREATE_FAILED",
+			describeError(error),
+		);
+	}
+
+	/** Terminal failure with no request-owned resource left behind to report. */
+	private failTerminal(record: ProjectStartOperationRecord, code: string, message: string): never {
 		const details: ProjectStartFailureDetails = {
 			operationId: record.operationId,
 			phase: "failed",
 			originProjectPath: record.originProjectPath,
 		};
 		const failure = { code, message, details };
-		this.journal.update(record.operationId, (current) => ({
-			...current,
-			phase: "failed",
-			updatedAt: Date.now(),
-			failure,
-		}));
+		this.journal.update(record.operationId, (current) => {
+			const { rollback: _rollback, result: _result, ...rest } = current;
+			return { ...rest, phase: "failed", updatedAt: Date.now(), failure };
+		});
 		throw new ProjectStartError(code, message, details);
 	}
 
@@ -1508,7 +1526,9 @@ export class ProjectStartCoordinator {
 			}
 			throw error;
 		}
-		if (!git) {
+		// Only an operation that recorded a repository can lose one. A project that
+		// was never in Git has nothing to reconcile and must still resume.
+		if (record.repositoryRoot !== null && !git) {
 			return this.fail(
 				record,
 				"retained",
