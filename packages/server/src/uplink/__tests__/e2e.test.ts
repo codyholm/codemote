@@ -1,14 +1,15 @@
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { simpleGit } from "simple-git";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import { createRelayServer } from "../../relay/server.js";
 import { UplinkServer } from "../server.js";
 
 describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 	let testDir: string;
+	let pairingStorePath: string;
 	let relayServer: Awaited<ReturnType<typeof createRelayServer>>;
 	let uplinkServer: UplinkServer;
 	let relayPort: number;
@@ -17,19 +18,23 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 	beforeAll(async () => {
 		// Setup test repo
 		testDir = await mkdtemp(join(tmpdir(), "e2e-test-"));
+		pairingStorePath = join(testDir, "trusted-pairings.json");
 		const git = simpleGit(testDir);
 		await git.init(["--initial-branch=main"]);
 		await git.addConfig("user.email", "test@test.com");
 		await git.addConfig("user.name", "Test");
+		await git.addConfig("commit.gpgsign", "false");
 		await writeFile(join(testDir, "README.md"), "# E2E Test");
 		await git.add(".");
 		await git.commit("Initial commit");
 
 		// Start relay on random port
 		relayPort = 9900 + Math.floor(Math.random() * 100);
+		vi.stubEnv("CODEMOTE_TRUSTED_PAIRINGS", "1");
 		relayServer = await createRelayServer({
 			port: relayPort,
 			host: "127.0.0.1",
+			pairingStorePath,
 		});
 		await relayServer.start();
 
@@ -40,12 +45,16 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 			port: uplinkPort,
 			host: "127.0.0.1",
 			repoPath: testDir,
+			projectRegistryPath: join(testDir, "projects.json"),
+			projectStartJournalPath: join(testDir, "project-start-operations.json"),
+			managedWorktreeRoot: join(testDir, "managed-worktrees"),
 			runtimes: [], // Only use MockExecutor
 		});
 		await uplinkServer.start();
 	}, 30000);
 
 	afterAll(async () => {
+		vi.unstubAllEnvs();
 		await uplinkServer?.stop();
 		await relayServer?.stop();
 		// Clean up worktrees created during tests
@@ -107,6 +116,16 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 		const uplinkPaired = await uplinkPairedPromise;
 		expect(uplinkPaired["type"]).toBe("paired");
 		expect(uplinkPaired["mobileDeviceId"]).toBe("mobile-test-device-456");
+
+		const pairingStore = JSON.parse(await readFile(pairingStorePath, "utf8")) as {
+			records: Array<Record<string, unknown>>;
+		};
+		expect(pairingStore.records).toContainEqual(
+			expect.objectContaining({
+				uplinkDeviceId: "uplink-test-device-123",
+				mobileDeviceId: "mobile-test-device-456",
+			}),
+		);
 
 		// 3. Test message routing (simulated encrypted blob)
 		const messagePromise = waitForMessageOfType(uplinkWs, "message");
