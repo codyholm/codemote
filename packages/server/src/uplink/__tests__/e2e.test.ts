@@ -2,7 +2,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { simpleGit } from "simple-git";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import { createRelayServer } from "../../relay/server.js";
 import { UplinkServer } from "../server.js";
@@ -30,6 +30,7 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 
 		// Start relay on random port
 		relayPort = 9900 + Math.floor(Math.random() * 100);
+		vi.stubEnv("CODEMOTE_TRUSTED_PAIRINGS", "1");
 		relayServer = await createRelayServer({
 			port: relayPort,
 			host: "127.0.0.1",
@@ -53,6 +54,7 @@ describe("E2E: Mobile -> Relay -> Uplink Flow", () => {
 	}, 30000);
 
 	afterAll(async () => {
+		vi.unstubAllEnvs();
 		await uplinkServer?.stop();
 		await relayServer?.stop();
 		// Clean up worktrees created during tests
