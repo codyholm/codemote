@@ -19,6 +19,7 @@ import {
 	restrictDirPermissions,
 	restrictFilePermissions,
 } from "../relay/services/win-permissions.js";
+import type { DurableProjectSession } from "./types.js";
 
 export interface ProjectStartJournalFailure {
 	code: string;
@@ -26,18 +27,49 @@ export interface ProjectStartJournalFailure {
 	details?: ProjectStartFailureDetails;
 }
 
+/**
+ * Intent to remove an exact, clean, unlaunched managed worktree, plus the
+ * original launch failure the operation ends with once rollback completes.
+ */
+export interface ProjectStartRollbackIntent {
+	requestedAt: number;
+	code: string;
+	message: string;
+}
+
+/**
+ * Server-internal phases. The mobile protocol keeps the landed
+ * `ProjectStartPhase`; the session, runtime-launch and rollback boundaries below
+ * exist only in the journal and are reported to a caller as `failed`/`retained`.
+ */
+export type ProjectStartJournalPhase =
+	| ProjectStartPhase
+	| "session_recorded"
+	| "runtime_launch_requested"
+	| "rollback_requested"
+	| "worktree_removed";
+
 interface ProjectStartOperationBase {
 	operationId: string;
 	fingerprint: string;
+	/**
+	 * Which writer last recorded this record's phase. A landed version-1
+	 * `launch_requested` may already have entered runtime code, because that build
+	 * had no boundary between preparation and the runtime call; a version-2 one
+	 * provably has not.
+	 */
+	recordVersion: 1 | 2;
 	originProjectPath: string;
 	runtime: RuntimeType;
 	repositoryRoot: string | null;
 	observedHead: string | null;
 	observedBranch: string | null;
 	requestedBranch: string | null;
-	phase: ProjectStartPhase;
+	phase: ProjectStartJournalPhase;
 	createdAt: number;
 	updatedAt: number;
+	session?: DurableProjectSession;
+	rollback?: ProjectStartRollbackIntent;
 	result?: RunResult;
 	failure?: ProjectStartJournalFailure;
 }
@@ -67,8 +99,10 @@ type ProjectStartJournalErrorCode =
 	| "OPERATION_CONFLICT"
 	| "OPERATION_NOT_FOUND";
 
+type ProjectStartJournalVersion = 1 | 2;
+
 interface ProjectStartJournalFile {
-	version: 1;
+	version: 2;
 	operations: ProjectStartOperationRecord[];
 }
 
@@ -117,8 +151,8 @@ function runtime(value: unknown): RuntimeType {
 	return invalid("Invalid journal field: runtime");
 }
 
-function phase(value: unknown): ProjectStartPhase {
-	if (
+function isMobilePhase(value: unknown): value is ProjectStartPhase {
+	return (
 		value === "recorded" ||
 		value === "branch_created" ||
 		value === "branch_checked_out" ||
@@ -128,10 +162,80 @@ function phase(value: unknown): ProjectStartPhase {
 		value === "session_started" ||
 		value === "failed" ||
 		value === "retained"
+	);
+}
+
+function phase(value: unknown): ProjectStartPhase {
+	if (isMobilePhase(value)) return value;
+	return invalid("Invalid journal field: phase");
+}
+
+function journalPhase(
+	value: unknown,
+	version: ProjectStartJournalVersion,
+): ProjectStartJournalPhase {
+	if (isMobilePhase(value)) return value;
+	if (
+		version === 2 &&
+		(value === "session_recorded" ||
+			value === "runtime_launch_requested" ||
+			value === "rollback_requested" ||
+			value === "worktree_removed")
 	) {
 		return value;
 	}
 	return invalid("Invalid journal field: phase");
+}
+
+/**
+ * Every phase change this writer is allowed to record, keyed by current phase.
+ * Re-recording the same phase is always allowed; it is how a record is
+ * re-timestamped or given a late runtime-native session ID.
+ *
+ * The table exists so no future path can skip a durable boundary: a session
+ * cannot appear without a prepared launch, a runtime launch cannot be recorded
+ * without a session, and a terminal record can never be reopened. Loading is
+ * unaffected, so records written by older builds stay readable.
+ */
+const ALLOWED_TRANSITIONS: Record<ProjectStartJournalPhase, readonly ProjectStartJournalPhase[]> = {
+	recorded: ["branch_created", "worktree_created", "launch_requested", "failed", "retained"],
+	branch_created: ["branch_checked_out", "failed", "retained"],
+	branch_checked_out: ["launch_requested", "failed", "retained"],
+	worktree_created: ["worktree_ready", "failed", "retained"],
+	worktree_ready: ["launch_requested", "failed", "retained"],
+	// `session_started` direct from here covers a launch callback that recorded
+	// no session of its own; it still ends as exactly one recorded session.
+	launch_requested: [
+		"session_recorded",
+		"session_started",
+		"rollback_requested",
+		"failed",
+		"retained",
+	],
+	session_recorded: ["runtime_launch_requested", "failed", "retained"],
+	runtime_launch_requested: ["session_started", "failed", "retained"],
+	rollback_requested: ["worktree_removed", "failed", "retained"],
+	worktree_removed: ["failed", "retained"],
+	session_started: [],
+	failed: [],
+	retained: [],
+};
+
+/**
+ * The phase a caller is allowed to see. Internal boundaries collapse onto the
+ * landed protocol value that carries the same meaning for the phone.
+ */
+export function mobilePhase(value: ProjectStartJournalPhase): ProjectStartPhase {
+	switch (value) {
+		case "session_recorded":
+		case "runtime_launch_requested":
+			return "launch_requested";
+		case "rollback_requested":
+		case "worktree_removed":
+			return "retained";
+		default:
+			return value;
+	}
 }
 
 function parseExecution(value: unknown): SessionExecutionState {
@@ -211,6 +315,39 @@ function parseResult(value: unknown): RunResult {
 	return result;
 }
 
+function parseSession(value: unknown): DurableProjectSession {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return invalid("Invalid journal durable session");
+	}
+	const candidate = value as Record<string, unknown>;
+	const session: DurableProjectSession = {
+		sessionId: requiredString(candidate["sessionId"], "session.sessionId"),
+		runId: requiredString(candidate["runId"], "session.runId"),
+		workspaceId: requiredString(candidate["workspaceId"], "session.workspaceId"),
+		createdAt: timestamp(candidate["createdAt"], "session.createdAt"),
+		execution: parseExecution(candidate["execution"]),
+	};
+	if (candidate["runtimeSessionId"] !== undefined) {
+		session.runtimeSessionId = requiredString(
+			candidate["runtimeSessionId"],
+			"session.runtimeSessionId",
+		);
+	}
+	return session;
+}
+
+function parseRollback(value: unknown): ProjectStartRollbackIntent {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return invalid("Invalid journal rollback intent");
+	}
+	const candidate = value as Record<string, unknown>;
+	return {
+		requestedAt: timestamp(candidate["requestedAt"], "rollback.requestedAt"),
+		code: requiredString(candidate["code"], "rollback.code"),
+		message: requiredString(candidate["message"], "rollback.message"),
+	};
+}
+
 function parseFailureDetails(value: unknown): ProjectStartFailureDetails {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		return invalid("Invalid journal failure details");
@@ -275,7 +412,55 @@ function isConsistentWorktreeExecution(
 	);
 }
 
-function parseRecord(value: unknown): ProjectStartOperationRecord {
+function recordVersion(value: unknown, version: ProjectStartJournalVersion): 1 | 2 {
+	if (version === 1) return 1;
+	if (value === undefined || value === 2) return 2;
+	if (value === 1) return 1;
+	return invalid("Invalid journal field: recordVersion");
+}
+
+/**
+ * One rule for every execution tuple a record can own, so a durable session and
+ * the terminal result it produced cannot describe different directories.
+ */
+function assertConsistentExecution(
+	record: ProjectStartOperationRecord,
+	execution: SessionExecutionState | undefined,
+): void {
+	if (!execution || execution.mode !== record.mode) {
+		invalid("Journal record has an inconsistent execution mode");
+	}
+	if (record.mode === "worktree") {
+		if (!isConsistentWorktreeExecution(record, execution)) {
+			invalid("Worktree journal record has inconsistent ownership");
+		}
+		return;
+	}
+	if (execution.directory !== record.originProjectPath) {
+		invalid("Journal record has an inconsistent execution directory");
+	}
+	if (record.repositoryRoot === null) {
+		if (execution.git !== null) {
+			invalid("Non-Git journal record contains Git execution state");
+		}
+		return;
+	}
+	const expectedBranch = record.requestedBranch ?? record.observedBranch;
+	if (
+		!execution.git ||
+		execution.git.repositoryRoot !== record.repositoryRoot ||
+		execution.git.head !== record.observedHead ||
+		execution.git.branch !== expectedBranch ||
+		execution.git.detached !== (execution.git.head !== null && execution.git.branch === null)
+	) {
+		invalid("Journal record has inconsistent Git execution state");
+	}
+}
+
+function parseRecord(
+	value: unknown,
+	version: ProjectStartJournalVersion = 2,
+): ProjectStartOperationRecord {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		return invalid("Invalid project start operation record");
 	}
@@ -287,16 +472,18 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 		candidate["repositoryRoot"] === null
 			? null
 			: absolutePath(candidate["repositoryRoot"], "repositoryRoot");
+	const parsedVersion = recordVersion(candidate["recordVersion"], version);
 	const common = {
 		operationId: requiredString(candidate["operationId"], "operationId"),
 		fingerprint: requiredString(candidate["fingerprint"], "fingerprint"),
+		recordVersion: parsedVersion,
 		originProjectPath: absolutePath(candidate["originProjectPath"], "originProjectPath"),
 		runtime: runtime(candidate["runtime"]),
 		repositoryRoot,
 		observedHead: nullableString(candidate["observedHead"], "observedHead"),
 		observedBranch: nullableString(candidate["observedBranch"], "observedBranch"),
 		requestedBranch: nullableString(candidate["requestedBranch"], "requestedBranch"),
-		phase: phase(candidate["phase"]),
+		phase: journalPhase(candidate["phase"], parsedVersion),
 		createdAt: timestamp(candidate["createdAt"], "createdAt"),
 		updatedAt: timestamp(candidate["updatedAt"], "updatedAt"),
 	};
@@ -332,15 +519,39 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 			},
 		};
 	}
+	if (candidate["session"] !== undefined) record.session = parseSession(candidate["session"]);
+	if (candidate["rollback"] !== undefined) record.rollback = parseRollback(candidate["rollback"]);
 	if (candidate["result"] !== undefined) record.result = parseResult(candidate["result"]);
 	if (candidate["failure"] !== undefined) record.failure = parseFailure(candidate["failure"]);
 	const hasResult = record.result !== undefined;
 	const hasFailure = record.failure !== undefined;
+	const isTerminal = record.phase === "failed" || record.phase === "retained";
 	if (hasResult !== (record.phase === "session_started")) {
 		invalid("Journal result must exist only for a started session");
 	}
-	if (hasFailure !== (record.phase === "failed" || record.phase === "retained")) {
+	if (hasFailure !== isTerminal) {
 		invalid("Journal failure must exist only for a failed or retained operation");
+	}
+	const carriesSession =
+		record.phase === "session_recorded" ||
+		record.phase === "runtime_launch_requested" ||
+		record.phase === "session_started";
+	// Only this writer's records are required to carry a session. A landed
+	// version-1 success recorded its result before durable session identity
+	// existed, and must stay loadable and replayable after the upgrade.
+	if (carriesSession && record.recordVersion === 2 && !record.session) {
+		invalid("Journal phase is missing its durable session identity");
+	}
+	if (record.session && !carriesSession && !isTerminal) {
+		invalid("Journal phase cannot carry a durable session identity");
+	}
+	const requiresRollback =
+		record.phase === "rollback_requested" || record.phase === "worktree_removed";
+	if (requiresRollback !== (record.rollback !== undefined)) {
+		invalid("Journal rollback intent must exist only for a rollback phase");
+	}
+	if (requiresRollback && (record.mode !== "worktree" || record.session)) {
+		invalid("Only an unlaunched Worktree operation can record rollback intent");
 	}
 	if (record.updatedAt < record.createdAt) {
 		invalid("Journal update timestamp precedes creation");
@@ -357,6 +568,8 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 		(record.phase === "branch_created" ||
 			record.phase === "branch_checked_out" ||
 			record.phase === "launch_requested" ||
+			record.phase === "session_recorded" ||
+			record.phase === "runtime_launch_requested" ||
 			record.phase === "session_started" ||
 			record.phase === "retained") &&
 		(record.repositoryRoot === null || record.observedHead === null)
@@ -374,7 +587,10 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 		(record.mode === "worktree" &&
 			(record.phase === "branch_created" || record.phase === "branch_checked_out")) ||
 		(record.mode === "project_folder" &&
-			(record.phase === "worktree_created" || record.phase === "worktree_ready"))
+			(record.phase === "worktree_created" ||
+				record.phase === "worktree_ready" ||
+				record.phase === "rollback_requested" ||
+				record.phase === "worktree_removed"))
 	) {
 		invalid("Journal phase does not match its start mode");
 	}
@@ -387,40 +603,22 @@ function parseRecord(value: unknown): ProjectStartOperationRecord {
 		invalid("Successful journal record has inconsistent project start metadata");
 	}
 	if (record.result) {
-		const execution = record.result.execution;
-		if (!execution || execution.mode !== record.mode) {
-			invalid("Successful journal record has an inconsistent execution mode");
-		}
-		if (record.mode === "project_folder" && execution.directory !== record.originProjectPath) {
-			invalid("Successful journal record has an inconsistent execution directory");
-		}
-		if (record.mode === "worktree") {
-			if (!isConsistentWorktreeExecution(record, execution)) {
-				invalid("Successful Worktree journal record has inconsistent ownership");
-			}
-		} else if (record.repositoryRoot === null) {
-			if (execution.git !== null) {
-				invalid("Successful non-Git journal record contains Git execution state");
-			}
-		} else {
-			const expectedBranch = record.requestedBranch ?? record.observedBranch;
-			if (
-				!execution.git ||
-				execution.git.repositoryRoot !== record.repositoryRoot ||
-				execution.git.head !== record.observedHead ||
-				execution.git.branch !== expectedBranch ||
-				execution.git.detached !== (execution.git.head !== null && execution.git.branch === null)
-			) {
-				invalid("Successful journal record has inconsistent Git execution state");
-			}
+		assertConsistentExecution(record, record.result.execution);
+		if (
+			record.session &&
+			(record.session.sessionId !== record.result.sessionId ||
+				record.session.runId !== record.result.runId)
+		) {
+			invalid("Successful journal record has an inconsistent durable session identity");
 		}
 	}
+	if (record.session) assertConsistentExecution(record, record.session.execution);
 	if (
 		record.failure &&
 		(!record.failure.details ||
 			record.failure.details.operationId !== record.operationId ||
 			record.failure.details.originProjectPath !== record.originProjectPath ||
-			record.failure.details.phase !== record.phase)
+			record.failure.details.phase !== mobilePhase(record.phase))
 	) {
 		invalid("Terminal journal record has inconsistent failure details");
 	}
@@ -481,10 +679,11 @@ function parseFile(value: unknown): ProjectStartOperationRecord[] {
 		return invalid();
 	}
 	const candidate = value as Record<string, unknown>;
-	if (candidate["version"] !== 1 || !Array.isArray(candidate["operations"])) invalid();
+	const version = candidate["version"];
+	if ((version !== 1 && version !== 2) || !Array.isArray(candidate["operations"])) invalid();
 	const ids = new Set<string>();
 	return candidate["operations"].map((value) => {
-		const record = parseRecord(value);
+		const record = parseRecord(value, version === 1 ? 1 : 2);
 		if (ids.has(record.operationId)) invalid(`Duplicate operation ID: ${record.operationId}`);
 		ids.add(record.operationId);
 		return record;
@@ -498,7 +697,7 @@ function cloneRecord(record: ProjectStartOperationRecord): ProjectStartOperation
 function errorDetails(record: ProjectStartOperationRecord): ProjectStartFailureDetails {
 	return {
 		operationId: record.operationId,
-		phase: record.phase,
+		phase: mobilePhase(record.phase),
 		originProjectPath: record.originProjectPath,
 	};
 }
@@ -548,12 +747,23 @@ export class ProjectStartJournal {
 				`Project start operation not found: ${operationId}`,
 			);
 		}
-		const updated = parseRecord(mutate(cloneRecord(current)));
+		const mutated = mutate(cloneRecord(current));
+		// A phase this writer records carries this writer's guarantees; a record
+		// merely re-timestamped keeps the provenance of whoever wrote its phase.
+		const updated = parseRecord(
+			mutated.phase === current.phase ? mutated : { ...mutated, recordVersion: 2 },
+		);
 		if (updated.operationId !== operationId) {
 			throw new ProjectStartJournalError(
 				"OPERATION_CONFLICT",
 				"Project start operation ID cannot change",
 			);
+		}
+		if (
+			updated.phase !== current.phase &&
+			!ALLOWED_TRANSITIONS[current.phase].includes(updated.phase)
+		) {
+			invalid(`Invalid journal phase transition: ${current.phase} to ${updated.phase}`);
 		}
 		const candidate = [...this.operations];
 		candidate[index] = updated;
@@ -598,7 +808,7 @@ export class ProjectStartJournal {
 		details?: ProjectStartFailureDetails,
 	): void {
 		const file: ProjectStartJournalFile = {
-			version: 1,
+			version: 2,
 			operations: operations.map(cloneRecord),
 		};
 		const tmpPath = `${this.filePath}.tmp`;

@@ -105,9 +105,36 @@ export interface Session {
 	execution?: SessionExecutionState;
 }
 
+/**
+ * The one Codemote session identity a Git-aware start operation owns, durable
+ * enough to restore discovery and replay a terminal result after a restart.
+ * Runtime output, prompts, approvals and process handles are deliberately absent.
+ */
+export interface DurableProjectSession {
+	sessionId: string;
+	runId: string;
+	workspaceId: string;
+	createdAt: number;
+	execution: SessionExecutionState;
+	runtimeSessionId?: string;
+}
+
+/**
+ * Durable boundaries the base executor crosses on behalf of a Git-aware start.
+ * `session` carries an already-recorded identity to reuse after a restart; both
+ * callbacks must persist before the executor may continue, so runtime-specific
+ * code can never run ahead of the phase that admits it might have run.
+ */
+export interface ProjectSessionLaunchControl {
+	session?: DurableProjectSession;
+	recordSession(session: Session): void;
+	recordRuntimeLaunchRequested(session: Session): void;
+}
+
 export interface SessionStartContext {
 	originProjectPath: string;
 	execution: SessionExecutionState;
+	launch?: ProjectSessionLaunchControl;
 }
 
 /**

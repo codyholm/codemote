@@ -3,10 +3,38 @@ import type { RuntimeType, SessionStatus } from "@codemote/common";
 import type { Session, SessionStartContext, Workspace } from "./types.js";
 
 /**
+ * Persists a runtime-native session ID for a session bound to a Git-aware start
+ * operation. Throwing means the ID was not made durable.
+ */
+export type RuntimeSessionPersist = (sessionId: string, runtimeSessionId: string) => void;
+
+export class SessionRestoreConflictError extends Error {
+	readonly code = "SESSION_RESTORE_CONFLICT";
+
+	constructor(sessionId: string) {
+		super(`Session ID is already in use by a different session: ${sessionId}`);
+		this.name = "SessionRestoreConflictError";
+	}
+}
+
+function sameSessionIdentity(a: Session, b: Session): boolean {
+	return (
+		a.id === b.id &&
+		a.runId === b.runId &&
+		a.runtime === b.runtime &&
+		a.workspace.id === b.workspace.id &&
+		a.workspace.workingDir === b.workspace.workingDir &&
+		a.originProjectPath === b.originProjectPath &&
+		a.execution?.directory === b.execution?.directory
+	);
+}
+
+/**
  * Manages session lifecycle
  */
 export class SessionManager {
 	private sessions = new Map<string, Session>();
+	private runtimeSessionPersistence = new Map<string, RuntimeSessionPersist>();
 
 	/**
 	 * Create a new session
@@ -35,6 +63,41 @@ export class SessionManager {
 
 		this.sessions.set(id, session);
 		return session;
+	}
+
+	/**
+	 * Re-register an exact session recorded by a previous process.
+	 *
+	 * Idempotent for the same identity, and refuses to replace a different
+	 * session that already holds the ID rather than silently taking it over.
+	 */
+	restore(session: Session): Session {
+		const existing = this.sessions.get(session.id);
+		if (existing) {
+			if (!sameSessionIdentity(existing, session)) {
+				throw new SessionRestoreConflictError(session.id);
+			}
+			return existing;
+		}
+		this.sessions.set(session.id, session);
+		return session;
+	}
+
+	/**
+	 * Forget a session and any persistence bound to it.
+	 */
+	remove(sessionId: string): void {
+		this.sessions.delete(sessionId);
+		this.runtimeSessionPersistence.delete(sessionId);
+	}
+
+	/**
+	 * Bind a session's runtime-native ID to durable operation state. Only
+	 * sessions created by a Git-aware start have one; every other session stays
+	 * in memory exactly as before.
+	 */
+	bindRuntimeSessionPersistence(sessionId: string, persist: RuntimeSessionPersist): void {
+		this.runtimeSessionPersistence.set(sessionId, persist);
 	}
 
 	/**
@@ -85,6 +148,21 @@ export class SessionManager {
 	setRuntimeSessionId(sessionId: string, runtimeSessionId: string): void {
 		const session = this.sessions.get(sessionId);
 		if (!session) return;
+		const persist = this.runtimeSessionPersistence.get(sessionId);
+		if (persist && session.runtimeSessionId !== runtimeSessionId) {
+			try {
+				// Durable first: an ID accepted in memory but lost from the journal
+				// would make a restarted process disagree with this one about how the
+				// runtime session is named.
+				persist(sessionId, runtimeSessionId);
+			} catch (error) {
+				console.error(
+					`Failed to persist runtime session ID for ${sessionId}:`,
+					error instanceof Error ? error.message : error,
+				);
+				return;
+			}
+		}
 		session.runtimeSessionId = runtimeSessionId;
 		session.lastActivityAt = Date.now();
 	}
@@ -154,7 +232,7 @@ export class SessionManager {
 
 		for (const [id, session] of this.sessions) {
 			if (session.endedAt && session.endedAt < cutoff) {
-				this.sessions.delete(id);
+				this.remove(id);
 				removed++;
 			}
 		}

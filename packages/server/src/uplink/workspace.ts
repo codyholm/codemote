@@ -7,6 +7,15 @@ import type { GitStatusSummary, Workspace, WorkspaceConfig } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
+export class WorkspaceRestoreConflictError extends Error {
+	readonly code = "WORKSPACE_RESTORE_CONFLICT";
+
+	constructor(workspaceId: string) {
+		super(`Workspace ID is already in use by a different working directory: ${workspaceId}`);
+		this.name = "WorkspaceRestoreConflictError";
+	}
+}
+
 /**
  * Manages runtime workspaces.
  *
@@ -29,6 +38,24 @@ export class WorkspaceManager {
 			workingDir,
 			createdAt: Date.now(),
 		};
+		this.workspaces.set(workspace.id, workspace);
+		return workspace;
+	}
+
+	/**
+	 * Re-register an exact workspace recorded by a previous process.
+	 *
+	 * Idempotent for the same identity, and refuses to replace a different
+	 * workspace holding the same ID. Creates and moves nothing on disk.
+	 */
+	restore(workspace: Workspace): Workspace {
+		const existing = this.workspaces.get(workspace.id);
+		if (existing) {
+			if (existing.workingDir !== workspace.workingDir) {
+				throw new WorkspaceRestoreConflictError(workspace.id);
+			}
+			return existing;
+		}
 		this.workspaces.set(workspace.id, workspace);
 		return workspace;
 	}

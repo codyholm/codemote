@@ -15,7 +15,13 @@ import {
 } from "@codemote/common";
 import { type EventBus, createEvent } from "./events.js";
 import type { SessionManager } from "./session.js";
-import type { Session, SessionStartContext, WorkspaceConfig } from "./types.js";
+import type {
+	DurableProjectSession,
+	Session,
+	SessionStartContext,
+	Workspace,
+	WorkspaceConfig,
+} from "./types.js";
 import type { WorkspaceManager } from "./workspace.js";
 
 /**
@@ -77,16 +83,37 @@ export abstract class BaseExecutor {
 	 * Start a new run
 	 */
 	async startRun(options: RunOptions, context?: SessionStartContext): Promise<RunResult> {
+		const control = context?.launch;
+		const recorded = control?.session;
 		// Create or get workspace
 		const workspaceConfig: WorkspaceConfig = {
 			repoPath: options.workspace,
-			workspaceId: this.generateWorkspaceId(),
+			workspaceId: recorded?.workspaceId ?? this.generateWorkspaceId(),
 		};
 
 		const workspace = await this.workspaceManager.create(workspaceConfig);
-		const session = this.sessionManager.create(this.type, workspace, context);
+		const session = recorded
+			? this.sessionManager.restore(this.recoveredSession(recorded, workspace, context))
+			: this.sessionManager.create(this.type, workspace, context);
+
+		// Each boundary is durable before the action it admits to. A session this
+		// process cannot record must not exist for the runtime to write into, so
+		// failing to persist discards it instead of leaving a phantom behind.
+		try {
+			control?.recordSession(session);
+		} catch (error) {
+			await this.discardSession(session.id, workspace.id);
+			throw error;
+		}
 
 		this.emitStatus(session.id, "starting");
+
+		try {
+			control?.recordRuntimeLaunchRequested(session);
+		} catch (error) {
+			await this.discardSession(session.id, workspace.id);
+			throw error;
+		}
 
 		try {
 			await this.doStartRun(session, options);
@@ -268,6 +295,42 @@ export abstract class BaseExecutor {
 
 	private generateWorkspaceId(): string {
 		return `ws-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	}
+
+	/**
+	 * Rebuild the exact session identity a previous process recorded, so a
+	 * retransmission after a restart launches into the same session rather than
+	 * allocating a second one.
+	 */
+	private recoveredSession(
+		recorded: DurableProjectSession,
+		workspace: Workspace,
+		context?: SessionStartContext,
+	): Session {
+		const now = Date.now();
+		return {
+			id: recorded.sessionId,
+			runId: recorded.runId,
+			runtime: this.type,
+			status: "starting",
+			workspace,
+			startedAt: recorded.createdAt,
+			endedAt: null,
+			lastActivityAt: now,
+			statusChangedAt: now,
+			...(recorded.runtimeSessionId ? { runtimeSessionId: recorded.runtimeSessionId } : {}),
+			...(context
+				? {
+						originProjectPath: context.originProjectPath,
+						execution: context.execution,
+					}
+				: {}),
+		};
+	}
+
+	private async discardSession(sessionId: string, workspaceId: string): Promise<void> {
+		this.sessionManager.remove(sessionId);
+		await this.workspaceManager.remove(workspaceId);
 	}
 
 	// ========================================

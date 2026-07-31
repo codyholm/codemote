@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type { GitWorktreeBase, WorktreeStartState } from "@codemote/common";
+import type { GitCheckoutState, GitWorktreeBase, WorktreeStartState } from "@codemote/common";
 import type { GitCommandResult, GitCommandRunner } from "./projectStart.js";
 
 export type ManagedWorktreeErrorCode =
@@ -30,11 +30,64 @@ export interface ManagedWorktreePlan {
 	projectRelativePath: string;
 }
 
+/** The immutable ownership tuple a journal record holds for one worktree. */
+export interface RecordedManagedWorktree {
+	repositoryRoot: string;
+	destination: string;
+	selectedBaseRef: string;
+	selectedBaseCommit: string;
+	projectRelativePath: string;
+	requestedBranch: string | null;
+}
+
+export type ManagedWorktreeMapping =
+	| { ok: true; directory: string }
+	| { ok: false; code: ManagedWorktreeErrorCode; message: string };
+
+/**
+ * Exhaustive classification of current Git and filesystem truth against a
+ * recorded worktree. Anything that cannot be established is `uncertain`, never
+ * `absent` and never clean.
+ */
+export type ManagedWorktreeTruth =
+	| { status: "absent" }
+	/** Registration and directory are provably gone; the exact branch remains. */
+	| { status: "branch_only" }
+	/**
+	 * `retainsDestination` is false only when the recorded destination is provably
+	 * gone: no directory, no registration naming it, nothing for the owner to
+	 * inspect there. A caller reporting retained resources must not name the path
+	 * in that case, though a surviving branch is still worth naming.
+	 */
+	| { status: "changed"; reason: string; retainsDestination: boolean }
+	| { status: "uncertain"; reason: string }
+	| {
+			status: "exact";
+			git: GitCheckoutState;
+			mapping: ManagedWorktreeMapping;
+			selectedBaseMatches: boolean;
+			clean: boolean;
+	  };
+
+export type ManagedWorktreeRemoval = { status: "removed" } | { status: "retained"; reason: string };
+
+interface WorktreeRegistration {
+	path: string;
+	head: string | null;
+	branch: string | null;
+	detached: boolean;
+}
+
+function describe(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 function line(value: string): string {
 	return value.replace(/[\r\n]+$/u, "");
 }
 
-function contained(parent: string, child: string): boolean {
+/** Whether `child` is `parent` itself or lies beneath it, on canonical paths. */
+export function containedIn(parent: string, child: string): boolean {
 	const path = relative(parent, child);
 	return path === "" || (!path.startsWith("..") && !isAbsolute(path));
 }
@@ -162,7 +215,7 @@ export class ManagedWorktreeService {
 	): Promise<ManagedWorktreePlan> {
 		const canonicalRepository = await realpath(repositoryRoot);
 		const canonicalOrigin = await realpath(originProjectPath);
-		if (!contained(canonicalRepository, canonicalOrigin)) {
+		if (!containedIn(canonicalRepository, canonicalOrigin)) {
 			throw new ManagedWorktreeError(
 				"WORKTREE_PROJECT_PATH_UNSAFE",
 				"Registered project is outside its source repository",
@@ -215,7 +268,7 @@ export class ManagedWorktreeService {
 			if (field.startsWith("worktree "))
 				unsafe.push(await realpath(field.slice("worktree ".length)));
 		}
-		if (unsafe.some((path) => contained(path, canonicalDestination))) {
+		if (unsafe.some((path) => containedIn(path, canonicalDestination))) {
 			throw new ManagedWorktreeError(
 				"UNSAFE_WORKTREE_DESTINATION",
 				"Managed destination is inside a checkout or Git metadata",
@@ -292,6 +345,208 @@ export class ManagedWorktreeService {
 		}
 	}
 
+	/**
+	 * Compare current truth with a recorded worktree without touching anything.
+	 *
+	 * `exact` means every immutable value the record owns still matches: the
+	 * canonical destination is registered exactly once to the recorded source
+	 * repository, at the recorded commit, in the recorded attached or detached
+	 * state. Everything else is `changed`, `absent`, `branch_only` or `uncertain`.
+	 */
+	async inspectRecorded(recorded: RecordedManagedWorktree): Promise<ManagedWorktreeTruth> {
+		const branchRef = recorded.requestedBranch ? `refs/heads/${recorded.requestedBranch}` : null;
+		try {
+			const registrations = await this.listRegistrations(recorded.repositoryRoot);
+			const canonicalDestination = await this.canonicalOrNull(recorded.destination);
+			const normalizedDestination = resolve(recorded.destination);
+			// The recorded destination is canonical by construction, so a path that
+			// now resolves elsewhere is a substitution — even when it lands on
+			// another registered worktree at the same commit and branch. Adopting,
+			// launching into or removing through it would act on the wrong checkout.
+			if (canonicalDestination !== null && canonicalDestination !== normalizedDestination) {
+				return {
+					status: "changed",
+					reason: `The recorded worktree destination ${normalizedDestination} now resolves to ${canonicalDestination}`,
+					retainsDestination: true,
+				};
+			}
+			const registered = await this.findRegistration(
+				registrations,
+				recorded.destination,
+				canonicalDestination,
+			);
+			const tip = branchRef ? await this.refTip(recorded.repositoryRoot, branchRef) : null;
+
+			if (!registered) {
+				if (canonicalDestination) {
+					return {
+						status: "changed",
+						reason: `A directory exists at ${recorded.destination} without a matching worktree registration`,
+						retainsDestination: true,
+					};
+				}
+				if (registrations.some((entry) => branchRef !== null && entry.branch === branchRef)) {
+					return {
+						status: "changed",
+						reason: `The requested branch is checked out in another worktree: ${recorded.requestedBranch}`,
+						// Destination absent and unregistered: only the branch survives.
+						retainsDestination: false,
+					};
+				}
+				if (tip === null) return { status: "absent" };
+				if (tip !== recorded.selectedBaseCommit) {
+					return {
+						status: "changed",
+						reason: `The requested branch moved away from the recorded commit: ${recorded.requestedBranch}`,
+						// Destination absent and unregistered: only the branch survives.
+						retainsDestination: false,
+					};
+				}
+				return { status: "branch_only" };
+			}
+
+			// The directory is gone but Git still registers it. Say exactly that,
+			// rather than letting the next command fail on the missing directory and
+			// report an unhelpful inspection error. Nothing here removes the stale
+			// registration; clearing it is the owner's call.
+			if (!canonicalDestination) {
+				return {
+					status: "changed",
+					reason: `The recorded worktree directory ${recorded.destination} is missing while ${recorded.repositoryRoot} still registers it; \`git worktree prune\` clears the stale registration once you are sure the directory is gone for good`,
+					// The stale registration still names the path, so it is inspectable.
+					retainsDestination: true,
+				};
+			}
+
+			const mismatch = this.registrationMismatch(recorded, registered, branchRef, tip);
+			if (mismatch) return { status: "changed", reason: mismatch, retainsDestination: true };
+			const common = await this.commonGitDirectory(recorded.destination);
+			const sourceCommon = await this.commonGitDirectory(recorded.repositoryRoot);
+			if (common !== sourceCommon) {
+				return {
+					status: "changed",
+					reason: "The recorded worktree belongs to a different repository",
+					retainsDestination: true,
+				};
+			}
+
+			const selectedBase = await this.refTip(
+				recorded.repositoryRoot,
+				`${recorded.selectedBaseRef}^{commit}`,
+			);
+			const status = await this.git(recorded.destination, [
+				"status",
+				"--porcelain=v1",
+				"-z",
+				"--untracked-files=all",
+				"--ignored=matching",
+			]);
+			return {
+				status: "exact",
+				git: {
+					repositoryRoot: recorded.destination,
+					head: recorded.selectedBaseCommit,
+					branch: recorded.requestedBranch,
+					detached: recorded.requestedBranch === null,
+				},
+				mapping: await this.inspectMapping(recorded),
+				selectedBaseMatches: selectedBase === recorded.selectedBaseCommit,
+				clean: status.stdout === "",
+			};
+		} catch (error) {
+			return { status: "uncertain", reason: describe(error) };
+		}
+	}
+
+	/**
+	 * Remove an exact, clean, unlaunched worktree after proving it again.
+	 *
+	 * Git's own non-force removal is the only deletion used: it refuses to remove
+	 * a worktree with local modifications, so the proof and the command agree.
+	 */
+	async rollbackExact(recorded: RecordedManagedWorktree): Promise<ManagedWorktreeRemoval> {
+		const proof = await this.inspectRecorded(recorded);
+		if (proof.status !== "exact") {
+			return {
+				status: "retained",
+				reason:
+					proof.status === "changed" || proof.status === "uncertain"
+						? proof.reason
+						: "The recorded worktree is no longer present as recorded",
+			};
+		}
+		if (!proof.mapping.ok) return { status: "retained", reason: proof.mapping.message };
+		if (!proof.selectedBaseMatches) {
+			return { status: "retained", reason: "The selected base no longer resolves as recorded" };
+		}
+		if (!proof.clean) {
+			return { status: "retained", reason: "The worktree contains local changes" };
+		}
+
+		let removal: GitCommandResult;
+		try {
+			removal = await this.runGit(recorded.repositoryRoot, [
+				"worktree",
+				"remove",
+				recorded.destination,
+			]);
+		} catch (error) {
+			return { status: "retained", reason: describe(error) };
+		}
+		if (removal.exitCode !== 0) {
+			return {
+				status: "retained",
+				reason: line(removal.stderr) || "Git could not remove the managed worktree",
+			};
+		}
+		const after = await this.inspectRecorded(recorded);
+		if (after.status === "absent" || after.status === "branch_only") return { status: "removed" };
+		return {
+			status: "retained",
+			reason:
+				after.status === "changed" || after.status === "uncertain"
+					? after.reason
+					: "The worktree registration or directory survived removal",
+		};
+	}
+
+	/**
+	 * Delete only the request-owned branch, and only while it still points at the
+	 * commit this operation created it from.
+	 */
+	async deleteRollbackBranch(recorded: RecordedManagedWorktree): Promise<ManagedWorktreeRemoval> {
+		if (!recorded.requestedBranch) return { status: "removed" };
+		const ref = `refs/heads/${recorded.requestedBranch}`;
+		try {
+			const tip = await this.refTip(recorded.repositoryRoot, ref);
+			if (tip === null) return { status: "removed" };
+			if (tip !== recorded.selectedBaseCommit) {
+				return {
+					status: "retained",
+					reason: `The branch moved away from the recorded commit: ${recorded.requestedBranch}`,
+				};
+			}
+			const deleted = await this.runGit(recorded.repositoryRoot, [
+				"update-ref",
+				"-d",
+				ref,
+				recorded.selectedBaseCommit,
+			]);
+			if (deleted.exitCode !== 0) {
+				return {
+					status: "retained",
+					reason: line(deleted.stderr) || "Git could not delete the request-owned branch",
+				};
+			}
+			if ((await this.refTip(recorded.repositoryRoot, ref)) !== null) {
+				return { status: "retained", reason: "The request-owned branch survived deletion" };
+			}
+			return { status: "removed" };
+		} catch (error) {
+			return { status: "retained", reason: describe(error) };
+		}
+	}
+
 	async mapProject(destination: string, relativePath: string): Promise<string> {
 		const candidate = resolve(destination, relativePath);
 		let info: Awaited<ReturnType<typeof stat>>;
@@ -311,7 +566,7 @@ export class ManagedWorktreeService {
 		}
 		const canonicalRoot = await realpath(destination);
 		const canonicalProject = await realpath(candidate);
-		if (!contained(canonicalRoot, canonicalProject)) {
+		if (!containedIn(canonicalRoot, canonicalProject)) {
 			throw new ManagedWorktreeError(
 				"WORKTREE_PROJECT_PATH_UNSAFE",
 				"Registered project path escapes the managed worktree",
@@ -326,5 +581,151 @@ export class ManagedWorktreeService {
 			throw new ManagedWorktreeError("INVALID_WORKTREE_BASE", "Failed to inspect local Git refs");
 		}
 		return result;
+	}
+
+	/**
+	 * Parse `git worktree list --porcelain -z` into canonical registrations.
+	 *
+	 * Records are NUL-terminated attributes ending with an empty attribute. Every
+	 * record must name a worktree path; attributes this recovery does not consume
+	 * (`bare`, `locked`, `prunable`, later additions) are ignored rather than
+	 * treated as corruption, because none of them can make a worktree look
+	 * present, exact or clean when it is not.
+	 */
+	private async listRegistrations(repositoryRoot: string): Promise<WorktreeRegistration[]> {
+		const result = await this.git(repositoryRoot, ["worktree", "list", "--porcelain", "-z"]);
+		const registrations: WorktreeRegistration[] = [];
+		let current: WorktreeRegistration | null = null;
+		for (const field of result.stdout.split("\0")) {
+			if (field === "") {
+				if (current) registrations.push(current);
+				current = null;
+				continue;
+			}
+			if (field.startsWith("worktree ")) {
+				if (current) {
+					throw new ManagedWorktreeError("WORKTREE_CREATE_FAILED", "Malformed Git worktree list");
+				}
+				current = {
+					path: resolve(field.slice("worktree ".length)),
+					head: null,
+					branch: null,
+					detached: false,
+				};
+				continue;
+			}
+			if (!current) {
+				throw new ManagedWorktreeError("WORKTREE_CREATE_FAILED", "Malformed Git worktree list");
+			}
+			if (field.startsWith("HEAD ")) current.head = field.slice("HEAD ".length);
+			else if (field.startsWith("branch ")) current.branch = field.slice("branch ".length);
+			else if (field === "detached") current.detached = true;
+		}
+		if (current) registrations.push(current);
+		return registrations;
+	}
+
+	private registrationMismatch(
+		recorded: RecordedManagedWorktree,
+		registration: WorktreeRegistration,
+		branchRef: string | null,
+		tip: string | null,
+	): string | null {
+		if (registration.head !== recorded.selectedBaseCommit) {
+			return "The recorded worktree is no longer at its selected commit";
+		}
+		if (registration.branch !== branchRef) {
+			return "The recorded worktree is checked out on a different branch";
+		}
+		if (registration.detached !== (branchRef === null)) {
+			return "The recorded worktree changed between attached and detached";
+		}
+		if (branchRef !== null && tip !== recorded.selectedBaseCommit) {
+			return `The requested branch moved away from the recorded commit: ${recorded.requestedBranch}`;
+		}
+		return null;
+	}
+
+	private async inspectMapping(recorded: RecordedManagedWorktree): Promise<ManagedWorktreeMapping> {
+		try {
+			return {
+				ok: true,
+				directory: await this.mapProject(recorded.destination, recorded.projectRelativePath),
+			};
+		} catch (error) {
+			if (error instanceof ManagedWorktreeError) {
+				return { ok: false, code: error.code, message: error.message };
+			}
+			throw error;
+		}
+	}
+
+	private async commonGitDirectory(cwd: string): Promise<string> {
+		const result = await this.git(cwd, ["rev-parse", "--git-common-dir"]);
+		const value = line(result.stdout);
+		if (!value) {
+			throw new ManagedWorktreeError(
+				"WORKTREE_CREATE_FAILED",
+				"Git returned no common directory for the recorded worktree",
+			);
+		}
+		return realpath(resolve(cwd, value));
+	}
+
+	private async refTip(repositoryRoot: string, ref: string): Promise<string | null> {
+		const result = await this.runGit(repositoryRoot, ["rev-parse", "--verify", "--quiet", ref]);
+		if (result.exitCode === 1) return null;
+		if (result.exitCode !== 0) {
+			throw new ManagedWorktreeError(
+				"WORKTREE_CREATE_FAILED",
+				`Failed to resolve ${ref} in the source repository`,
+			);
+		}
+		const value = line(result.stdout);
+		if (!/^[0-9a-f]{40,64}$/u.test(value)) {
+			throw new ManagedWorktreeError(
+				"WORKTREE_CREATE_FAILED",
+				`Git returned an unusable commit for ${ref}`,
+			);
+		}
+		return value;
+	}
+
+	/**
+	 * Match a registration by literal path first, then by canonical path, so a
+	 * registration whose directory is already gone is still found. A registration
+	 * that cannot be canonicalised is skipped rather than allowed to make an
+	 * unrelated worktree's state uncertain.
+	 */
+	private async findRegistration(
+		registrations: WorktreeRegistration[],
+		destination: string,
+		canonicalDestination: string | null,
+	): Promise<WorktreeRegistration | undefined> {
+		const literal = resolve(destination);
+		const direct = registrations.find((entry) => entry.path === literal);
+		if (direct || canonicalDestination === null) return direct;
+		for (const entry of registrations) {
+			try {
+				if ((await realpath(entry.path)) === canonicalDestination) return entry;
+			} catch {
+				// A registration whose own path cannot be resolved is not this one.
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * The canonical path, or null only when nothing exists there at all. A
+	 * dangling symlink throws rather than reading as absent.
+	 */
+	private async canonicalOrNull(path: string): Promise<string | null> {
+		try {
+			await lstat(path);
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+			throw error;
+		}
+		return realpath(path);
 	}
 }
