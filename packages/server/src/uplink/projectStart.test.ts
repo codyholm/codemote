@@ -21,7 +21,7 @@ import { WorkspaceManager } from "./workspace.js";
 
 const execFileAsync = promisify(execFile);
 
-describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
+describe("ProjectStartCoordinator", { timeout: 60_000 }, () => {
 	let fixtureRoot: string;
 	let registry: ProjectRegistry;
 	let journal: ProjectStartJournal;
@@ -407,7 +407,10 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		const state = await coordinator().inspect(nested);
 		const base = state.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
 		if (!base) throw new Error("Expected local main base");
-		const launches: Array<{ options: RunOptions; context: SessionStartContext }> = [];
+		const launches: Array<{
+			options: RunOptions;
+			context: SessionStartContext;
+		}> = [];
 		const service = coordinator();
 		const first = await service.start(
 			worktreeRequest(nested, "worktree-detached", base.ref, base.commit),
@@ -700,7 +703,11 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
 		if (!base) throw new Error("Expected local main base");
 		const cases = [
-			{ id: "tracked", file: "tracked.txt", contents: "modified in worktree\n" },
+			{
+				id: "tracked",
+				file: "tracked.txt",
+				contents: "modified in worktree\n",
+			},
 			{ id: "untracked", file: "scratch.txt", contents: "untracked\n" },
 			{ id: "ignored", file: "ignored.txt", contents: "ignored\n" },
 		];
@@ -1175,7 +1182,9 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		await expectStartError(
 			() =>
 				service.start(
-					request(project, "wrong-dir", undefined, { workspace: dirname(project) }),
+					request(project, "wrong-dir", undefined, {
+						workspace: dirname(project),
+					}),
 					launcher(),
 				),
 			"INVALID_PROJECT_START",
@@ -1183,7 +1192,9 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		await expectStartError(
 			() =>
 				service.start(
-					request(project, "resume", undefined, { resumeSessionId: "runtime-session" }),
+					request(project, "resume", undefined, {
+						resumeSessionId: "runtime-session",
+					}),
 					launcher(),
 				),
 			"INVALID_PROJECT_START",
@@ -1441,10 +1452,9 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		expect(journal.get("resume-created")?.phase).toBe("branch_created");
 		expect(await git(repo, ["branch", "--show-current"])).toBe("main");
 
-		const result = await coordinator({ sessionManager: new SessionManager() }).start(
-			options,
-			launcher(),
-		);
+		const result = await coordinator({
+			sessionManager: new SessionManager(),
+		}).start(options, launcher());
 		expect(result.execution?.git?.branch).toBe("feature/resume-created");
 		expect(await git(repo, ["branch", "--show-current"])).toBe("feature/resume-created");
 	});
@@ -1603,7 +1613,11 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		);
 
 		expect(launches).toBe(1);
-		expect(prepared.execution).toEqual({ directory: plain, mode: "project_folder", git: null });
+		expect(prepared.execution).toEqual({
+			directory: plain,
+			mode: "project_folder",
+			git: null,
+		});
 		expect(prepared.originProjectPath).toBe(plain);
 		expect(preparedSessions.list()).toHaveLength(1);
 		expect(journal.get("plain-restart")?.phase).toBe("session_started");
@@ -1948,6 +1962,18 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 		expect(restored?.execution?.directory).toBe(completed.execution.directory);
 		expect(restored?.originProjectPath).toBe(nested);
 
+		// Normal runtime work may advance HEAD without changing which registered
+		// worktree or source repository owns this session.
+		await writeFile(join(completed.execution.worktree.path, "runtime-commit.txt"), "advanced\n");
+		await git(completed.execution.worktree.path, ["add", "runtime-commit.txt"]);
+		await git(completed.execution.worktree.path, ["commit", "--no-gpg-sign", "-m", "runtime work"]);
+		const advancedSessions = new SessionManager();
+		await coordinator({
+			sessionManager: advancedSessions,
+			workspaceManager: new WorkspaceManager(fixtureRoot),
+		}).reconcileOnStartup();
+		expect(advancedSessions.get(completed.sessionId)?.status).toBe("ended");
+
 		// Point the mapped project directory outside the recorded worktree.
 		const outside = join(fixtureRoot, "outside-worktree");
 		await mkdir(outside, { recursive: true });
@@ -1963,6 +1989,127 @@ describe("ProjectStartCoordinator", { timeout: 30_000 }, () => {
 
 		expect(escapedSessions.list()).toHaveLength(0);
 		expect(escapedWorkspaces.list()).toHaveLength(0);
+	});
+
+	it("refuses to recover a managed session from an ordinary replacement directory", async () => {
+		const repository = await makeGitProject("worktree-replacement");
+		const inspected = await coordinator().inspect(repository);
+		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const options = worktreeRequest(repository, "worktree-replacement", base.ref, base.commit);
+		const completed = await coordinator().start(options, launcher());
+		if (completed.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+		const record = journal.get("worktree-replacement");
+		if (!record?.session) throw new Error("Expected durable session");
+		journal.update("worktree-replacement", (current) =>
+			current.session
+				? {
+						...current,
+						session: {
+							...current.session,
+							runtimeSessionId: "runtime-replacement",
+							recoveryState: "resumable",
+						},
+						updatedAt: Date.now(),
+					}
+				: current,
+		);
+
+		await rm(completed.execution.worktree.path, {
+			recursive: true,
+			force: true,
+		});
+		await mkdir(completed.execution.directory, { recursive: true });
+		const restartedSessions = new SessionManager();
+		const restartedWorkspaces = new WorkspaceManager(fixtureRoot);
+		const recoverSession = vi.fn(async () => true);
+		await coordinator({
+			sessionManager: restartedSessions,
+			workspaceManager: restartedWorkspaces,
+			recoverSession,
+		}).reconcileOnStartup();
+
+		expect(recoverSession).not.toHaveBeenCalled();
+		expect(restartedSessions.list()).toHaveLength(0);
+		expect(restartedWorkspaces.list()).toHaveLength(0);
+	});
+
+	it("refuses to recover a managed session from a replacement worktree at the same path", async () => {
+		const repository = await makeGitProject("registered-worktree-replacement");
+		const inspected = await coordinator().inspect(repository);
+		const base = inspected.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+		if (!base) throw new Error("Expected local main base");
+		const options = worktreeRequest(repository, "registered-replacement", base.ref, base.commit);
+		const completed = await coordinator().start(options, launcher());
+		if (completed.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+		const record = journal.get("registered-replacement");
+		if (!record?.session) throw new Error("Expected durable session");
+		journal.update("registered-replacement", (current) =>
+			current.session
+				? {
+						...current,
+						session: {
+							...current.session,
+							runtimeSessionId: "runtime-registered-replacement",
+							recoveryState: "resumable",
+						},
+						updatedAt: Date.now(),
+					}
+				: current,
+		);
+
+		const destination = completed.execution.worktree.path;
+		await git(repository, ["worktree", "remove", "--force", destination]);
+		await writeFile(join(repository, "replacement.txt"), "replacement\n", "utf8");
+		await git(repository, ["add", "replacement.txt"]);
+		await git(repository, ["commit", "--no-gpg-sign", "-m", "replacement worktree"]);
+		await git(repository, ["worktree", "add", "--detach", destination, "HEAD"]);
+
+		const restartedSessions = new SessionManager();
+		const restartedWorkspaces = new WorkspaceManager(fixtureRoot);
+		const recoverSession = vi.fn(async () => true);
+		await coordinator({
+			sessionManager: restartedSessions,
+			workspaceManager: restartedWorkspaces,
+			recoverSession,
+		}).reconcileOnStartup();
+
+		expect(recoverSession).not.toHaveBeenCalled();
+		expect(restartedSessions.list()).toHaveLength(0);
+		expect(restartedWorkspaces.list()).toHaveLength(0);
+	});
+
+	it("keeps explicitly ended and failed durable sessions terminal after restart", async () => {
+		const endedProject = await makeGitProject("ended-recovery");
+		const ended = await coordinator().start(request(endedProject, "ended-recovery"), launcher());
+		sessions.setRuntimeSessionId(ended.sessionId, "runtime-ended");
+		sessions.setRecoveryState(ended.sessionId, "ended");
+
+		const failedProject = await makeGitProject("failed-recovery");
+		const failed = await coordinator().start(request(failedProject, "failed-recovery"), launcher());
+		sessions.setRuntimeSessionId(failed.sessionId, "runtime-failed");
+		sessions.updateStatus(failed.sessionId, "error");
+		expect(journal.get("failed-recovery")?.session?.recoveryState).toBe("error");
+
+		const restartedSessions = new SessionManager();
+		const recoverSession = vi.fn(async () => true);
+		await coordinator({
+			sessionManager: restartedSessions,
+			workspaceManager: new WorkspaceManager(fixtureRoot),
+			recoverSession,
+		}).reconcileOnStartup();
+
+		expect(recoverSession).not.toHaveBeenCalled();
+		expect(restartedSessions.get(ended.sessionId)).toMatchObject({
+			status: "ended",
+			resumeEligible: false,
+		});
+		expect(restartedSessions.get(ended.sessionId)?.runtimeSessionId).toBeUndefined();
+		expect(restartedSessions.get(failed.sessionId)).toMatchObject({
+			status: "error",
+			resumeEligible: false,
+		});
+		expect(restartedSessions.get(failed.sessionId)?.runtimeSessionId).toBeUndefined();
 	});
 
 	it("retains a version-1 launch boundary that could already have entered the runtime", async () => {

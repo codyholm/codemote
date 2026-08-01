@@ -969,6 +969,42 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		expect(await git(project, ["branch", "--show-current"])).toBe("main");
 	});
 
+	it("keeps an explicitly stopped durable session ended after service restart", async () => {
+		const started = await client.request(
+			{ type: "start_run", payload: startPayload("stopped-restart", "stop me") },
+			"stopped-restart-start",
+		);
+		const result = started.payload as RunResult;
+		const internals = server as unknown as ServerInternals;
+		internals.sessionManager.setRuntimeSessionId(result.sessionId, "runtime-stopped-1");
+
+		const stopped = await client.request(
+			{ type: "stop", payload: { sessionId: result.sessionId } },
+			"stopped-restart-stop",
+		);
+		expect(stopped.type).toBe("stopped");
+		const durableBeforeRestart = readJournal().operations.find(
+			(operation) => operation["operationId"] === "stopped-restart",
+		)?.["session"] as Record<string, unknown> | undefined;
+		expect(durableBeforeRestart).toMatchObject({
+			runtimeSessionId: "runtime-stopped-1",
+			recoveryState: "ended",
+		});
+
+		const { client: restartedClient, executor } = await restartServer();
+		const restored = (
+			await restartedClient.request({ type: "list_sessions" }, "stopped-restart-sessions")
+		).payload as Session[];
+		expect(restored).toHaveLength(1);
+		expect(restored[0]).toMatchObject({
+			id: result.sessionId,
+			status: "ended",
+			resumeEligible: false,
+		});
+		expect(restored[0]?.runtimeSessionId).toBeUndefined();
+		expect(executor.inputs).toBe(0);
+	});
+
 	it.skipIf(platform() === "win32")(
 		"recovers one live Claude worktree session for one follow-up after restart",
 		async () => {

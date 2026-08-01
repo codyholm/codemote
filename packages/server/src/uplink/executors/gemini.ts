@@ -90,6 +90,24 @@ export class GeminiExecutor extends BaseExecutor {
 		await this.runPromptTurn(session, options.initialPrompt);
 	}
 
+	protected override async doRecoverRun(
+		session: Session,
+		runtimeSessionId: string,
+	): Promise<boolean> {
+		this.geminiSessions.set(session.id, {
+			process: null,
+			running: false,
+			hasHistory: true,
+			runtimeSessionId,
+			model: null,
+			temperature: null,
+			maxTokens: null,
+			stderrBuffer: "",
+			toolNames: new Map(),
+		});
+		return true;
+	}
+
 	protected async doSendInput(session: Session, input: string): Promise<void> {
 		const geminiSession = this.geminiSessions.get(session.id);
 		if (!geminiSession) {

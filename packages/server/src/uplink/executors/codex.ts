@@ -188,6 +188,9 @@ export class CodexExecutor extends BaseExecutor {
 		}
 
 		if (session.status === "ended") {
+			if (session.resumeEligible === false) {
+				throw new SessionNotActiveError(sessionId);
+			}
 			const runtimeSessionId = session.runtimeSessionId?.trim();
 			if (!runtimeSessionId) {
 				throw new SessionNotActiveError(sessionId);
@@ -205,6 +208,16 @@ export class CodexExecutor extends BaseExecutor {
 		await super.sendInput(sessionId, input);
 	}
 
+	protected override async doRecoverRun(
+		session: Session,
+		runtimeSessionId: string,
+	): Promise<boolean> {
+		const codexSession = this.createCodexSession(runtimeSessionId);
+		codexSession.running = false;
+		this.codexSessions.set(session.id, codexSession);
+		return true;
+	}
+
 	/**
 	 * Send input to the Codex session
 	 *
@@ -213,6 +226,15 @@ export class CodexExecutor extends BaseExecutor {
 	 */
 	protected async doSendInput(session: Session, input: string): Promise<void> {
 		const codexSession = this.codexSessions.get(session.id);
+		if (codexSession && (!codexSession.process || !codexSession.running)) {
+			const runtimeSessionId =
+				codexSession.threadId ?? codexSession.codexSessionId ?? session.runtimeSessionId;
+			if (runtimeSessionId) {
+				this.emitStatus(session.id, "starting");
+				await this.resumeSession(session.id, runtimeSessionId, input);
+				return;
+			}
+		}
 		if (!codexSession?.process || !codexSession.running) {
 			throw new Error("Codex session not running");
 		}

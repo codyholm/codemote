@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -469,15 +469,24 @@ export class ProjectStartCoordinator {
 	private async restoreDurableSession(record: ProjectStartOperationRecord): Promise<void> {
 		const durable = record.session;
 		if (!durable) return;
+		if (record.mode === "worktree") {
+			const mapping = await this.managedWorktrees.inspectRecordedIdentity(
+				this.recordedWorktree(record),
+			);
+			if (!mapping?.ok || mapping.directory !== durable.execution.directory) {
+				return;
+			}
+		}
 		if (!(await this.resolvesToRecordedDirectory(durable.execution))) return;
+		const recoveryState = durable.recoveryState ?? "resumable";
 		const context: SessionStartContext = {
 			originProjectPath: record.originProjectPath,
 			execution: durable.execution,
 		};
-		if (this.recoverSession) {
+		if (recoveryState === "resumable" && this.recoverSession) {
 			try {
 				if (await this.recoverSession(record.runtime, durable, context)) {
-					this.bindRuntimeSessionPersistence(record.operationId, durable.sessionId);
+					this.bindDurableSessionPersistence(record.operationId, durable.sessionId);
 					return;
 				}
 			} catch (error) {
@@ -496,17 +505,20 @@ export class ProjectStartCoordinator {
 			id: durable.sessionId,
 			runId: durable.runId,
 			runtime: record.runtime,
-			status: "ended",
+			status: recoveryState === "error" ? "error" : "ended",
+			resumeEligible: recoveryState === "resumable",
 			workspace,
 			startedAt: durable.createdAt,
 			endedAt: record.updatedAt,
 			lastActivityAt: record.updatedAt,
 			statusChangedAt: record.updatedAt,
-			...(durable.runtimeSessionId ? { runtimeSessionId: durable.runtimeSessionId } : {}),
+			...(recoveryState === "resumable" && durable.runtimeSessionId
+				? { runtimeSessionId: durable.runtimeSessionId }
+				: {}),
 			originProjectPath: record.originProjectPath,
 			execution: durable.execution,
 		});
-		this.bindRuntimeSessionPersistence(record.operationId, durable.sessionId);
+		this.bindDurableSessionPersistence(record.operationId, durable.sessionId);
 	}
 
 	/**
@@ -637,6 +649,7 @@ export class ProjectStartCoordinator {
 					selectedBaseRef: request.preparation.baseRef,
 					selectedBaseCommit: request.preparation.expectedCommit,
 					projectRelativePath: plan.projectRelativePath,
+					ownershipToken: randomUUID(),
 				},
 				phase: "recorded",
 				createdAt: now,
@@ -849,6 +862,7 @@ export class ProjectStartCoordinator {
 				record.worktree.destination,
 				record.worktree.selectedBaseCommit,
 				record.requestedBranch,
+				record.worktree.ownershipToken ?? "",
 			);
 		} catch (error) {
 			if (
@@ -962,7 +976,7 @@ export class ProjectStartCoordinator {
 			session,
 			result,
 		}));
-		this.bindRuntimeSessionPersistence(operationId, session.sessionId);
+		this.bindDurableSessionPersistence(operationId, session.sessionId);
 		return result;
 	}
 
@@ -977,6 +991,7 @@ export class ProjectStartCoordinator {
 			workspaceId: session.workspace.id,
 			createdAt: session.startedAt,
 			execution,
+			recoveryState: "resumable",
 			...(session.runtimeSessionId ? { runtimeSessionId: session.runtimeSessionId } : {}),
 		};
 		this.journal.update(operationId, (current) => ({
@@ -985,7 +1000,7 @@ export class ProjectStartCoordinator {
 			updatedAt: Date.now(),
 			session: durable,
 		}));
-		this.bindRuntimeSessionPersistence(operationId, session.id);
+		this.bindDurableSessionPersistence(operationId, session.id);
 	}
 
 	/**
@@ -1004,11 +1019,12 @@ export class ProjectStartCoordinator {
 			workspaceId: live?.workspace.id ?? launched.runId,
 			createdAt: live?.startedAt ?? Date.now(),
 			execution,
+			recoveryState: "resumable",
 			...(live?.runtimeSessionId ? { runtimeSessionId: live.runtimeSessionId } : {}),
 		};
 	}
 
-	private bindRuntimeSessionPersistence(operationId: string, sessionId: string): void {
+	private bindDurableSessionPersistence(operationId: string, sessionId: string): void {
 		this.sessionManager.bindRuntimeSessionPersistence(sessionId, (_id, runtimeSessionId) => {
 			const current = this.journal.get(operationId);
 			if (!current?.session || current.session.runtimeSessionId === runtimeSessionId) return;
@@ -1017,6 +1033,19 @@ export class ProjectStartCoordinator {
 					? {
 							...record,
 							session: { ...record.session, runtimeSessionId },
+							updatedAt: Date.now(),
+						}
+					: record,
+			);
+		});
+		this.sessionManager.bindRecoveryStatePersistence(sessionId, (_id, recoveryState) => {
+			const current = this.journal.get(operationId);
+			if (!current?.session || current.session.recoveryState === recoveryState) return;
+			this.journal.update(operationId, (record) =>
+				record.session
+					? {
+							...record,
+							session: { ...record.session, recoveryState },
 							updatedAt: Date.now(),
 						}
 					: record,
@@ -1118,6 +1147,7 @@ export class ProjectStartCoordinator {
 			selectedBaseCommit: record.worktree.selectedBaseCommit,
 			projectRelativePath: record.worktree.projectRelativePath,
 			requestedBranch: record.requestedBranch,
+			ownershipToken: record.worktree.ownershipToken ?? null,
 		};
 	}
 

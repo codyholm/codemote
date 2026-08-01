@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, realpath, stat } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { GitCheckoutState, GitWorktreeBase, WorktreeStartState } from "@codemote/common";
 import type { GitCommandResult, GitCommandRunner } from "./projectStart.js";
@@ -38,6 +38,7 @@ export interface RecordedManagedWorktree {
 	selectedBaseCommit: string;
 	projectRelativePath: string;
 	requestedBranch: string | null;
+	ownershipToken: string | null;
 }
 
 export type ManagedWorktreeMapping =
@@ -94,7 +95,10 @@ export function containedIn(parent: string, child: string): boolean {
 
 function qualified(ref: string): Pick<GitWorktreeBase, "kind" | "qualifiedName"> | null {
 	if (ref.startsWith("refs/heads/")) {
-		return { kind: "local", qualifiedName: `local/${ref.slice("refs/heads/".length)}` };
+		return {
+			kind: "local",
+			qualifiedName: `local/${ref.slice("refs/heads/".length)}`,
+		};
 	}
 	if (ref.startsWith("refs/remotes/")) {
 		const name = ref.slice("refs/remotes/".length);
@@ -293,7 +297,7 @@ export class ManagedWorktreeService {
 		const unsafe = [resolve(repositoryRoot, line(common.stdout))];
 		for (const field of worktrees.stdout.split("\0")) {
 			if (field.startsWith("worktree "))
-				unsafe.push(await realpath(field.slice("worktree ".length)));
+				unsafe.push(await this.canonicalizeAllowMissing(field.slice("worktree ".length)));
 		}
 		if (unsafe.some((path) => containedIn(path, canonicalDestination))) {
 			throw new ManagedWorktreeError(
@@ -337,7 +341,14 @@ export class ManagedWorktreeService {
 		destination: string,
 		commit: string,
 		newBranch: string | null,
+		ownershipToken: string,
 	): Promise<void> {
+		if (!ownershipToken) {
+			throw new ManagedWorktreeError(
+				"WORKTREE_CREATE_FAILED",
+				"Managed worktree ownership token is missing",
+			);
+		}
 		await this.assertSafeDestination(repositoryRoot, destination);
 		if (newBranch) {
 			const valid = await this.runGit(repositoryRoot, ["check-ref-format", "--branch", newBranch]);
@@ -368,6 +379,18 @@ export class ManagedWorktreeService {
 			throw new ManagedWorktreeError(
 				"WORKTREE_CREATE_FAILED",
 				line(created.stderr) || "Git could not create the managed worktree",
+			);
+		}
+		try {
+			await writeFile(await this.ownershipMarker(destination), ownershipToken, {
+				encoding: "utf8",
+				mode: 0o600,
+				flag: "wx",
+			});
+		} catch (error) {
+			throw new ManagedWorktreeError(
+				"WORKTREE_CREATE_FAILED",
+				`Git created the managed worktree but its ownership marker could not be recorded: ${describe(error)}`,
 			);
 		}
 	}
@@ -446,13 +469,25 @@ export class ManagedWorktreeService {
 			}
 
 			const mismatch = this.registrationMismatch(recorded, registered, branchRef, tip);
-			if (mismatch) return { status: "changed", reason: mismatch, retainsDestination: true };
+			if (mismatch)
+				return {
+					status: "changed",
+					reason: mismatch,
+					retainsDestination: true,
+				};
 			const common = await this.commonGitDirectory(recorded.destination);
 			const sourceCommon = await this.commonGitDirectory(recorded.repositoryRoot);
 			if (common !== sourceCommon) {
 				return {
 					status: "changed",
 					reason: "The recorded worktree belongs to a different repository",
+					retainsDestination: true,
+				};
+			}
+			if (!(await this.hasRecordedOwnership(recorded))) {
+				return {
+					status: "changed",
+					reason: "The recorded worktree ownership marker is missing or no longer matches",
 					retainsDestination: true,
 				};
 			}
@@ -486,6 +521,48 @@ export class ManagedWorktreeService {
 	}
 
 	/**
+	 * Prove that a launched session still points at the same registered worktree
+	 * and source repository. Unlike rollback inspection, this deliberately allows
+	 * HEAD to advance: creating commits is normal runtime work, not an ownership
+	 * change.
+	 */
+	async inspectRecordedIdentity(
+		recorded: RecordedManagedWorktree,
+	): Promise<ManagedWorktreeMapping | null> {
+		try {
+			if (!recorded.ownershipToken) return null;
+			const canonicalDestination = await this.canonicalOrNull(recorded.destination);
+			if (canonicalDestination === null || canonicalDestination !== resolve(recorded.destination)) {
+				return null;
+			}
+			const registrations = await this.listRegistrations(recorded.repositoryRoot);
+			const registered = await this.findRegistration(
+				registrations,
+				recorded.destination,
+				canonicalDestination,
+			);
+			if (!registered) return null;
+			const branchRef = recorded.requestedBranch ? `refs/heads/${recorded.requestedBranch}` : null;
+			if (
+				registered.branch !== branchRef ||
+				registered.detached !== (recorded.requestedBranch === null)
+			) {
+				return null;
+			}
+			if (
+				(await this.commonGitDirectory(recorded.destination)) !==
+				(await this.commonGitDirectory(recorded.repositoryRoot))
+			) {
+				return null;
+			}
+			if (!(await this.hasRecordedOwnership(recorded))) return null;
+			return await this.inspectMapping(recorded);
+		} catch {
+			return null;
+		}
+	}
+
+	/**
 	 * Remove an exact, clean, unlaunched worktree after proving it again.
 	 *
 	 * Git's own non-force removal is the only deletion used: it refuses to remove
@@ -504,10 +581,16 @@ export class ManagedWorktreeService {
 		}
 		if (!proof.mapping.ok) return { status: "retained", reason: proof.mapping.message };
 		if (!proof.selectedBaseMatches) {
-			return { status: "retained", reason: "The selected base no longer resolves as recorded" };
+			return {
+				status: "retained",
+				reason: "The selected base no longer resolves as recorded",
+			};
 		}
 		if (!proof.clean) {
-			return { status: "retained", reason: "The worktree contains local changes" };
+			return {
+				status: "retained",
+				reason: "The worktree contains local changes",
+			};
 		}
 
 		let removal: GitCommandResult;
@@ -553,11 +636,14 @@ export class ManagedWorktreeService {
 					reason: `The branch moved away from the recorded commit: ${recorded.requestedBranch}`,
 				};
 			}
+			// Let Git enforce its checked-out worktree and merged-tip protections.
+			// `update-ref -d` bypasses both and can invalidate another worktree even
+			// after our exact-tip proof above succeeds.
 			const deleted = await this.runGit(recorded.repositoryRoot, [
-				"update-ref",
+				"branch",
 				"-d",
-				ref,
-				recorded.selectedBaseCommit,
+				"--",
+				recorded.requestedBranch,
 			]);
 			if (deleted.exitCode !== 0) {
 				return {
@@ -566,7 +652,10 @@ export class ManagedWorktreeService {
 				};
 			}
 			if ((await this.refTip(recorded.repositoryRoot, ref)) !== null) {
-				return { status: "retained", reason: "The request-owned branch survived deletion" };
+				return {
+					status: "retained",
+					reason: "The request-owned branch survived deletion",
+				};
 			}
 			return { status: "removed" };
 		} catch (error) {
@@ -699,6 +788,30 @@ export class ManagedWorktreeService {
 		return realpath(resolve(cwd, value));
 	}
 
+	private async ownershipMarker(cwd: string): Promise<string> {
+		const result = await this.git(cwd, ["rev-parse", "--absolute-git-dir"]);
+		const value = line(result.stdout);
+		if (!value || !isAbsolute(value)) {
+			throw new ManagedWorktreeError(
+				"WORKTREE_CREATE_FAILED",
+				"Git returned no absolute metadata directory for the managed worktree",
+			);
+		}
+		return join(await realpath(value), "codemote-owner");
+	}
+
+	private async hasRecordedOwnership(recorded: RecordedManagedWorktree): Promise<boolean> {
+		if (!recorded.ownershipToken) return false;
+		try {
+			return (
+				(await readFile(await this.ownershipMarker(recorded.destination), "utf8")) ===
+				recorded.ownershipToken
+			);
+		} catch {
+			return false;
+		}
+	}
+
 	private async refTip(repositoryRoot: string, ref: string): Promise<string | null> {
 		const result = await this.runGit(repositoryRoot, ["rev-parse", "--verify", "--quiet", ref]);
 		if (result.exitCode === 1) return null;
@@ -754,5 +867,21 @@ export class ManagedWorktreeService {
 			throw error;
 		}
 		return realpath(path);
+	}
+
+	/**
+	 * Canonicalize a path even when its leaf no longer exists. Git retains stale
+	 * worktree registrations until they are pruned, and those recorded subtrees
+	 * remain unsafe destinations rather than becoming validation failures.
+	 */
+	private async canonicalizeAllowMissing(path: string): Promise<string> {
+		const absolute = resolve(path);
+		try {
+			return await realpath(absolute);
+		} catch (error) {
+			if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+			const ancestor = await nearestExisting(absolute);
+			return join(await realpath(ancestor), relative(ancestor, absolute));
+		}
 	}
 }

@@ -1,12 +1,21 @@
 import { randomUUID } from "node:crypto";
 import type { RuntimeType, SessionStatus } from "@codemote/common";
-import type { Session, SessionStartContext, Workspace } from "./types.js";
+import type {
+	DurableSessionRecoveryState,
+	Session,
+	SessionStartContext,
+	Workspace,
+} from "./types.js";
 
 /**
  * Persists a runtime-native session ID for a session bound to a Git-aware start
  * operation. Throwing means the ID was not made durable.
  */
 export type RuntimeSessionPersist = (sessionId: string, runtimeSessionId: string) => void;
+export type RecoveryStatePersist = (
+	sessionId: string,
+	recoveryState: DurableSessionRecoveryState,
+) => void;
 
 export class SessionRestoreConflictError extends Error {
 	readonly code = "SESSION_RESTORE_CONFLICT";
@@ -35,6 +44,8 @@ function sameSessionIdentity(a: Session, b: Session): boolean {
 export class SessionManager {
 	private sessions = new Map<string, Session>();
 	private runtimeSessionPersistence = new Map<string, RuntimeSessionPersist>();
+	private recoveryStatePersistence = new Map<string, RecoveryStatePersist>();
+	private recoveryPersistenceSuppression = new Map<string, number>();
 
 	/**
 	 * Create a new session
@@ -48,6 +59,7 @@ export class SessionManager {
 			runId,
 			runtime,
 			status: "starting",
+			resumeEligible: true,
 			workspace,
 			startedAt: Date.now(),
 			endedAt: null,
@@ -89,6 +101,8 @@ export class SessionManager {
 	remove(sessionId: string): void {
 		this.sessions.delete(sessionId);
 		this.runtimeSessionPersistence.delete(sessionId);
+		this.recoveryStatePersistence.delete(sessionId);
+		this.recoveryPersistenceSuppression.delete(sessionId);
 	}
 
 	/**
@@ -98,6 +112,37 @@ export class SessionManager {
 	 */
 	bindRuntimeSessionPersistence(sessionId: string, persist: RuntimeSessionPersist): void {
 		this.runtimeSessionPersistence.set(sessionId, persist);
+	}
+
+	bindRecoveryStatePersistence(sessionId: string, persist: RecoveryStatePersist): void {
+		this.recoveryStatePersistence.set(sessionId, persist);
+	}
+
+	/**
+	 * Persist an explicit recovery-policy change before accepting it in memory.
+	 * Callers use this for user intent; runtime errors use the guarded best-effort
+	 * path in updateStatus so a journal write failure cannot mask the runtime error.
+	 */
+	setRecoveryState(sessionId: string, recoveryState: DurableSessionRecoveryState): void {
+		const session = this.sessions.get(sessionId);
+		if (!session) return;
+		const persist = this.recoveryStatePersistence.get(sessionId);
+		if (persist) persist(sessionId, recoveryState);
+		session.resumeEligible = recoveryState === "resumable";
+	}
+
+	async withoutRecoveryPersistence<T>(sessionId: string, action: () => Promise<T>): Promise<T> {
+		this.recoveryPersistenceSuppression.set(
+			sessionId,
+			(this.recoveryPersistenceSuppression.get(sessionId) ?? 0) + 1,
+		);
+		try {
+			return await action();
+		} finally {
+			const remaining = (this.recoveryPersistenceSuppression.get(sessionId) ?? 1) - 1;
+			if (remaining === 0) this.recoveryPersistenceSuppression.delete(sessionId);
+			else this.recoveryPersistenceSuppression.set(sessionId, remaining);
+		}
 	}
 
 	/**
@@ -113,10 +158,26 @@ export class SessionManager {
 	updateStatus(sessionId: string, status: SessionStatus): void {
 		const session = this.sessions.get(sessionId);
 		if (!session) return;
+		const changed = status !== session.status;
+		if (
+			changed &&
+			status === "error" &&
+			session.resumeEligible !== false &&
+			!this.recoveryPersistenceSuppression.has(sessionId)
+		) {
+			try {
+				this.setRecoveryState(sessionId, "error");
+			} catch (error) {
+				console.error(
+					`Failed to persist recovery state for ${sessionId}:`,
+					error instanceof Error ? error.message : error,
+				);
+			}
+		}
 
 		// Guarded: codex re-emits "running" on every turn, so an unguarded write would
 		// make this move without a transition and destroy its value as a transition key.
-		if (status !== session.status) {
+		if (changed) {
 			session.statusChangedAt = Date.now();
 		}
 

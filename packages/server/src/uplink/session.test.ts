@@ -311,6 +311,49 @@ describe("SessionManager", () => {
 		errors.mockRestore();
 	});
 
+	it("persists explicit terminal recovery state before disabling resume", () => {
+		const manager = new SessionManager();
+		const persisted: string[] = [];
+		const session = manager.create("codex", mockWorkspace);
+		manager.bindRecoveryStatePersistence(session.id, (_id, recoveryState) => {
+			persisted.push(recoveryState);
+		});
+
+		manager.setRecoveryState(session.id, "ended");
+		expect(persisted).toEqual(["ended"]);
+		expect(manager.get(session.id)?.resumeEligible).toBe(false);
+
+		const failing = manager.create("claude", mockWorkspace);
+		manager.bindRecoveryStatePersistence(failing.id, () => {
+			throw new Error("journal unavailable");
+		});
+		expect(() => manager.setRecoveryState(failing.id, "ended")).toThrow("journal unavailable");
+		expect(manager.get(failing.id)?.resumeEligible).toBe(true);
+	});
+
+	it("persists runtime errors but not errors emitted during an intentional stop", async () => {
+		const manager = new SessionManager();
+		const persisted: string[] = [];
+		const failed = manager.create("gemini", mockWorkspace);
+		manager.bindRecoveryStatePersistence(failed.id, (_id, recoveryState) => {
+			persisted.push(recoveryState);
+		});
+
+		manager.updateStatus(failed.id, "error");
+		expect(persisted).toEqual(["error"]);
+		expect(failed.resumeEligible).toBe(false);
+
+		const stopped = manager.create("opencode", mockWorkspace);
+		manager.bindRecoveryStatePersistence(stopped.id, (_id, recoveryState) => {
+			persisted.push(recoveryState);
+		});
+		await manager.withoutRecoveryPersistence(stopped.id, async () => {
+			manager.updateStatus(stopped.id, "error");
+		});
+		expect(persisted).toEqual(["error"]);
+		expect(stopped.resumeEligible).toBe(true);
+	});
+
 	it("drops persistence binding with the session it belongs to", () => {
 		const manager = new SessionManager();
 		const persisted: string[] = [];
@@ -318,12 +361,16 @@ describe("SessionManager", () => {
 		manager.bindRuntimeSessionPersistence(session.id, (_id, runtimeSessionId) => {
 			persisted.push(runtimeSessionId);
 		});
+		manager.bindRecoveryStatePersistence(session.id, (_id, recoveryState) => {
+			persisted.push(recoveryState);
+		});
 
 		manager.remove(session.id);
 		expect(manager.get(session.id)).toBeUndefined();
 
 		manager.restore(recordedSession());
 		manager.setRuntimeSessionId(session.id, "runtime-after-remove");
+		manager.setRecoveryState(session.id, "ended");
 		expect(persisted).toEqual([]);
 	});
 });

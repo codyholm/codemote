@@ -64,8 +64,18 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 
 		expect(state.bases).toEqual(
 			expect.arrayContaining([
-				{ ref: "refs/heads/main", qualifiedName: "local/main", kind: "local", commit: head },
-				{ ref: "refs/heads/other", qualifiedName: "local/other", kind: "local", commit: head },
+				{
+					ref: "refs/heads/main",
+					qualifiedName: "local/main",
+					kind: "local",
+					commit: head,
+				},
+				{
+					ref: "refs/heads/other",
+					qualifiedName: "local/other",
+					kind: "local",
+					commit: head,
+				},
 				{
 					ref: "refs/remotes/upstream/other",
 					qualifiedName: "remote/upstream/other",
@@ -87,7 +97,7 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		const service = new ManagedWorktreeService(runGitCommand, managedRoot);
 		const nested = join(repository, "packages", "nested");
 		const detached = await service.plan(repository, nested, "detached");
-		await service.create(repository, detached.destination, commit, null);
+		await service.create(repository, detached.destination, commit, null, "detached-owner");
 		expect(await service.mapProject(detached.destination, detached.projectRelativePath)).toBe(
 			resolve(detached.destination, "packages", "nested"),
 		);
@@ -104,7 +114,13 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		).toBeNull();
 
 		const attached = await service.plan(repository, repository, "attached");
-		await service.create(repository, attached.destination, commit, "feature/managed");
+		await service.create(
+			repository,
+			attached.destination,
+			commit,
+			"feature/managed",
+			"attached-owner",
+		);
 		expect(await git(["branch", "--show-current"], attached.destination)).toBe("feature/managed");
 		expect(await git(["rev-parse", "refs/heads/feature/managed"])).toBe(commit);
 	});
@@ -125,7 +141,10 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		expect(state.bases).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ ref: "refs/heads/main", commit: current }),
-				expect.objectContaining({ ref: "refs/remotes/origin/main", commit: oldCommit }),
+				expect.objectContaining({
+					ref: "refs/remotes/origin/main",
+					commit: oldCommit,
+				}),
 			]),
 		);
 		expect(state.defaultBaseRef).toBe("refs/remotes/origin/main");
@@ -164,12 +183,24 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		const commit = await git(["rev-parse", "HEAD"]);
 		const invalidBranch = await service.plan(repository, repository, "invalid-branch");
 		await expect(
-			service.create(repository, invalidBranch.destination, commit, "invalid branch"),
+			service.create(
+				repository,
+				invalidBranch.destination,
+				commit,
+				"invalid branch",
+				"invalid-owner",
+			),
 		).rejects.toMatchObject({ code: "INVALID_BRANCH" });
 		await git(["branch", "already-exists"]);
 		const existingBranch = await service.plan(repository, repository, "existing-branch");
 		await expect(
-			service.create(repository, existingBranch.destination, commit, "already-exists"),
+			service.create(
+				repository,
+				existingBranch.destination,
+				commit,
+				"already-exists",
+				"existing-owner",
+			),
 		).rejects.toMatchObject({ code: "BRANCH_EXISTS" });
 		const plan = await service.plan(repository, repository, "collision");
 		await mkdir(plan.destination);
@@ -189,7 +220,7 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 
 		const missing = new ManagedWorktreeService(runGitCommand, join(fixtureRoot, "other-managed"));
 		const missingPlan = await missing.plan(repository, repository, "missing");
-		await missing.create(repository, missingPlan.destination, commit, null);
+		await missing.create(repository, missingPlan.destination, commit, null, "missing-owner");
 		await expect(missing.mapProject(missingPlan.destination, "absent")).rejects.toMatchObject({
 			code: "WORKTREE_PROJECT_PATH_MISSING",
 		});
@@ -201,7 +232,7 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		await git(["commit", "--no-gpg-sign", "-m", "escaping symlink"]);
 		const escapeCommit = await git(["rev-parse", "HEAD"]);
 		const escapePlan = await missing.plan(repository, repository, "escape");
-		await missing.create(repository, escapePlan.destination, escapeCommit, null);
+		await missing.create(repository, escapePlan.destination, escapeCommit, null, "escape-owner");
 		await expect(missing.mapProject(escapePlan.destination, "escape")).rejects.toMatchObject({
 			code: "WORKTREE_PROJECT_PATH_UNSAFE",
 		});
@@ -219,16 +250,32 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 			selectedBaseCommit: commit,
 			projectRelativePath: plan.projectRelativePath,
 			requestedBranch: "feature/truth",
+			ownershipToken: "truth-owner",
 		};
 
-		expect(await service.inspectRecorded(recorded)).toEqual({ status: "absent" });
+		expect(await service.inspectRecorded(recorded)).toEqual({
+			status: "absent",
+		});
 
-		await service.create(repository, recorded.destination, commit, recorded.requestedBranch);
+		await service.create(
+			repository,
+			recorded.destination,
+			commit,
+			recorded.requestedBranch,
+			recorded.ownershipToken,
+		);
 		const exact = await service.inspectRecorded(recorded);
 		expect(exact).toMatchObject({
 			status: "exact",
-			git: { repositoryRoot: recorded.destination, head: commit, branch: "feature/truth" },
-			mapping: { ok: true, directory: join(recorded.destination, "packages", "nested") },
+			git: {
+				repositoryRoot: recorded.destination,
+				head: commit,
+				branch: "feature/truth",
+			},
+			mapping: {
+				ok: true,
+				directory: join(recorded.destination, "packages", "nested"),
+			},
 			selectedBaseMatches: true,
 			clean: true,
 		});
@@ -244,7 +291,10 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		// A worktree the operation does not own is changed, never adoptable.
 		const otherCommit = await git(["commit-tree", `${commit}^{tree}`, "-p", commit, "-m", "next"]);
 		expect(
-			await service.inspectRecorded({ ...recorded, selectedBaseCommit: otherCommit }),
+			await service.inspectRecorded({
+				...recorded,
+				selectedBaseCommit: otherCommit,
+			}),
 		).toMatchObject({ status: "changed" });
 		expect(await service.inspectRecorded({ ...recorded, requestedBranch: null })).toMatchObject({
 			status: "changed",
@@ -254,7 +304,9 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		const failing = new ManagedWorktreeService(async () => {
 			throw new Error("git unavailable");
 		}, managedRoot);
-		expect(await failing.inspectRecorded(recorded)).toMatchObject({ status: "uncertain" });
+		expect(await failing.inspectRecorded(recorded)).toMatchObject({
+			status: "uncertain",
+		});
 
 		// A destination that is provably gone says so, so a caller reporting
 		// retained resources does not name a path that no longer exists.
@@ -278,12 +330,15 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 			selectedBaseCommit: commit,
 			projectRelativePath: recordedPlan.projectRelativePath,
 			requestedBranch: null,
+			ownershipToken: "recorded-owner",
 		};
 		// Two registered worktrees of the same repository, detached at the same
 		// commit: by every value except identity, they look interchangeable.
-		await service.create(repository, recorded.destination, commit, null);
-		await service.create(repository, otherPlan.destination, commit, null);
-		expect(await service.inspectRecorded(recorded)).toMatchObject({ status: "exact" });
+		await service.create(repository, recorded.destination, commit, null, recorded.ownershipToken);
+		await service.create(repository, otherPlan.destination, commit, null, "other-owner");
+		expect(await service.inspectRecorded(recorded)).toMatchObject({
+			status: "exact",
+		});
 
 		await rm(recorded.destination, { recursive: true, force: true });
 		await symlink(otherPlan.destination, recorded.destination);
@@ -296,7 +351,9 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 
 		// Rollback must not act through the link: the other worktree, its
 		// registration and its contents are untouched.
-		expect(await service.rollbackExact(recorded)).toMatchObject({ status: "retained" });
+		expect(await service.rollbackExact(recorded)).toMatchObject({
+			status: "retained",
+		});
 		expect(existsSync(otherPlan.destination)).toBe(true);
 		expect(await git(["worktree", "list", "--porcelain"])).toContain(otherPlan.destination);
 		expect(await git(["rev-parse", "HEAD"], otherPlan.destination)).toBe(commit);
@@ -313,8 +370,15 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 			selectedBaseCommit: commit,
 			projectRelativePath: plan.projectRelativePath,
 			requestedBranch: "feature/stale",
+			ownershipToken: "stale-owner",
 		};
-		await service.create(repository, recorded.destination, commit, recorded.requestedBranch);
+		await service.create(
+			repository,
+			recorded.destination,
+			commit,
+			recorded.requestedBranch,
+			recorded.ownershipToken,
+		);
 
 		// Deleted the way a person does it: `rm -rf`, no `git worktree prune`.
 		await rm(recorded.destination, { recursive: true, force: true });
@@ -334,7 +398,9 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		expect(await git(["rev-parse", "--verify", "refs/heads/feature/stale"])).toBe(commit);
 
 		// Rollback still refuses, because the proof cannot pass.
-		expect(await service.rollbackExact(recorded)).toMatchObject({ status: "retained" });
+		expect(await service.rollbackExact(recorded)).toMatchObject({
+			status: "retained",
+		});
 		expect(await git(["worktree", "list", "--porcelain"])).toContain(recorded.destination);
 		expect(await git(["rev-parse", "--verify", "refs/heads/feature/stale"])).toBe(commit);
 	});
@@ -350,26 +416,41 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 			selectedBaseCommit: commit,
 			projectRelativePath: plan.projectRelativePath,
 			requestedBranch: "feature/rollback",
+			ownershipToken: "rollback-owner",
 		};
-		await service.create(repository, recorded.destination, commit, recorded.requestedBranch);
+		await service.create(
+			repository,
+			recorded.destination,
+			commit,
+			recorded.requestedBranch,
+			recorded.ownershipToken,
+		);
 
 		await writeFile(join(recorded.destination, "tracked.txt"), "dirty\n");
-		expect(await service.rollbackExact(recorded)).toMatchObject({ status: "retained" });
+		expect(await service.rollbackExact(recorded)).toMatchObject({
+			status: "retained",
+		});
 		expect(await git(["rev-parse", "--verify", "refs/heads/feature/rollback"])).toBe(commit);
 		await git(["checkout", "--", "tracked.txt"], recorded.destination);
 
-		expect(await service.rollbackExact(recorded)).toEqual({ status: "removed" });
+		expect(await service.rollbackExact(recorded)).toEqual({
+			status: "removed",
+		});
 		expect(existsSync(recorded.destination)).toBe(false);
 		expect(await git(["worktree", "list", "--porcelain"])).not.toContain(recorded.destination);
 
 		// The branch survives a moved tip and is deleted only at the recorded commit.
 		const moved = await git(["commit-tree", `${commit}^{tree}`, "-p", commit, "-m", "moved"]);
 		await git(["update-ref", "refs/heads/feature/rollback", moved]);
-		expect(await service.deleteRollbackBranch(recorded)).toMatchObject({ status: "retained" });
+		expect(await service.deleteRollbackBranch(recorded)).toMatchObject({
+			status: "retained",
+		});
 		expect(await git(["rev-parse", "--verify", "refs/heads/feature/rollback"])).toBe(moved);
 
 		await git(["update-ref", "refs/heads/feature/rollback", commit]);
-		expect(await service.deleteRollbackBranch(recorded)).toEqual({ status: "removed" });
+		expect(await service.deleteRollbackBranch(recorded)).toEqual({
+			status: "removed",
+		});
 		await expect(
 			execFileAsync("git", [
 				"-C",
@@ -379,7 +460,9 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 				"refs/heads/feature/rollback",
 			]),
 		).rejects.toBeDefined();
-		expect(await service.deleteRollbackBranch(recorded)).toEqual({ status: "removed" });
+		expect(await service.deleteRollbackBranch(recorded)).toEqual({
+			status: "removed",
+		});
 	});
 
 	it("rejects managed roots inside unrelated Git metadata and bare repositories", async () => {
@@ -401,5 +484,41 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		await expect(
 			bareService.plan(repository, repository, "inside-bare-repository"),
 		).rejects.toMatchObject({ code: "UNSAFE_WORKTREE_DESTINATION" });
+	});
+
+	it("keeps a missing worktree registration protected without blocking unrelated destinations", async () => {
+		const commit = await git(["rev-parse", "HEAD"]);
+		const service = new ManagedWorktreeService(runGitCommand, managedRoot);
+		const stale = await service.plan(repository, repository, "stale-registration");
+		await service.create(repository, stale.destination, commit, null, "stale-registration-owner");
+		await rm(stale.destination, { recursive: true, force: true });
+
+		const unrelated = join(managedRoot, "unrelated-destination");
+		await expect(service.assertSafeDestination(repository, unrelated)).resolves.toBeUndefined();
+		await expect(
+			service.assertSafeDestination(repository, join(stale.destination, "nested")),
+		).rejects.toMatchObject({ code: "UNSAFE_WORKTREE_DESTINATION" });
+	});
+
+	it("retains an exact rollback branch that is checked out in another worktree", async () => {
+		const commit = await git(["rev-parse", "HEAD"]);
+		const service = new ManagedWorktreeService(runGitCommand, managedRoot);
+		const checkout = join(fixtureRoot, "other-checkout");
+		await git(["branch", "feature/in-use", commit]);
+		await git(["worktree", "add", checkout, "feature/in-use"]);
+		const recorded = {
+			repositoryRoot: repository,
+			destination: join(managedRoot, "removed-worktree"),
+			selectedBaseRef: "refs/heads/main",
+			selectedBaseCommit: commit,
+			projectRelativePath: "",
+			requestedBranch: "feature/in-use",
+			ownershipToken: null,
+		};
+
+		await expect(service.deleteRollbackBranch(recorded)).resolves.toMatchObject({
+			status: "retained",
+		});
+		expect(await git(["rev-parse", "--verify", "refs/heads/feature/in-use"])).toBe(commit);
 	});
 });

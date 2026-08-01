@@ -656,6 +656,7 @@ describe("RelayUplinkBridge", () => {
 						socket.send(
 							JSON.stringify({
 								type: "run_started",
+								requestId: command["requestId"],
 								payload: {
 									sessionId: "sess-late-1",
 									runId: "run-late-1",
@@ -670,6 +671,7 @@ describe("RelayUplinkBridge", () => {
 					socket.send(
 						JSON.stringify({
 							type: "run_started",
+							requestId: command["requestId"],
 							payload: {
 								sessionId: "sess-fast-2",
 								runId: "run-fast-2",
@@ -1003,6 +1005,8 @@ describe("RelayUplinkBridge", () => {
 		let sendInputCommandAt = 0;
 		let sendInputAckAt = 0;
 		let stopCommandAt = 0;
+		let stopArrivedBeforeInputAck = false;
+		let acknowledgeInput: (() => void) | null = null;
 
 		uplinkWss.on("connection", (socket) => {
 			socket.on("message", (raw) => {
@@ -1036,7 +1040,7 @@ describe("RelayUplinkBridge", () => {
 
 				if (type === "send_input") {
 					sendInputCommandAt = Date.now();
-					setTimeout(() => {
+					acknowledgeInput = () => {
 						sendInputAckAt = Date.now();
 						socket.send(
 							JSON.stringify({
@@ -1044,18 +1048,21 @@ describe("RelayUplinkBridge", () => {
 								payload: { sessionId: "sess-stop-1" },
 							}),
 						);
-					}, 300);
+					};
 					return;
 				}
 
 				if (type === "stop") {
 					stopCommandAt = Date.now();
+					stopArrivedBeforeInputAck = sendInputAckAt === 0;
 					socket.send(
 						JSON.stringify({
 							type: "stopped",
 							payload: { sessionId: "sess-stop-1" },
 						}),
 					);
+					acknowledgeInput?.();
+					acknowledgeInput = null;
 				}
 			});
 		});
@@ -1161,7 +1168,7 @@ describe("RelayUplinkBridge", () => {
 			await waitForCondition(() => sendInputAckAt > 0, 8000);
 
 			expect(stopCommandAt).toBeGreaterThan(sendInputCommandAt);
-			expect(stopCommandAt).toBeLessThan(sendInputAckAt);
+			expect(stopArrivedBeforeInputAck).toBe(true);
 		} finally {
 			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
 				mobileSocket.close();

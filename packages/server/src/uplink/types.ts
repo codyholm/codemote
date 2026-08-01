@@ -81,6 +81,8 @@ export interface Session {
 	runId: string;
 	/** Runtime-native session ID used for resume (e.g. Claude session_id) */
 	runtimeSessionId?: string;
+	/** Whether this session may use its runtime-native ID for another turn. */
+	resumeEligible?: boolean;
 	/** Which runtime this session uses */
 	runtime: RuntimeType;
 	/** Current status */
@@ -117,7 +119,10 @@ export interface DurableProjectSession {
 	createdAt: number;
 	execution: SessionExecutionState;
 	runtimeSessionId?: string;
+	recoveryState?: DurableSessionRecoveryState;
 }
+
+export type DurableSessionRecoveryState = "resumable" | "ended" | "error";
 
 /**
  * Durable boundaries the base executor crosses on behalf of a Git-aware start.

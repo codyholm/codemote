@@ -86,6 +86,7 @@ export interface ManagedWorktreeOperationRecord extends ProjectStartOperationBas
 		selectedBaseRef: string;
 		selectedBaseCommit: string;
 		projectRelativePath: string;
+		ownershipToken?: string;
 	};
 }
 
@@ -333,6 +334,13 @@ function parseSession(value: unknown): DurableProjectSession {
 			"session.runtimeSessionId",
 		);
 	}
+	if (candidate["recoveryState"] !== undefined) {
+		const recoveryState = requiredString(candidate["recoveryState"], "session.recoveryState");
+		if (recoveryState !== "resumable" && recoveryState !== "ended" && recoveryState !== "error") {
+			return invalid("Invalid session.recoveryState");
+		}
+		session.recoveryState = recoveryState;
+	}
 	return session;
 }
 
@@ -504,6 +512,10 @@ function parseRecord(
 		if (isAbsolute(projectRelativePath) || projectRelativePath.split(/[\\/]/u).includes("..")) {
 			invalid("Invalid Worktree project relative path");
 		}
+		const ownershipToken =
+			worktree["ownershipToken"] === undefined
+				? undefined
+				: requiredString(worktree["ownershipToken"], "worktree.ownershipToken");
 		record = {
 			...common,
 			mode: "worktree",
@@ -516,6 +528,7 @@ function parseRecord(
 					"worktree.selectedBaseCommit",
 				),
 				projectRelativePath,
+				...(ownershipToken === undefined ? {} : { ownershipToken }),
 			},
 		};
 	}

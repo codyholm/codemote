@@ -420,6 +420,7 @@ export class UplinkServer {
 				const session = this.sessionManager.get(command.payload.sessionId);
 				if (!session) throw new Error("Session not found");
 				const executor = this.executors.get(session.runtime);
+				this.sessionManager.setRecoveryState(command.payload.sessionId, "ended");
 				await executor?.stop(command.payload.sessionId);
 				return { type: "stopped", payload: { sessionId: command.payload.sessionId } };
 			}

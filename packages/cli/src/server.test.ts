@@ -36,7 +36,7 @@ describe("Server Integration", { timeout: 30000 }, () => {
 		process.env["HOME"] = suiteMachineStateDir;
 		process.env["USERPROFILE"] = suiteMachineStateDir;
 		({ startServer: startServerImplementation } = await import("./server.js"));
-	});
+	}, 30_000);
 
 	afterAll(async () => {
 		if (originalHome === undefined) {

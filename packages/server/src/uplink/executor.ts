@@ -216,7 +216,10 @@ export abstract class BaseExecutor {
 		const session = this.sessionManager.get(sessionId);
 		if (!session) return;
 
-		await this.doStop(session);
+		// Runtime exit handlers may report an error while an intentional stop is in
+		// flight. The protocol caller records user intent separately; service shutdown
+		// deliberately records nothing so the durable conversation remains recoverable.
+		await this.sessionManager.withoutRecoveryPersistence(sessionId, () => this.doStop(session));
 		this.sessionManager.end(sessionId);
 		this.emitStatus(sessionId, "ended");
 	}
@@ -349,6 +352,7 @@ export abstract class BaseExecutor {
 			runId: recorded.runId,
 			runtime: this.type,
 			status,
+			resumeEligible: (recorded.recoveryState ?? "resumable") === "resumable",
 			workspace,
 			startedAt: recorded.createdAt,
 			endedAt: null,

@@ -113,7 +113,11 @@ describe("ProjectStartJournal", () => {
 					branch: "feature/worktree",
 					detached: false,
 				},
-				worktree: { path: destination, baseRef: "refs/heads/main", baseCommit: "abc123" },
+				worktree: {
+					path: destination,
+					baseRef: "refs/heads/main",
+					baseCommit: "abc123",
+				},
 			},
 		};
 	}
@@ -150,6 +154,7 @@ describe("ProjectStartJournal", () => {
 				selectedBaseRef: "refs/heads/main",
 				selectedBaseCommit: "abc123",
 				projectRelativePath: join("packages", "nested"),
+				ownershipToken: "worktree-owner",
 			},
 			phase: "retained",
 			createdAt: 1000,
@@ -262,7 +267,10 @@ describe("ProjectStartJournal", () => {
 		expect(journal.get("worktree-1")?.phase).toBe("retained");
 		expect(await readFile(journalPath, "utf8")).toBe(document);
 
-		journal.update("operation-1", (current) => ({ ...current, updatedAt: 3000 }));
+		journal.update("operation-1", (current) => ({
+			...current,
+			updatedAt: 3000,
+		}));
 		expect(journal.get("operation-1")?.recordVersion).toBe(1);
 		journal.update("operation-1", (current) => ({
 			...current,
@@ -277,11 +285,16 @@ describe("ProjectStartJournal", () => {
 	});
 
 	it("keeps a landed version-1 successful record loadable and replayable", async () => {
-		const { recordVersion: _recordVersion, ...legacy } = record({ phase: "session_started" });
+		const { recordVersion: _recordVersion, ...legacy } = record({
+			phase: "session_started",
+		});
 		await mkdir(dirname(journalPath), { recursive: true });
 		await writeFile(
 			journalPath,
-			JSON.stringify({ version: 1, operations: [{ ...legacy, result: terminalResult() }] }),
+			JSON.stringify({
+				version: 1,
+				operations: [{ ...legacy, result: terminalResult() }],
+			}),
 			"utf8",
 		);
 
@@ -323,7 +336,11 @@ describe("ProjectStartJournal", () => {
 		expect(journal.get("operation-1")?.phase).toBe("recorded");
 
 		for (const phase of ["branch_created", "branch_checked_out", "launch_requested"] as const) {
-			journal.update("operation-1", (current) => ({ ...current, phase, updatedAt: 2000 }));
+			journal.update("operation-1", (current) => ({
+				...current,
+				phase,
+				updatedAt: 2000,
+			}));
 		}
 		journal.update("operation-1", (current) => ({
 			...current,
@@ -358,12 +375,17 @@ describe("ProjectStartJournal", () => {
 			current.session
 				? {
 						...current,
-						session: { ...current.session, runtimeSessionId: "runtime-native-1" },
+						session: {
+							...current.session,
+							runtimeSessionId: "runtime-native-1",
+							recoveryState: "ended",
+						},
 						updatedAt: 5000,
 					}
 				: current,
 		);
 		expect(journal.get("operation-1")?.session?.runtimeSessionId).toBe("runtime-native-1");
+		expect(journal.get("operation-1")?.session?.recoveryState).toBe("ended");
 
 		expectJournalError(
 			() =>
@@ -386,7 +408,10 @@ describe("ProjectStartJournal", () => {
 		await mkdir(dirname(journalPath), { recursive: true });
 		const rejected: unknown[] = [
 			{ version: 1, operations: [{ ...record(), phase: "session_recorded" }] },
-			{ version: 1, operations: [{ ...record(), phase: "runtime_launch_requested" }] },
+			{
+				version: 1,
+				operations: [{ ...record(), phase: "runtime_launch_requested" }],
+			},
 			{
 				version: 1,
 				operations: [{ ...record(), phase: "recorded", session: durableSession() }],
@@ -407,9 +432,15 @@ describe("ProjectStartJournal", () => {
 		const invalid: unknown[] = [
 			// Session identity is required from the moment it exists.
 			{ version: 2, operations: [{ ...record(), phase: "session_recorded" }] },
-			{ version: 2, operations: [{ ...record(), phase: "runtime_launch_requested" }] },
+			{
+				version: 2,
+				operations: [{ ...record(), phase: "runtime_launch_requested" }],
+			},
 			// ...and cannot exist before it.
-			{ version: 2, operations: [{ ...record(), phase: "recorded", session: durableSession() }] },
+			{
+				version: 2,
+				operations: [{ ...record(), phase: "recorded", session: durableSession() }],
+			},
 			{
 				version: 2,
 				operations: [{ ...record(), phase: "launch_requested", session: durableSession() }],
@@ -456,18 +487,35 @@ describe("ProjectStartJournal", () => {
 
 	it("accepts rollback intent only for an unlaunched Worktree operation", async () => {
 		await mkdir(dirname(journalPath), { recursive: true });
-		const intent = { requestedAt: 2000, code: "RUNTIME_LAUNCH_FAILED", message: "Runtime failed" };
-		const rolling = { ...worktreeRecord(), phase: "rollback_requested" as const, rollback: intent };
+		const intent = {
+			requestedAt: 2000,
+			code: "RUNTIME_LAUNCH_FAILED",
+			message: "Runtime failed",
+		};
+		const rolling = {
+			...worktreeRecord(),
+			phase: "rollback_requested" as const,
+			rollback: intent,
+		};
 		const { failure: _failure, ...rollingWithoutFailure } = rolling;
 		const invalid: unknown[] = [
 			// A Project-folder operation never rolls back.
-			{ version: 2, operations: [{ ...record(), phase: "rollback_requested", rollback: intent }] },
+			{
+				version: 2,
+				operations: [{ ...record(), phase: "rollback_requested", rollback: intent }],
+			},
 			// Rollback intent cannot exist outside a rollback phase.
 			{ version: 2, operations: [{ ...worktreeRecord(), rollback: intent }] },
 			// A rollback phase without its intent has lost the failure to report.
 			{
 				version: 2,
-				operations: [{ ...worktreeRecord(), phase: "worktree_removed", failure: undefined }],
+				operations: [
+					{
+						...worktreeRecord(),
+						phase: "worktree_removed",
+						failure: undefined,
+					},
+				],
 			},
 			// A launched operation is never eligible.
 			{
@@ -560,8 +608,11 @@ describe("ProjectStartJournal", () => {
 			worktree: {
 				destination: expected.worktree.destination,
 				projectRelativePath: join("packages", "nested"),
+				ownershipToken: "worktree-owner",
 			},
-			failure: { details: { retainedWorktreePath: expected.worktree.destination } },
+			failure: {
+				details: { retainedWorktreePath: expected.worktree.destination },
+			},
 		});
 	});
 

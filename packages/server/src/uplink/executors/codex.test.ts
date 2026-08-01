@@ -98,6 +98,75 @@ exit 0
 		expect(executor.type).toBe("codex");
 	});
 
+	it("recovers a durable session lazily and resumes its exact thread", async () => {
+		const argsLogPath = join(testDir, "codex-recovery-args.log");
+		const recoveryPath = join(testDir, "mock-codex-recovery");
+		await writeFile(
+			recoveryPath,
+			`#!/bin/sh
+printf '%s\n' "$*" >> "${argsLogPath}"
+echo '{"type":"thread.started","thread_id":"codex-thread-recovered"}'
+echo '{"type":"turn.started"}'
+echo '{"type":"turn.completed"}'
+exit 0
+`,
+		);
+		await chmod(recoveryPath, 0o755);
+		activeExecutor = new CodexExecutor(workspaceManager, sessionManager, eventBus, {
+			codexPath: recoveryPath,
+		});
+		const execution = { directory: testDir, mode: "project_folder" as const, git: null };
+		const recovered = await activeExecutor.recoverRun(
+			{
+				sessionId: "codex-recovered",
+				runId: "codex-run",
+				workspaceId: "codex-workspace",
+				createdAt: 1,
+				execution,
+				runtimeSessionId: "codex-thread-recovered",
+				recoveryState: "resumable",
+			},
+			{ originProjectPath: testDir, execution },
+		);
+		activeSessionId = "codex-recovered";
+
+		expect(recovered).toBe(true);
+		expect(sessionManager.get(activeSessionId)).toMatchObject({ status: "idle" });
+		await expect(readFile(argsLogPath, "utf8")).rejects.toBeDefined();
+
+		await activeExecutor.sendInput(activeSessionId, "recovered-follow-up");
+		await waitFor(() => sessionManager.get(activeSessionId ?? "")?.status === "ended");
+		expect(await readFile(argsLogPath, "utf8")).toContain(
+			"exec resume codex-thread-recovered --json recovered-follow-up",
+		);
+	});
+
+	it("does not resume a deliberately stopped Codex session", async () => {
+		activeExecutor = new CodexExecutor(workspaceManager, sessionManager, eventBus, {
+			codexPath: mockCodexPath,
+		});
+		const workspace = workspaceManager.restore({
+			id: "stopped-workspace",
+			workingDir: testDir,
+			createdAt: 1,
+		});
+		sessionManager.restore({
+			id: "stopped-session",
+			runId: "stopped-run",
+			runtime: "codex",
+			status: "ended",
+			workspace,
+			startedAt: 1,
+			endedAt: 2,
+			lastActivityAt: 2,
+			statusChangedAt: 2,
+			runtimeSessionId: "stopped-thread",
+			resumeEligible: false,
+		});
+
+		await expect(activeExecutor.sendInput("stopped-session", "do not resume")).rejects.toThrow();
+	});
+
 	it("rejects start when the Codex binary is not executable", async () => {
 		const unexecutablePath = join(testDir, "unexecutable-codex");
 		await writeFile(unexecutablePath, "#!/bin/sh\nexit 0\n", "utf8");
