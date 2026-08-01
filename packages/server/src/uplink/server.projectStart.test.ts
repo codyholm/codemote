@@ -28,6 +28,12 @@ interface UplinkMessage {
 
 class TestClient {
 	private readonly messages: UplinkMessage[] = [];
+	private readonly messageWaiters = new Set<{
+		predicate: (message: UplinkMessage) => boolean;
+		resolve: (message: UplinkMessage) => void;
+		reject: (error: Error) => void;
+		timeout: NodeJS.Timeout;
+	}>();
 	private readonly waiters = new Map<
 		string,
 		{
@@ -41,6 +47,12 @@ class TestClient {
 		socket.on("message", (data) => {
 			const message = JSON.parse(data.toString()) as UplinkMessage;
 			this.messages.push(message);
+			for (const waiter of this.messageWaiters) {
+				if (!waiter.predicate(message)) continue;
+				clearTimeout(waiter.timeout);
+				this.messageWaiters.delete(waiter);
+				waiter.resolve(message);
+			}
 			if (message.requestId) {
 				const waiter = this.waiters.get(message.requestId);
 				if (waiter) {
@@ -51,11 +63,33 @@ class TestClient {
 			}
 		});
 		socket.on("close", () => {
+			for (const waiter of this.messageWaiters) {
+				clearTimeout(waiter.timeout);
+				waiter.reject(new Error("Socket closed before matching uplink message"));
+			}
+			this.messageWaiters.clear();
 			for (const [requestId, waiter] of this.waiters) {
 				clearTimeout(waiter.timeout);
 				waiter.reject(new Error(`Socket closed before response for ${requestId}`));
 			}
 			this.waiters.clear();
+		});
+	}
+
+	waitForMessage(predicate: (message: UplinkMessage) => boolean): Promise<UplinkMessage> {
+		const existing = this.messages.find(predicate);
+		if (existing) return Promise.resolve(existing);
+		return new Promise((resolvePromise, reject) => {
+			const waiter = {
+				predicate,
+				resolve: resolvePromise,
+				reject,
+				timeout: setTimeout(() => {
+					this.messageWaiters.delete(waiter);
+					reject(new Error("Timed out waiting for matching uplink message"));
+				}, 5_000),
+			};
+			this.messageWaiters.add(waiter);
 		});
 	}
 
@@ -389,6 +423,30 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		);
 		expect(response.type).toBe("project_start_state");
 		return response.payload as ProjectStartState;
+	}
+
+	async function waitForSession(
+		sessionId: string,
+		predicate: (session: Session) => boolean,
+	): Promise<Session> {
+		let response = await client.request({ type: "list_sessions" }, `wait-session-${sessionId}-0`);
+		let session = (response.payload as Session[]).find((candidate) => candidate.id === sessionId);
+		if (session && predicate(session)) return session;
+		await client.waitForMessage((message) => {
+			if (message.type !== "event") return false;
+			const event = message.payload as
+				| { type?: string; sessionId?: string; payload?: { status?: string } }
+				| undefined;
+			return (
+				event?.type === "session.status" &&
+				event.sessionId === sessionId &&
+				event.payload?.status === "idle"
+			);
+		});
+		response = await client.request({ type: "list_sessions" }, `wait-session-${sessionId}-1`);
+		session = (response.payload as Session[]).find((candidate) => candidate.id === sessionId);
+		if (session && predicate(session)) return session;
+		throw new Error(`Timed out waiting for session ${sessionId}`);
 	}
 
 	function startPayload(
@@ -910,6 +968,128 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		expect(sessions[0]?.originProjectPath).toBe(project);
 		expect(await git(project, ["branch", "--show-current"])).toBe("main");
 	});
+
+	it.skipIf(platform() === "win32")(
+		"recovers one live Claude worktree session for one follow-up after restart",
+		async () => {
+			const invocationLog = join(fixtureRoot, "claude-invocations.log");
+			const inputLog = join(fixtureRoot, "claude-inputs.log");
+			const claudePath = join(fixtureRoot, "mock-claude-resume");
+			await writeFile(
+				claudePath,
+				[
+					"#!/bin/sh",
+					`printf '%s|%s\\n' "$PWD" "$*" >> "${invocationLog}"`,
+					"while IFS= read -r line; do",
+					`	printf '%s\\n' "$line" >> "${inputLog}"`,
+					`	printf '%s\\n' '{"type":"session_start","session_id":"claude-runtime-1"}'`,
+					`	printf '%s\\n' '{"type":"result","session_id":"claude-runtime-1","result":"done"}'`,
+					"done",
+					"",
+				].join("\n"),
+				"utf8",
+			);
+			await chmod(claudePath, 0o755);
+
+			const current = await state();
+			const base = current.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
+			if (!base) throw new Error("Expected local main base");
+			const payload = worktreeStartPayload(
+				"restart-live-claude",
+				base.ref,
+				base.commit,
+				"feature/restart-live-claude",
+			);
+			payload["profile"] = "claude";
+
+			const firstInternals = server as unknown as ServerInternals;
+			server.registerExecutor(
+				new ClaudeExecutor(
+					firstInternals.workspaceManager,
+					firstInternals.sessionManager,
+					firstInternals.eventBus,
+					{ claudePath },
+				),
+			);
+			const started = await client.request(
+				{ type: "start_run", payload },
+				"restart-live-claude-start",
+			);
+			const result = started.payload as RunResult;
+			if (result.execution?.mode !== "worktree") throw new Error("Expected Worktree execution");
+			const original = await waitForSession(
+				result.sessionId,
+				(session) => session.status === "idle" && session.runtimeSessionId === "claude-runtime-1",
+			);
+			expect(original.workspace.workingDir).toBe(result.execution.directory);
+
+			await client.close();
+			await server.stop();
+			port = await reserveFreePort();
+			server = new UplinkServer({
+				port,
+				host: "127.0.0.1",
+				repoPath: fixtureRoot,
+				runtimes: [],
+				projectRegistryPath: join(fixtureRoot, "machine", "projects.json"),
+				projectStartJournalPath: journalPath,
+				managedWorktreeRoot: join(fixtureRoot, "managed"),
+			});
+			const restartedInternals = server as unknown as ServerInternals;
+			server.registerExecutor(
+				new ClaudeExecutor(
+					restartedInternals.workspaceManager,
+					restartedInternals.sessionManager,
+					restartedInternals.eventBus,
+					{ claudePath },
+				),
+			);
+			await server.start();
+			client = await TestClient.connect(port);
+
+			const recovered = await waitForSession(
+				result.sessionId,
+				(session) => session.status === "idle",
+			);
+			expect(recovered).toMatchObject({
+				id: result.sessionId,
+				runId: original.runId,
+				runtimeSessionId: "claude-runtime-1",
+				originProjectPath: project,
+			});
+			expect(recovered.workspace).toMatchObject({
+				id: original.workspace.id,
+				workingDir: result.execution.directory,
+			});
+			expect((await readFile(invocationLog, "utf8")).trim().split("\n")).toHaveLength(1);
+
+			const followedUp = await client.request(
+				{ type: "send_input", payload: { sessionId: result.sessionId, input: "continue" } },
+				"restart-live-claude-follow-up",
+			);
+			expect(followedUp.type).toBe("input_sent");
+			await waitForSession(result.sessionId, (session) => session.status === "idle");
+
+			const invocations = (await readFile(invocationLog, "utf8")).trim().split("\n");
+			expect(invocations).toHaveLength(2);
+			expect(invocations[1]).toContain(`${result.execution.directory}|`);
+			expect(invocations[1]).toContain("--resume claude-runtime-1");
+			const inputs = (await readFile(inputLog, "utf8")).trim().split("\n");
+			expect(inputs).toHaveLength(2);
+			expect(inputs[1]).toContain("continue");
+
+			const sessions = (
+				await client.request({ type: "list_sessions" }, "restart-live-claude-sessions")
+			).payload as Session[];
+			expect(sessions).toHaveLength(1);
+			const operationJournal = readJournal();
+			expect(operationJournal.operations).toHaveLength(1);
+			const registrations = (await git(project, ["worktree", "list", "--porcelain"]))
+				.split("\n")
+				.filter((line) => line === `worktree ${result.execution?.directory}`);
+			expect(registrations).toHaveLength(1);
+		},
+	);
 
 	it("relaunches a recorded session through the real executor exactly once after restart", async () => {
 		const payload = startPayload(

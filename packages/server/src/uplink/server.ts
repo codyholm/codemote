@@ -652,6 +652,8 @@ export class UplinkServer {
 				registry: this.projectRegistry,
 				sessionManager: this.sessionManager,
 				workspaceManager: this.workspaceManager,
+				recoverSession: async (runtime, session, context) =>
+					(await this.executors.get(runtime)?.recoverRun(session, context)) ?? false,
 				...(this.config.managedWorktreeRoot
 					? { managedWorktreeRoot: this.config.managedWorktreeRoot }
 					: {}),

@@ -145,6 +145,41 @@ export abstract class BaseExecutor {
 	}
 
 	/**
+	 * Rehydrate a durable runtime conversation without manufacturing a new turn.
+	 *
+	 * Runtime-specific recovery may register enough state to resume lazily when
+	 * the next real user input arrives. Unsupported runtimes return false and the
+	 * caller keeps the existing conservative ended-session restoration.
+	 */
+	async recoverRun(
+		recorded: DurableProjectSession,
+		context: SessionStartContext,
+	): Promise<boolean> {
+		const runtimeSessionId = recorded.runtimeSessionId?.trim();
+		if (!runtimeSessionId) return false;
+
+		const workspace = this.workspaceManager.restore({
+			id: recorded.workspaceId,
+			workingDir: recorded.execution.directory,
+			createdAt: recorded.createdAt,
+		});
+		const session = this.sessionManager.restore(
+			this.recoveredSession(recorded, workspace, context, "idle"),
+		);
+
+		try {
+			const recovered = await this.doRecoverRun(session, runtimeSessionId);
+			if (recovered) return true;
+		} catch (error) {
+			await this.discardSession(session.id, workspace.id);
+			throw error;
+		}
+
+		await this.discardSession(session.id, workspace.id);
+		return false;
+	}
+
+	/**
 	 * Send input to a session
 	 */
 	async sendInput(sessionId: string, input: string): Promise<void> {
@@ -306,13 +341,14 @@ export abstract class BaseExecutor {
 		recorded: DurableProjectSession,
 		workspace: Workspace,
 		context?: SessionStartContext,
+		status: SessionStatus = "starting",
 	): Session {
 		const now = Date.now();
 		return {
 			id: recorded.sessionId,
 			runId: recorded.runId,
 			runtime: this.type,
-			status: "starting",
+			status,
 			workspace,
 			startedAt: recorded.createdAt,
 			endedAt: null,
@@ -341,6 +377,14 @@ export abstract class BaseExecutor {
 	 * Implement runtime-specific run start logic
 	 */
 	protected abstract doStartRun(session: Session, options: RunOptions): Promise<void>;
+
+	/**
+	 * Register a durable runtime-native identity for lazy follow-up recovery.
+	 * Runtimes that do not explicitly support this keep the prior ended state.
+	 */
+	protected async doRecoverRun(_session: Session, _runtimeSessionId: string): Promise<boolean> {
+		return false;
+	}
 
 	/**
 	 * Implement runtime-specific input handling
