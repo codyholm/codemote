@@ -171,99 +171,19 @@ export class ClaudeExecutor extends BaseExecutor {
 				: null;
 		const maxTokens =
 			typeof options.maxTokens === "number" && options.maxTokens > 0 ? options.maxTokens : null;
-		const args = this.buildArgs(options.resumeSessionId, model, temperature, maxTokens);
-
 		const claudeSession: ClaudeSession = {
-			claudeSessionId: null,
+			claudeSessionId: options.resumeSessionId?.trim() || null,
 			model,
 			temperature,
 			maxTokens,
 			process: null,
 			buffer: "",
-			running: true,
+			running: false,
 			pendingToolCalls: new Map(),
 		};
 
 		this.claudeSessions.set(session.id, claudeSession);
-
-		const proc = spawn(this.config.claudePath, args, {
-			cwd: session.workspace.workingDir,
-			env: {
-				...process.env,
-				// Headless environment settings
-				CI: "true",
-				TERM: "dumb",
-			},
-			stdio: "pipe",
-		}) as ChildProcessWithoutNullStreams;
-
-		if (!proc.stdout || !proc.stderr || !proc.stdin) {
-			proc.kill("SIGTERM");
-			claudeSession.running = false;
-			this.claudeSessions.delete(session.id);
-			this.emitOutput(session.id, "Error: Claude stdio streams not available\n");
-			this.emitStatus(session.id, "error");
-			throw new Error("Claude stdio streams not available");
-		}
-
-		claudeSession.process = proc;
-
-		// A claude CLI that dies before our prompt write lands (bad flags, missing auth,
-		// immediate crash) closes the read end of the stdin pipe, and libuv reports that
-		// as an 'error' on the stream. Without a listener Node promotes it to an uncaught
-		// exception and takes the whole uplink process down. One stream-level listener
-		// also covers doSendInput() writes and doStop()'s end(). Deliberately does not
-		// touch session state: stdin can close while stdout is still streaming, and the
-		// 'exit'/'error' handlers below own the lifecycle.
-		proc.stdin.on("error", (error) => {
-			logClaudeDebug(`[Claude stdin] ${session.id.slice(0, 8)}...: ${error.message}`);
-		});
-
-		// Handle output (stdout + stderr).
-		proc.stdout.on("data", (chunk) => {
-			const data = chunk.toString("utf8");
-			logClaudeDebug(`[Claude stdout] ${session.id.slice(0, 8)}...: ${data.slice(0, 200)}`);
-			this.handleOutput(session.id, data);
-		});
-		proc.stderr.on("data", (chunk) => {
-			const data = chunk.toString("utf8");
-			logClaudeDebug(`[Claude stderr] ${session.id.slice(0, 8)}...: ${data.slice(0, 200)}`);
-			this.handleOutput(session.id, data);
-		});
-
-		// Handle spawn errors (e.g., binary missing / not executable). Without this,
-		// Node can emit an unhandled 'error' event and crash the uplink process.
-		proc.on("error", (error) => {
-			if (!claudeSession.running) return;
-			claudeSession.running = false;
-			this.emitOutput(session.id, `Error: ${error.message}\n`);
-			this.emitStatus(session.id, "error");
-		});
-
-		// Handle process exit
-		proc.on("exit", (exitCode) => {
-			if (!claudeSession.running) return;
-			claudeSession.running = false;
-
-			// Process any remaining buffer content
-			if (claudeSession.buffer.trim()) {
-				this.processLine(session.id, claudeSession.buffer);
-				claudeSession.buffer = "";
-			}
-
-			if (exitCode === 0) {
-				this.emitStatus(session.id, "ended");
-			} else {
-				this.emitStatus(session.id, "error");
-			}
-		});
-
-		try {
-			await this.waitForSpawn(proc);
-		} catch (error) {
-			this.claudeSessions.delete(session.id);
-			throw error;
-		}
+		const proc = await this.spawnClaude(session, claudeSession, options.resumeSessionId);
 
 		// Send initial prompt as JSON message (for stream-json input format)
 		// Format: {"type":"user","message":{"role":"user","content":"..."}}
@@ -281,6 +201,23 @@ export class ClaudeExecutor extends BaseExecutor {
 		this.emitStatus(session.id, "running");
 	}
 
+	protected override async doRecoverRun(
+		session: Session,
+		runtimeSessionId: string,
+	): Promise<boolean> {
+		this.claudeSessions.set(session.id, {
+			claudeSessionId: runtimeSessionId,
+			model: null,
+			temperature: null,
+			maxTokens: null,
+			process: null,
+			buffer: "",
+			running: false,
+			pendingToolCalls: new Map(),
+		});
+		return true;
+	}
+
 	/**
 	 * Send a follow-up input to the Claude session
 	 *
@@ -290,7 +227,13 @@ export class ClaudeExecutor extends BaseExecutor {
 	 */
 	protected async doSendInput(session: Session, input: string): Promise<void> {
 		const claudeSession = this.claudeSessions.get(session.id);
-		if (!claudeSession?.process || !claudeSession.running) {
+		if (!claudeSession) {
+			throw new Error("Claude session not running");
+		}
+		if (!claudeSession.process && !claudeSession.running && claudeSession.claudeSessionId) {
+			await this.spawnClaude(session, claudeSession, claudeSession.claudeSessionId);
+		}
+		if (!claudeSession.process || !claudeSession.running) {
 			throw new Error("Claude session not running");
 		}
 
@@ -386,6 +329,76 @@ export class ClaudeExecutor extends BaseExecutor {
 	// ========================================
 	// Private helper methods
 	// ========================================
+
+	private async spawnClaude(
+		session: Session,
+		claudeSession: ClaudeSession,
+		resumeSessionId?: string,
+	): Promise<ChildProcessWithoutNullStreams> {
+		const args = this.buildArgs(
+			resumeSessionId,
+			claudeSession.model,
+			claudeSession.temperature,
+			claudeSession.maxTokens,
+		);
+		claudeSession.running = true;
+		const proc = spawn(this.config.claudePath, args, {
+			cwd: session.workspace.workingDir,
+			env: {
+				...process.env,
+				CI: "true",
+				TERM: "dumb",
+			},
+			stdio: "pipe",
+		}) as ChildProcessWithoutNullStreams;
+
+		if (!proc.stdout || !proc.stderr || !proc.stdin) {
+			proc.kill("SIGTERM");
+			claudeSession.running = false;
+			this.claudeSessions.delete(session.id);
+			this.emitOutput(session.id, "Error: Claude stdio streams not available\n");
+			this.emitStatus(session.id, "error");
+			throw new Error("Claude stdio streams not available");
+		}
+
+		claudeSession.process = proc;
+		proc.stdin.on("error", (error) => {
+			logClaudeDebug(`[Claude stdin] ${session.id.slice(0, 8)}...: ${error.message}`);
+		});
+		proc.stdout.on("data", (chunk) => {
+			const data = chunk.toString("utf8");
+			logClaudeDebug(`[Claude stdout] ${session.id.slice(0, 8)}...: ${data.slice(0, 200)}`);
+			this.handleOutput(session.id, data);
+		});
+		proc.stderr.on("data", (chunk) => {
+			const data = chunk.toString("utf8");
+			logClaudeDebug(`[Claude stderr] ${session.id.slice(0, 8)}...: ${data.slice(0, 200)}`);
+			this.handleOutput(session.id, data);
+		});
+		proc.on("error", (error) => {
+			if (!claudeSession.running) return;
+			claudeSession.running = false;
+			this.emitOutput(session.id, `Error: ${error.message}\n`);
+			this.emitStatus(session.id, "error");
+		});
+		proc.on("exit", (exitCode) => {
+			if (!claudeSession.running) return;
+			claudeSession.running = false;
+			if (claudeSession.buffer.trim()) {
+				this.processLine(session.id, claudeSession.buffer);
+				claudeSession.buffer = "";
+			}
+			this.emitStatus(session.id, exitCode === 0 ? "ended" : "error");
+		});
+
+		try {
+			await this.waitForSpawn(proc);
+		} catch (error) {
+			this.claudeSessions.delete(session.id);
+			throw error;
+		}
+		return proc;
+	}
 
 	private waitForSpawn(proc: ChildProcessWithoutNullStreams): Promise<void> {
 		return new Promise((resolve, reject) => {

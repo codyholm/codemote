@@ -83,6 +83,11 @@ export interface ProjectStartCoordinatorOptions {
 	workspaceManager: WorkspaceManager;
 	runGit?: GitCommandRunner;
 	managedWorktreeRoot?: string;
+	recoverSession?: (
+		runtime: RunOptions["profile"],
+		session: DurableProjectSession,
+		context: SessionStartContext,
+	) => Promise<boolean>;
 }
 
 type WorktreeOperationRecord = Extract<ProjectStartOperationRecord, { mode: "worktree" }>;
@@ -359,6 +364,7 @@ export class ProjectStartCoordinator {
 	private readonly workspaceManager: WorkspaceManager;
 	private readonly runGit: GitCommandRunner;
 	private readonly managedWorktrees: ManagedWorktreeService;
+	private readonly recoverSession: ProjectStartCoordinatorOptions["recoverSession"];
 	private readonly inFlight = new Map<string, InFlightOperation>();
 	private readonly repositoryTails = new Map<string, Promise<void>>();
 
@@ -368,6 +374,7 @@ export class ProjectStartCoordinator {
 		this.sessionManager = options.sessionManager;
 		this.workspaceManager = options.workspaceManager;
 		this.runGit = options.runGit ?? runGitCommand;
+		this.recoverSession = options.recoverSession;
 		this.managedWorktrees = new ManagedWorktreeService(
 			this.runGit,
 			options.managedWorktreeRoot ?? join(homedir(), ".codemote", "worktrees"),
@@ -455,13 +462,31 @@ export class ProjectStartCoordinator {
 
 	/**
 	 * Make a completed operation's session, workspace and effective directory
-	 * discoverable again. The status is `ended` because the previous process took
-	 * its runtime with it; this restores the mapping, not a live conversation.
+	 * discoverable again. A runtime that explicitly supports durable recovery may
+	 * rehydrate the conversation for lazy follow-up; every other runtime keeps the
+	 * existing conservative ended-session mapping.
 	 */
 	private async restoreDurableSession(record: ProjectStartOperationRecord): Promise<void> {
 		const durable = record.session;
 		if (!durable) return;
 		if (!(await this.resolvesToRecordedDirectory(durable.execution))) return;
+		const context: SessionStartContext = {
+			originProjectPath: record.originProjectPath,
+			execution: durable.execution,
+		};
+		if (this.recoverSession) {
+			try {
+				if (await this.recoverSession(record.runtime, durable, context)) {
+					this.bindRuntimeSessionPersistence(record.operationId, durable.sessionId);
+					return;
+				}
+			} catch (error) {
+				console.error(
+					`Runtime session recovery fell back to ended for ${durable.sessionId}:`,
+					describeError(error),
+				);
+			}
+		}
 		const workspace = this.workspaceManager.restore({
 			id: durable.workspaceId,
 			workingDir: durable.execution.directory,
