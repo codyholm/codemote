@@ -962,7 +962,11 @@ export class ProjectStartCoordinator {
 		}
 
 		const current = this.journal.get(operationId) ?? record;
-		const session = current.session ?? this.durableSessionFor(launched, effective);
+		const recordedSession = current.session ?? this.durableSessionFor(launched, effective);
+		const liveRuntimeSessionId = this.sessionManager.get(launched.sessionId)?.runtimeSessionId;
+		const session: DurableProjectSession = liveRuntimeSessionId
+			? { ...recordedSession, runtimeSessionId: liveRuntimeSessionId }
+			: recordedSession;
 		const result: RunResult = {
 			...launched,
 			operationId,

@@ -194,6 +194,7 @@ interface NewSessionMessage {
 	type: "new_session";
 	runtime: RuntimeType;
 	prompt: string;
+	resumeSessionId?: string;
 	workspace?: string;
 	model?: string;
 	temperature?: number;
@@ -417,6 +418,8 @@ type MobileOutboundMessage =
 	| SessionStartUnresolvedMessage
 	| ProjectRegistryResultMessage
 	| GitPRResultMessage;
+
+const AUTO_RESUME_RUNTIMES: ReadonlySet<RuntimeType> = new Set(["claude", "opencode"]);
 
 export interface RelayUplinkBridgeConfig {
 	relayUrl: string;
@@ -1502,10 +1505,12 @@ export async function startRelayUplinkBridge(
 	}
 
 	async function handleNewSession(message: NewSessionMessage): Promise<void> {
+		const resumeSessionId = resolveResumeSessionId(message);
 		try {
 			const result = await startAndTrackSession(
 				message.runtime,
 				message.prompt,
+				resumeSessionId,
 				message.workspace,
 				message.model,
 				message.temperature,
@@ -1527,7 +1532,7 @@ export async function startRelayUplinkBridge(
 			}
 		} catch (error) {
 			if (message.projectStart) {
-				if (!(error instanceof UplinkRequestError)) {
+				if (!(error instanceof UplinkRequestError) || error.code === "PROJECT_START_JOURNAL_IO") {
 					log?.(
 						`[Bridge] Project start ${message.projectStart.operationId} remains unresolved: ${errorMessage(error)}`,
 					);
@@ -1557,11 +1562,28 @@ export async function startRelayUplinkBridge(
 				return;
 			}
 
-			log?.(
-				`[Bridge] Failed to start session: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
-			);
+			let sessionStartError: unknown = error;
+			if (resumeSessionId) {
+				log?.(
+					`[Bridge] Resume failed for ${message.runtime} session ${resumeSessionId}: ${errorMessage(error)}; retrying with a fresh session`,
+				);
+				try {
+					await startAndTrackSession(
+						message.runtime,
+						message.prompt,
+						undefined,
+						message.workspace,
+						message.model,
+						message.temperature,
+						message.maxTokens,
+					);
+					return;
+				} catch (fallbackError) {
+					sessionStartError = fallbackError;
+				}
+			}
+
+			log?.(`[Bridge] Failed to start session: ${errorMessage(sessionStartError)}`);
 			const errorId = `error-${Date.now()}`;
 			sessions.set(errorId, {
 				id: errorId,
@@ -1578,9 +1600,39 @@ export async function startRelayUplinkBridge(
 		}
 	}
 
+	function resolveResumeSessionId(message: NewSessionMessage): string | undefined {
+		if (message.projectStart || !AUTO_RESUME_RUNTIMES.has(message.runtime)) return undefined;
+		return (
+			normalizeResumeSessionId(message.runtime, message.resumeSessionId) ??
+			resolveLatestRuntimeSessionId(message.runtime)
+		);
+	}
+
+	function resolveLatestRuntimeSessionId(runtime: RuntimeType): string | undefined {
+		if (!AUTO_RESUME_RUNTIMES.has(runtime)) return undefined;
+		const latest = Array.from(sessions.values())
+			.filter((session) => session.runtime === runtime && !!session.runtimeSessionId)
+			.sort((a, b) => b.createdAt - a.createdAt)[0];
+		return normalizeResumeSessionId(runtime, latest?.runtimeSessionId);
+	}
+
+	function normalizeResumeSessionId(
+		runtime: RuntimeType,
+		runtimeSessionId: string | undefined,
+	): string | undefined {
+		const trimmed = runtimeSessionId?.trim();
+		if (!trimmed) return undefined;
+		if (runtime === "opencode" && !trimmed.startsWith("ses_")) {
+			log?.(`[Bridge] Ignoring incompatible OpenCode resume id: ${trimmed.slice(0, 12)}...`);
+			return undefined;
+		}
+		return trimmed;
+	}
+
 	async function startAndTrackSession(
 		runtime: RuntimeType,
 		prompt: string,
+		resumeSessionId?: string,
 		workspace?: string,
 		model?: string,
 		temperature?: number,
@@ -1596,7 +1648,7 @@ export async function startRelayUplinkBridge(
 			runtime,
 			effectiveWorkspace,
 			prompt,
-			undefined,
+			resumeSessionId,
 			model,
 			temperature,
 			maxTokens,
@@ -1609,7 +1661,7 @@ export async function startRelayUplinkBridge(
 		const sessionId = started.payload.sessionId;
 		const existing = sessions.get(sessionId);
 		const status = existing?.status ?? "starting";
-		const runtimeSessionId = existing?.runtimeSessionId;
+		const runtimeSessionId = existing?.runtimeSessionId ?? resumeSessionId;
 		const originProjectPath = started.payload.originProjectPath ?? existing?.originProjectPath;
 		const execution = started.payload.execution ?? existing?.execution;
 		const workspacePath =
@@ -1641,7 +1693,16 @@ export async function startRelayUplinkBridge(
 			throw new Error("Prompt is required");
 		}
 
-		return startAndTrackSession(runtime, cleanPrompt);
+		const resumeSessionId = resolveLatestRuntimeSessionId(runtime);
+		try {
+			return await startAndTrackSession(runtime, cleanPrompt, resumeSessionId);
+		} catch (error) {
+			if (!resumeSessionId) throw error;
+			log?.(
+				`[Bridge] Resume failed for local ${runtime} start ${resumeSessionId}: ${errorMessage(error)}; retrying with a fresh session`,
+			);
+			return startAndTrackSession(runtime, cleanPrompt);
+		}
 	}
 
 	async function handleApprovalResponse(message: ApprovalResponseMessage): Promise<void> {
@@ -2560,6 +2621,7 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 	if (type === "new_session") {
 		const runtime = (payload as { runtime?: unknown }).runtime;
 		const prompt = (payload as { prompt?: unknown }).prompt;
+		const resumeSessionId = (payload as { resumeSessionId?: unknown }).resumeSessionId;
 		const workspace = (payload as { workspace?: unknown }).workspace;
 		const model = (payload as { model?: unknown }).model;
 		const temperature = (payload as { temperature?: unknown }).temperature;
@@ -2576,6 +2638,13 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 				projectStartValue === undefined ? undefined : decodeProjectStartRequest(projectStartValue);
 			if (projectStartValue !== undefined && !projectStart) return null;
 			const msg: NewSessionMessage = { type: "new_session", runtime, prompt };
+			if (
+				projectStart === undefined &&
+				typeof resumeSessionId === "string" &&
+				resumeSessionId.trim().length > 0
+			) {
+				msg.resumeSessionId = resumeSessionId.trim();
+			}
 			if (typeof workspace === "string" && workspace.trim().length > 0) {
 				msg.workspace = workspace.trim();
 			}

@@ -2157,6 +2157,30 @@ describe("ProjectStartCoordinator", { timeout: 60_000 }, () => {
 		expect(journal.get("runtime-native")?.session?.runtimeSessionId).toBe("claude-native-1");
 	});
 
+	it("records a runtime-native ID assigned before launch success", async () => {
+		const repo = await makeGitProject("runtime-native-before-success");
+		const result = await coordinator().start(
+			request(repo, "runtime-native-before-success", { type: "none" }, { profile: "claude" }),
+			async (_options, context) => {
+				const workspace = {
+					id: "workspace-native-before-success",
+					workingDir: context.execution.directory,
+					createdAt: 1,
+				};
+				const session = sessions.create("claude", workspace, context);
+				context.launch?.recordSession(session);
+				context.launch?.recordRuntimeLaunchRequested(session);
+				sessions.setRuntimeSessionId(session.id, "claude-native-before-success");
+				return { runId: session.runId, sessionId: session.id };
+			},
+		);
+
+		expect(result.sessionId).toBeDefined();
+		expect(journal.get("runtime-native-before-success")?.session?.runtimeSessionId).toBe(
+			"claude-native-before-success",
+		);
+	});
+
 	it("persists retained outcomes when post-mutation projects cannot be safely resumed", async () => {
 		const removedRepo = await makeGitProject("removed-registration");
 		const removedState = await coordinator().inspect(removedRepo);

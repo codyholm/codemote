@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -182,6 +183,44 @@ exit 0
 		const invokedArgs = await readFile(argsPath, "utf8");
 		expect(invokedArgs).toContain("--permission-mode acceptEdits");
 		expect(invokedArgs).toContain("--resume claude-resume-id");
+
+		activeSessionId = null;
+	});
+
+	it("assigns a native session ID before a project-aware start succeeds", async () => {
+		const argsPath = join(testDir, "claude-project-args.txt");
+		const argsCapturingMockPath = join(testDir, "mock-claude-project-args");
+		const argsScript = `#!/bin/sh
+echo "$@" > "${argsPath}"
+printf '%s\n' '{"type":"session_start","session_id":"mock-session"}'
+printf '%s\n' '{"type":"end"}'
+exit 0
+`;
+		await writeFile(argsCapturingMockPath, argsScript);
+		await chmod(argsCapturingMockPath, 0o755);
+		activeExecutor = new ClaudeExecutor(workspaceManager, sessionManager, eventBus, {
+			claudePath: argsCapturingMockPath,
+		});
+
+		const result = await activeExecutor.startRun({
+			profile: "claude",
+			workspace: testDir,
+			initialPrompt: "Hello",
+			projectStart: {
+				operationId: "claude-project-start",
+				originProjectPath: testDir,
+				mode: "project_folder",
+				preparation: { type: "none" },
+			},
+		});
+		activeSessionId = result.sessionId;
+
+		await waitFor(() => existsSync(argsPath));
+		const invokedArgs = await readFile(argsPath, "utf8");
+		expect(invokedArgs).toMatch(
+			/--session-id [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/u,
+		);
+		expect(invokedArgs).not.toContain("--resume");
 
 		activeSessionId = null;
 	});

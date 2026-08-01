@@ -1061,6 +1061,7 @@ describe("bridge project state", { timeout: 30000 }, () => {
 						type: "new_session",
 						runtime: "opencode",
 						prompt: "fresh project start",
+						resumeSessionId: "ses_legacy_project",
 						projectStart: {
 							operationId: "operation-success",
 							originProjectPath: tempRepoDir,
@@ -1428,7 +1429,7 @@ describe("bridge project state", { timeout: 30000 }, () => {
 				() =>
 					received.some(
 						(message) =>
-							message["type"] === "session_start_result" &&
+							message["type"] === "session_start_unresolved" &&
 							message["operationId"] === "unwritable-journal",
 					),
 				15_000,
@@ -1436,19 +1437,15 @@ describe("bridge project state", { timeout: 30000 }, () => {
 			expect(
 				received.find(
 					(message) =>
-						message["type"] === "session_start_result" &&
+						message["type"] === "session_start_unresolved" &&
 						message["operationId"] === "unwritable-journal",
 				),
-			).toMatchObject({
+			).toEqual({
+				type: "session_start_unresolved",
 				operationId: "unwritable-journal",
-				success: false,
-				code: "PROJECT_START_JOURNAL_IO",
+				retryable: true,
+				code: "UPLINK_RESPONSE_UNRESOLVED",
 				message: "Failed to persist project start operation journal",
-				details: {
-					operationId: "unwritable-journal",
-					phase: "recorded",
-					originProjectPath: tempRepoDir,
-				},
 			});
 			expect(
 				received

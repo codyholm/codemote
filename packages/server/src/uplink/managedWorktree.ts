@@ -252,6 +252,15 @@ export class ManagedWorktreeService {
 				"Registered project is outside its source repository",
 			);
 		}
+		try {
+			await lstat(this.managedRoot);
+		} catch (error) {
+			if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+			// Validate a prospective root through its nearest existing ancestor before
+			// creating anything. An invalid configuration must not leave an untracked
+			// directory in a checkout, another repository, or Git metadata.
+			await this.assertSafeDestination(canonicalRepository, this.managedRoot);
+		}
 		await mkdir(this.managedRoot, { recursive: true, mode: 0o700 });
 		const canonicalRoot = await realpath(this.managedRoot);
 		const prefix =

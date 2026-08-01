@@ -136,6 +136,12 @@ describe("decodeMobileInbound", () => {
 			});
 		});
 
+		it("keeps project-aware starts fresh even when a legacy resume ID is supplied", () => {
+			const decoded = decodeMobileInbound({ ...base, resumeSessionId: "legacy-session" });
+			expect(decoded).not.toBeNull();
+			expect(asRecord(decoded)["resumeSessionId"]).toBeUndefined();
+		});
+
 		it("rejects malformed nested intent instead of downgrading it", () => {
 			const malformed: unknown[] = [
 				null,

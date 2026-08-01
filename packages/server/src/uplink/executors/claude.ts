@@ -1,4 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type { RunOptions, RuntimeType } from "@codemote/common";
 import spawn from "cross-spawn";
 import { BaseExecutor } from "../executor.js";
@@ -164,6 +165,8 @@ export class ClaudeExecutor extends BaseExecutor {
 	 * Parses streaming JSON events and maps them to our unified event types.
 	 */
 	protected async doStartRun(session: Session, options: RunOptions): Promise<void> {
+		const resumeSessionId = options.resumeSessionId?.trim() || null;
+		const assignedSessionId = !resumeSessionId && options.projectStart ? randomUUID() : null;
 		const model = options.model?.trim() ? options.model.trim() : null;
 		const temperature =
 			typeof options.temperature === "number" && options.temperature >= 0
@@ -172,7 +175,7 @@ export class ClaudeExecutor extends BaseExecutor {
 		const maxTokens =
 			typeof options.maxTokens === "number" && options.maxTokens > 0 ? options.maxTokens : null;
 		const claudeSession: ClaudeSession = {
-			claudeSessionId: options.resumeSessionId?.trim() || null,
+			claudeSessionId: resumeSessionId ?? assignedSessionId,
 			model,
 			temperature,
 			maxTokens,
@@ -183,7 +186,13 @@ export class ClaudeExecutor extends BaseExecutor {
 		};
 
 		this.claudeSessions.set(session.id, claudeSession);
-		const proc = await this.spawnClaude(session, claudeSession, options.resumeSessionId);
+		if (assignedSessionId) this.sessionManager.setRuntimeSessionId(session.id, assignedSessionId);
+		const proc = await this.spawnClaude(
+			session,
+			claudeSession,
+			resumeSessionId ?? undefined,
+			assignedSessionId ?? undefined,
+		);
 
 		// Send initial prompt as JSON message (for stream-json input format)
 		// Format: {"type":"user","message":{"role":"user","content":"..."}}
@@ -334,12 +343,14 @@ export class ClaudeExecutor extends BaseExecutor {
 		session: Session,
 		claudeSession: ClaudeSession,
 		resumeSessionId?: string,
+		newSessionId?: string,
 	): Promise<ChildProcessWithoutNullStreams> {
 		const args = this.buildArgs(
 			resumeSessionId,
 			claudeSession.model,
 			claudeSession.temperature,
 			claudeSession.maxTokens,
+			newSessionId,
 		);
 		claudeSession.running = true;
 		const proc = spawn(this.config.claudePath, args, {
@@ -431,6 +442,7 @@ export class ClaudeExecutor extends BaseExecutor {
 		model?: string | null,
 		temperature?: number | null,
 		maxTokens?: number | null,
+		newSessionId?: string,
 	): string[] {
 		const args: string[] = [
 			"-p", // Print mode (required for programmatic control)
@@ -464,6 +476,8 @@ export class ClaudeExecutor extends BaseExecutor {
 		const resumeId = resumeSessionId?.trim();
 		if (resumeId && resumeId.length > 0) {
 			args.push("--resume", resumeId);
+		} else if (newSessionId) {
+			args.push("--session-id", newSessionId);
 		}
 
 		// Add any extra configured args last so config can override defaults

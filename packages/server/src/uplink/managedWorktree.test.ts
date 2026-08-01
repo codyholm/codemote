@@ -178,6 +178,16 @@ describe("ManagedWorktreeService", { timeout: 30_000 }, () => {
 		});
 	});
 
+	it("rejects an unsafe missing managed root without creating it", async () => {
+		const invalidRoot = join(repository, "uncreated-managed-root");
+		const service = new ManagedWorktreeService(runGitCommand, invalidRoot);
+
+		await expect(service.plan(repository, repository, "unsafe-root")).rejects.toMatchObject({
+			code: "UNSAFE_WORKTREE_DESTINATION",
+		});
+		expect(existsSync(invalidRoot)).toBe(false);
+	});
+
 	it("rejects stale bases, collisions, unrelated repository roots, and missing mappings", async () => {
 		const service = new ManagedWorktreeService(runGitCommand, managedRoot);
 		const commit = await git(["rev-parse", "HEAD"]);

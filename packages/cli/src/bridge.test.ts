@@ -360,7 +360,7 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
-	it("forwards model but never an explicit resume ID from new_session", async () => {
+	it("forwards model and an explicit legacy resume ID from new_session", async () => {
 		let relayUplinkSocket: WebSocket | null = null;
 		let relayMobileSocket: WebSocket | null = null;
 		let startRunPayload: JsonRecord | null = null;
@@ -472,7 +472,7 @@ describe("RelayUplinkBridge", () => {
 
 			await waitForCondition(() => startRunPayload !== null, 8000);
 			expect(startRunPayload?.["model"]).toBe("claude-sonnet-4-20250514");
-			expect(startRunPayload?.["resumeSessionId"]).toBeUndefined();
+			expect(startRunPayload?.["resumeSessionId"]).toBe("explicit-runtime-session");
 		} finally {
 			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
 				mobileSocket.close();
@@ -2054,7 +2054,7 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
-	it("starts a fresh local session even when an older runtime session exists", async () => {
+	it("resumes the latest compatible local runtime session", async () => {
 		let startRunPayload: JsonRecord | null = null;
 
 		uplinkWss.on("connection", (socket) => {
@@ -2125,13 +2125,13 @@ describe("RelayUplinkBridge", () => {
 				sessionId: "sess-new-1",
 			});
 			expect(startRunPayload).toBeTruthy();
-			expect(startRunPayload?.["resumeSessionId"]).toBeUndefined();
+			expect(startRunPayload?.["resumeSessionId"]).toBe("ses_existing_123");
 		} finally {
 			await bridge.stop();
 		}
 	}, 20_000);
 
-	it("does not retry a failed local new-session start", async () => {
+	it("retries a failed local resume once as a fresh session", async () => {
 		const startRunPayloads: JsonRecord[] = [];
 
 		uplinkWss.on("connection", (socket) => {
@@ -2198,8 +2198,9 @@ describe("RelayUplinkBridge", () => {
 			await expect(bridge.startSession("opencode", "single-attempt validation")).rejects.toThrow(
 				"runtime start failed",
 			);
-			expect(startRunPayloads).toHaveLength(1);
-			expect(startRunPayloads[0]?.["resumeSessionId"]).toBeUndefined();
+			expect(startRunPayloads).toHaveLength(2);
+			expect(startRunPayloads[0]?.["resumeSessionId"]).toBe("ses_stale_456");
+			expect(startRunPayloads[1]?.["resumeSessionId"]).toBeUndefined();
 		} finally {
 			await bridge.stop();
 		}
