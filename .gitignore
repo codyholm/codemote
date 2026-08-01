@@ -19,7 +19,6 @@ out/
 # IDE
 .idea/
 .vscode/
-.claude/
 *.swp
 *.swo
 
@@ -49,13 +48,26 @@ npm-debug.log*
 
 # Guild (generated)
 .guild/exports/
-.guild/.archive/**
 .guild/ops/evidence/
 masterreference
 .guild/handoff-workspace-feature.md
 
-# Codex
-.codex/
+# Machine-local agent state
+**/worktrees/
+**/.worktrees/
+/.claude/tracker/
+/.claude/**/tracker/
+/.claude/preview/
+/.claude/settings.local.*
+/.claude/scheduled_tasks.lock
+/.guild/runtime/**/*.log
+/.guild/runtime/**/*.err
+/.guild/runtime/**/*.pid
+/.guild/runtime/**/*.sock
+/.guild/runtime/**/*.lock
+/.guild/runtime/**/evidence/
+/.guild/runtime/**/*.jsonl
+/.guild/runtime/**/exit-code*
 
 # Conductor (local-only)
 conductor/
