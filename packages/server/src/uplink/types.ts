@@ -63,10 +63,19 @@ export interface Workspace {
 }
 
 /**
+ * A selectable filesystem location returned by list_directory
+ */
+export interface DirectoryLocation {
+	name: string;
+	path: string;
+}
+
+/**
  * A directory entry returned by list_directory
  */
 export interface DirectoryEntry {
 	name: string;
+	path: string;
 	isDirectory: boolean;
 	isGitRepo: boolean;
 }
@@ -236,7 +245,13 @@ export type UplinkResponse =
 	| ({ type: "pong" } & RequestEnvelope)
 	| ({
 			type: "directory_listing";
-			payload: { path: string; entries: DirectoryEntry[] };
+			payload: {
+				path: string;
+				parentPath: string | null;
+				homePath: string;
+				roots: DirectoryLocation[];
+				entries: DirectoryEntry[];
+			};
 	  } & RequestEnvelope)
 	| ({ type: "runtime_list"; payload: { runtimes: RuntimeType[] } } & RequestEnvelope)
 	| ({
