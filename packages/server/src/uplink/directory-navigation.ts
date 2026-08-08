@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
+import { realpath } from "node:fs/promises";
 import * as nodePath from "node:path";
 import type { DirectoryLocation } from "./types.js";
 
 const WINDOWS_DRIVE_DISCOVERY_TIMEOUT_MS = 2_000;
+const WINDOWS_DRIVE_DISCOVERY_CACHE_TTL_MS = 30_000;
 const WINDOWS_DRIVE_DISCOVERY_SCRIPT =
 	"$roots = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady } | ForEach-Object { $_.RootDirectory.FullName }); ConvertTo-Json -Compress -InputObject $roots";
 
@@ -31,6 +33,11 @@ interface NavigationMetadataOptions {
 	platform?: NodeJS.Platform;
 	pathApi?: PathOperations;
 	discoverWindowsDrives?: () => Promise<string[]>;
+}
+
+interface CanonicalizeDirectoryPathOptions {
+	platform?: NodeJS.Platform;
+	canonicalize?: (path: string) => Promise<string>;
 }
 
 interface ProcessResult {
@@ -86,6 +93,13 @@ export function directoryEntryPath(
 	return pathApi.join(directoryPath, entryName);
 }
 
+export async function canonicalizeDirectoryPath(
+	path: string,
+	{ platform = process.platform, canonicalize = realpath }: CanonicalizeDirectoryPathOptions = {},
+): Promise<string> {
+	return platform === "win32" ? canonicalize(path) : path;
+}
+
 function runProcess(
 	file: string,
 	args: string[],
@@ -130,6 +144,44 @@ export async function discoverWindowsDriveRoots(
 	return parseWindowsDriveRoots(result.stdout);
 }
 
+interface WindowsDriveRootCacheOptions {
+	discover?: () => Promise<string[]>;
+	now?: () => number;
+	ttlMs?: number;
+}
+
+export function createWindowsDriveRootDiscoveryCache({
+	discover = discoverWindowsDriveRoots,
+	now = Date.now,
+	ttlMs = WINDOWS_DRIVE_DISCOVERY_CACHE_TTL_MS,
+}: WindowsDriveRootCacheOptions = {}): () => Promise<string[]> {
+	let cached: { expiresAt: number; roots: string[] } | undefined;
+	let pending: Promise<string[]> | undefined;
+
+	return async () => {
+		if (cached && now() < cached.expiresAt) {
+			return [...cached.roots];
+		}
+		if (pending) {
+			return pending;
+		}
+
+		const discovery = discover()
+			.catch(() => [])
+			.then((roots) => {
+				cached = { expiresAt: now() + ttlMs, roots: [...roots] };
+				return [...roots];
+			})
+			.finally(() => {
+				if (pending === discovery) pending = undefined;
+			});
+		pending = discovery;
+		return discovery;
+	};
+}
+
+const discoverCachedWindowsDriveRoots = createWindowsDriveRootDiscoveryCache();
+
 function rootName(rootPath: string, platform: NodeJS.Platform): string {
 	if (platform !== "win32") {
 		return rootPath;
@@ -151,7 +203,7 @@ export async function buildDirectoryNavigationMetadata(
 	{
 		platform = process.platform,
 		pathApi = nodePath,
-		discoverWindowsDrives = discoverWindowsDriveRoots,
+		discoverWindowsDrives = discoverCachedWindowsDriveRoots,
 	}: NavigationMetadataOptions = {},
 ): Promise<{ parentPath: string | null; roots: DirectoryLocation[] }> {
 	const parent = pathApi.dirname(currentPath);

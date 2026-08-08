@@ -2,6 +2,8 @@ import { posix, win32 } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
 	buildDirectoryNavigationMetadata,
+	canonicalizeDirectoryPath,
+	createWindowsDriveRootDiscoveryCache,
 	directoryEntryPath,
 	discoverWindowsDriveRoots,
 	parseWindowsDriveRoots,
@@ -105,6 +107,26 @@ describe("directory navigation", () => {
 		);
 	});
 
+	it("uses the filesystem's canonical identity for Windows paths only", async () => {
+		const canonicalize = vi.fn(async () => "C:\\Users\\Tester\\Repo");
+
+		await expect(
+			canonicalizeDirectoryPath("c:\\users\\tester\\repo", {
+				platform: "win32",
+				canonicalize,
+			}),
+		).resolves.toBe("C:\\Users\\Tester\\Repo");
+		expect(canonicalize).toHaveBeenCalledWith("c:\\users\\tester\\repo");
+
+		await expect(
+			canonicalizeDirectoryPath("/tmp/project", {
+				platform: "darwin",
+				canonicalize,
+			}),
+		).resolves.toBe("/tmp/project");
+		expect(canonicalize).toHaveBeenCalledOnce();
+	});
+
 	it("reports no parent at a drive root and includes another discovered drive", async () => {
 		const anotherDrive = resolveDirectoryPaths({
 			requestedPath: "D:\\src",
@@ -198,5 +220,35 @@ describe("directory navigation", () => {
 		expect(() => parseWindowsDriveRoots(JSON.stringify("C:\\"))).toThrow(
 			"PowerShell returned an invalid drive list",
 		);
+	});
+
+	it("caches successful drive discovery for a bounded interval", async () => {
+		let currentTime = 1_000;
+		const discover = vi.fn(async () => ["C:\\", "D:\\"]);
+		const cachedDiscover = createWindowsDriveRootDiscoveryCache({
+			discover,
+			now: () => currentTime,
+			ttlMs: 30_000,
+		});
+
+		await expect(cachedDiscover()).resolves.toEqual(["C:\\", "D:\\"]);
+		currentTime += 29_999;
+		await expect(cachedDiscover()).resolves.toEqual(["C:\\", "D:\\"]);
+		expect(discover).toHaveBeenCalledOnce();
+
+		currentTime += 1;
+		await expect(cachedDiscover()).resolves.toEqual(["C:\\", "D:\\"]);
+		expect(discover).toHaveBeenCalledTimes(2);
+	});
+
+	it("caches a failed drive discovery fallback instead of repeating the timeout", async () => {
+		const discover = vi.fn(async (): Promise<string[]> => {
+			throw new Error("timed out");
+		});
+		const cachedDiscover = createWindowsDriveRootDiscoveryCache({ discover });
+
+		await expect(cachedDiscover()).resolves.toEqual([]);
+		await expect(cachedDiscover()).resolves.toEqual([]);
+		expect(discover).toHaveBeenCalledOnce();
 	});
 });

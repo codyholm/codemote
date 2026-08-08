@@ -11,6 +11,7 @@ import {
 import { WebSocket, WebSocketServer } from "ws";
 import {
 	buildDirectoryNavigationMetadata,
+	canonicalizeDirectoryPath,
 	directoryEntryPath,
 	resolveDirectoryPaths,
 } from "./directory-navigation.js";
@@ -503,12 +504,15 @@ export class UplinkServer {
 					cwd: process.cwd(),
 					homePath: homedir(),
 				});
-				const entries = await this.listDirectory(resolved.path);
-				const navigation = await buildDirectoryNavigationMetadata(resolved.path, resolved.homePath);
+				// The filesystem supplies stable path identity (including Windows casing)
+				// before the mobile client compares it with registered project paths.
+				const canonicalPath = await canonicalizeDirectoryPath(resolved.path);
+				const entries = await this.listDirectory(canonicalPath);
+				const navigation = await buildDirectoryNavigationMetadata(canonicalPath, resolved.homePath);
 				return {
 					type: "directory_listing",
 					payload: {
-						path: resolved.path,
+						path: canonicalPath,
 						parentPath: navigation.parentPath,
 						homePath: resolved.homePath,
 						roots: navigation.roots,
