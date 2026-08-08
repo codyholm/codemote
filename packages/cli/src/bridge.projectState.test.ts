@@ -845,6 +845,620 @@ describe("bridge project state", { timeout: 30000 }, () => {
 			relay.dispose();
 		}
 	});
+
+	it("forwards project start inspection success and failure", async () => {
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				const type = command["type"];
+				if (type === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+					return;
+				}
+				if (type === "get_project_state") {
+					socket.send(
+						JSON.stringify({
+							type: "project_state",
+							requestId: command["requestId"],
+							payload: aggregate(SOLICITED),
+						}),
+					);
+					return;
+				}
+				if (type === "get_project_start_state") {
+					const path = (command["payload"] as JsonRecord)["projectPath"];
+					if (path === "/missing") {
+						socket.send(
+							JSON.stringify({
+								type: "error",
+								requestId: command["requestId"],
+								payload: {
+									code: "PROJECT_NOT_REGISTERED",
+									message: "Project is not registered",
+								},
+							}),
+						);
+						return;
+					}
+					socket.send(
+						JSON.stringify({
+							type: "project_start_state",
+							requestId: command["requestId"],
+							payload: {
+								originProjectPath: tempRepoDir,
+								mode: "project_folder",
+								directory: tempRepoDir,
+								git: null,
+							},
+						}),
+					);
+				}
+			});
+		});
+
+		const relay = wireRelay(relayWss);
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+			const received: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const payload = mobilePayload(raw.toString());
+				if (payload) received.push(payload);
+			});
+			await pairMobile(mobileSocket, bridge.pairingCode);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "get_project_start_state", projectPath: tempRepoDir },
+				}),
+			);
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) =>
+							message["type"] === "project_start_state" &&
+							(message["state"] as JsonRecord | undefined)?.["directory"] === tempRepoDir,
+					),
+				15_000,
+			);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "get_project_start_state", projectPath: "/missing" },
+				}),
+			);
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) =>
+							message["type"] === "project_start_state" &&
+							(message["error"] as JsonRecord | undefined)?.["code"] === "PROJECT_NOT_REGISTERED",
+					),
+				15_000,
+			);
+		} finally {
+			mobileSocket?.close();
+			await bridge.stop();
+			relay.dispose();
+		}
+	});
+
+	it("forwards Worktree truth and continues the returned session without another start", async () => {
+		let startPayload: JsonRecord | null = null;
+		let startCount = 0;
+		let inputCount = 0;
+		const worktreePath = join(tempRepoDir, "managed", "worktree-1");
+		const effectiveDirectory = join(worktreePath, "packages", "nested");
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				const type = command["type"];
+				if (type === "list_sessions") {
+					socket.send(
+						JSON.stringify({
+							type: "sessions",
+							payload: [
+								{
+									id: "old-session",
+									runId: "old-run",
+									runtime: "opencode",
+									status: "idle",
+									runtimeSessionId: "ses_old",
+									workspace: { id: "old-workspace", workingDir: "/old", createdAt: 1 },
+									startedAt: 1,
+									endedAt: null,
+									lastActivityAt: 1,
+									statusChangedAt: 1,
+								},
+							],
+						}),
+					);
+					return;
+				}
+				if (type === "get_project_state") {
+					socket.send(
+						JSON.stringify({
+							type: "project_state",
+							requestId: command["requestId"],
+							payload: aggregate(SOLICITED),
+						}),
+					);
+					return;
+				}
+				if (type === "start_run") {
+					startCount += 1;
+					startPayload = command["payload"] as JsonRecord;
+					socket.send(
+						JSON.stringify({
+							type: "run_started",
+							requestId: command["requestId"],
+							payload: {
+								runId: "project-run",
+								sessionId: "project-session",
+								operationId: "operation-success",
+								originProjectPath: tempRepoDir,
+								execution: {
+									directory: effectiveDirectory,
+									mode: "worktree",
+									git: {
+										repositoryRoot: worktreePath,
+										head: "a".repeat(40),
+										branch: null,
+										detached: true,
+									},
+									worktree: {
+										path: worktreePath,
+										baseRef: "refs/heads/main",
+										baseCommit: "a".repeat(40),
+									},
+								},
+							},
+						}),
+					);
+					return;
+				}
+				if (type === "send_input") {
+					inputCount += 1;
+					socket.send(
+						JSON.stringify({
+							type: "input_sent",
+							requestId: command["requestId"],
+							payload: { sessionId: "project-session" },
+						}),
+					);
+				}
+			});
+		});
+
+		const relay = wireRelay(relayWss);
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: "/legacy-default",
+		});
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+			const received: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const payload = mobilePayload(raw.toString());
+				if (payload) received.push(payload);
+			});
+			await pairMobile(mobileSocket, bridge.pairingCode);
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: {
+						type: "new_session",
+						runtime: "opencode",
+						prompt: "fresh project start",
+						resumeSessionId: "ses_legacy_project",
+						projectStart: {
+							operationId: "operation-success",
+							originProjectPath: tempRepoDir,
+							mode: "worktree",
+							preparation: {
+								type: "create_worktree",
+								baseRef: "refs/heads/main",
+								expectedCommit: "a".repeat(40),
+								newBranch: null,
+							},
+						},
+					},
+				}),
+			);
+
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) => message["type"] === "session_start_result" && message["success"] === true,
+					),
+				15_000,
+			);
+			const capturedStart = startPayload as JsonRecord | null;
+			expect(capturedStart).not.toBeNull();
+			if (!capturedStart) throw new Error("Expected start_run payload");
+			expect(capturedStart["workspace"]).toBe(tempRepoDir);
+			expect(capturedStart["resumeSessionId"]).toBeUndefined();
+			expect((capturedStart["projectStart"] as JsonRecord)["operationId"]).toBe(
+				"operation-success",
+			);
+			expect(received.find((message) => message["type"] === "session_start_result")).toMatchObject({
+				type: "session_start_result",
+				operationId: "operation-success",
+				success: true,
+				sessionId: "project-session",
+				originProjectPath: tempRepoDir,
+				execution: {
+					directory: effectiveDirectory,
+					mode: "worktree",
+					worktree: { path: worktreePath, baseRef: "refs/heads/main" },
+				},
+			});
+			const projected = received
+				.filter((message) => message["type"] === "session_list")
+				.flatMap((message) => message["sessions"] as JsonRecord[])
+				.find((session) => session["id"] === "project-session");
+			expect(projected).toMatchObject({
+				originProjectPath: tempRepoDir,
+				workspace: effectiveDirectory,
+				execution: {
+					directory: effectiveDirectory,
+					mode: "worktree",
+					worktree: { path: worktreePath, baseRef: "refs/heads/main" },
+				},
+			});
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "send_prompt", sessionId: "project-session", prompt: "continue" },
+				}),
+			);
+			await waitForCondition(() => inputCount === 1, 15_000);
+			expect(startCount).toBe(1);
+		} finally {
+			mobileSocket?.close();
+			await bridge.stop();
+			relay.dispose();
+		}
+	});
+
+	it("keeps a timed-out project start unresolved and retries the same operation ID", async () => {
+		const previousTimeout = process.env["CODEMOTE_UPLINK_COMMAND_TIMEOUT_MS"];
+		const previousLongTimeout = process.env["CODEMOTE_UPLINK_LONG_COMMAND_TIMEOUT_MS"];
+		process.env["CODEMOTE_UPLINK_COMMAND_TIMEOUT_MS"] = "80";
+		process.env["CODEMOTE_UPLINK_LONG_COMMAND_TIMEOUT_MS"] = "80";
+
+		const startCommands: JsonRecord[] = [];
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+					return;
+				}
+				if (command["type"] === "get_project_state") {
+					socket.send(
+						JSON.stringify({
+							type: "project_state",
+							requestId: command["requestId"],
+							payload: aggregate(SOLICITED),
+						}),
+					);
+					return;
+				}
+				if (command["type"] !== "start_run") return;
+				startCommands.push(command);
+				if (startCommands.length === 1) return;
+				socket.send(
+					JSON.stringify({
+						type: "run_started",
+						requestId: command["requestId"],
+						payload: {
+							runId: "project-retry-run",
+							sessionId: "project-retry-session",
+							operationId: "operation-timeout",
+							originProjectPath: tempRepoDir,
+							execution: {
+								directory: tempRepoDir,
+								mode: "project_folder",
+								git: null,
+							},
+						},
+					}),
+				);
+			});
+		});
+
+		const relay = wireRelay(relayWss);
+		let bridge: Awaited<ReturnType<typeof startRelayUplinkBridge>> | null = null;
+		let mobileSocket: WebSocket | null = null;
+		try {
+			bridge = await startRelayUplinkBridge({
+				relayUrl: `ws://127.0.0.1:${relayPort}`,
+				uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+				repoPath: tempRepoDir,
+			});
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+			const received: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const payload = mobilePayload(raw.toString());
+				if (payload) received.push(payload);
+			});
+			await pairMobile(mobileSocket, bridge.pairingCode);
+
+			const startMessage = JSON.stringify({
+				type: "message",
+				payload: {
+					type: "new_session",
+					runtime: "codex",
+					prompt: "retry the same project start",
+					projectStart: {
+						operationId: "operation-timeout",
+						originProjectPath: tempRepoDir,
+						mode: "project_folder",
+						preparation: { type: "none" },
+					},
+				},
+			});
+			mobileSocket.send(startMessage);
+
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) =>
+							message["type"] === "session_start_unresolved" &&
+							message["operationId"] === "operation-timeout",
+					),
+				15_000,
+			);
+			expect(
+				received.find(
+					(message) =>
+						message["type"] === "session_start_unresolved" &&
+						message["operationId"] === "operation-timeout",
+				),
+			).toEqual({
+				type: "session_start_unresolved",
+				operationId: "operation-timeout",
+				retryable: true,
+				code: "UPLINK_RESPONSE_TIMEOUT",
+				message: "Timed out waiting for uplink response: run_started",
+			});
+			expect(
+				received.some(
+					(message) =>
+						message["type"] === "session_start_result" &&
+						message["operationId"] === "operation-timeout",
+				),
+			).toBe(false);
+
+			mobileSocket.send(startMessage);
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) =>
+							message["type"] === "session_start_result" &&
+							message["operationId"] === "operation-timeout" &&
+							message["success"] === true,
+					),
+				15_000,
+			);
+			expect(startCommands).toHaveLength(2);
+			expect(
+				startCommands.map(
+					(command) =>
+						((command["payload"] as JsonRecord)["projectStart"] as JsonRecord)["operationId"],
+				),
+			).toEqual(["operation-timeout", "operation-timeout"]);
+			expect(
+				received.some(
+					(message) =>
+						message["type"] === "session_start_result" &&
+						message["operationId"] === "operation-timeout" &&
+						message["success"] === false,
+				),
+			).toBe(false);
+		} finally {
+			mobileSocket?.close();
+			if (bridge) await bridge.stop();
+			relay.dispose();
+			if (previousTimeout === undefined) {
+				Reflect.deleteProperty(process.env, "CODEMOTE_UPLINK_COMMAND_TIMEOUT_MS");
+			} else {
+				process.env["CODEMOTE_UPLINK_COMMAND_TIMEOUT_MS"] = previousTimeout;
+			}
+			if (previousLongTimeout === undefined) {
+				Reflect.deleteProperty(process.env, "CODEMOTE_UPLINK_LONG_COMMAND_TIMEOUT_MS");
+			} else {
+				process.env["CODEMOTE_UPLINK_LONG_COMMAND_TIMEOUT_MS"] = previousLongTimeout;
+			}
+		}
+	});
+
+	it("forwards structured project and journal failures without synthetic sessions", async () => {
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				if (command["type"] === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+					return;
+				}
+				if (command["type"] === "get_project_state") {
+					socket.send(
+						JSON.stringify({
+							type: "project_state",
+							requestId: command["requestId"],
+							payload: aggregate(SOLICITED),
+						}),
+					);
+					return;
+				}
+				if (command["type"] === "start_run") {
+					const payload = command["payload"] as JsonRecord;
+					const projectStart = payload["projectStart"] as JsonRecord;
+					const operationId = projectStart["operationId"];
+					const journalCode =
+						operationId === "corrupt-journal"
+							? "INVALID_PROJECT_START_JOURNAL"
+							: operationId === "unwritable-journal"
+								? "PROJECT_START_JOURNAL_IO"
+								: null;
+					socket.send(
+						JSON.stringify({
+							type: "error",
+							requestId: command["requestId"],
+							payload: {
+								code: journalCode ?? "STALE_PROJECT_STATE",
+								message:
+									journalCode === "INVALID_PROJECT_START_JOURNAL"
+										? "Invalid project start operation journal"
+										: journalCode === "PROJECT_START_JOURNAL_IO"
+											? "Failed to persist project start operation journal"
+											: "Refresh the project state",
+								...(operationId === "corrupt-journal"
+									? {}
+									: {
+											details: {
+												operationId,
+												phase: operationId === "unwritable-journal" ? "recorded" : "failed",
+												originProjectPath: tempRepoDir,
+											},
+										}),
+							},
+						}),
+					);
+				}
+			});
+		});
+
+		const relay = wireRelay(relayWss);
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+			const received: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const payload = mobilePayload(raw.toString());
+				if (payload) received.push(payload);
+			});
+			await pairMobile(mobileSocket, bridge.pairingCode);
+			const sendProjectStart = (operationId: string): void => {
+				mobileSocket?.send(
+					JSON.stringify({
+						type: "message",
+						payload: {
+							type: "new_session",
+							runtime: "codex",
+							prompt: operationId,
+							projectStart: {
+								operationId,
+								originProjectPath: tempRepoDir,
+								mode: "project_folder",
+								preparation: { type: "none" },
+							},
+						},
+					}),
+				);
+			};
+			sendProjectStart("operation-failure");
+
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) =>
+							message["type"] === "session_start_result" &&
+							message["operationId"] === "operation-failure",
+					),
+				15_000,
+			);
+			expect(
+				received.find(
+					(message) =>
+						message["type"] === "session_start_result" &&
+						message["operationId"] === "operation-failure",
+				),
+			).toMatchObject({
+				operationId: "operation-failure",
+				success: false,
+				code: "STALE_PROJECT_STATE",
+				message: "Refresh the project state",
+				details: { phase: "failed", originProjectPath: tempRepoDir },
+			});
+
+			sendProjectStart("corrupt-journal");
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) =>
+							message["type"] === "session_start_result" &&
+							message["operationId"] === "corrupt-journal",
+					),
+				15_000,
+			);
+			expect(
+				received.find(
+					(message) =>
+						message["type"] === "session_start_result" &&
+						message["operationId"] === "corrupt-journal",
+				),
+			).toMatchObject({
+				operationId: "corrupt-journal",
+				success: false,
+				code: "INVALID_PROJECT_START_JOURNAL",
+				message: "Invalid project start operation journal",
+			});
+
+			sendProjectStart("unwritable-journal");
+			await waitForCondition(
+				() =>
+					received.some(
+						(message) =>
+							message["type"] === "session_start_unresolved" &&
+							message["operationId"] === "unwritable-journal",
+					),
+				15_000,
+			);
+			expect(
+				received.find(
+					(message) =>
+						message["type"] === "session_start_unresolved" &&
+						message["operationId"] === "unwritable-journal",
+				),
+			).toEqual({
+				type: "session_start_unresolved",
+				operationId: "unwritable-journal",
+				retryable: true,
+				code: "UPLINK_RESPONSE_UNRESOLVED",
+				message: "Failed to persist project start operation journal",
+			});
+			expect(
+				received
+					.filter((message) => message["type"] === "session_list")
+					.flatMap((message) => message["sessions"] as JsonRecord[]),
+			).toEqual([]);
+			expect(received.some((message) => message["type"] === "session_output")).toBe(false);
+		} finally {
+			mobileSocket?.close();
+			await bridge.stop();
+			relay.dispose();
+		}
+	});
 });
 
 function mobilePayload(raw: string): JsonRecord | null {

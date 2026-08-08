@@ -3,9 +3,17 @@
 // Types
 export type {
 	RuntimeType,
+	SessionExecutionState,
 	SessionStatus,
 	StreamEvent,
 	RegisteredProject,
+	ProjectStartFailureDetails,
+	ProjectStartRequest,
+	ProjectStartState,
+	GitWorktreeBase,
+	ManagedWorktreeExecutionState,
+	ManagedWorktreeStartRequest,
+	WorktreeStartState,
 	RunOptions,
 	RunResult,
 	WorkspaceConfig,
@@ -13,6 +21,7 @@ export type {
 	DirectoryEntry,
 	GitStatusSummary,
 	Session,
+	SessionStartContext,
 	UplinkCommand,
 	UplinkResponse,
 	RequestEnvelope,
@@ -41,6 +50,7 @@ export type { OpenCodeConfig, ClaudeConfig, CodexConfig, GeminiConfig } from "./
 
 // Server
 export { UplinkServer } from "./server.js";
+export { ManagedWorktreeService } from "./managedWorktree.js";
 
 // Config
 export { loadConfig, validateConfig } from "./config.js";

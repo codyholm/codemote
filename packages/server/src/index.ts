@@ -13,6 +13,7 @@ export { RELAY_VERSION } from "./relay/index.js";
 
 // ── Uplink exports ─────────────────────────────────────────────
 export { UplinkServer } from "./uplink/server.js";
+export { ManagedWorktreeService } from "./uplink/managedWorktree.js";
 export { SessionManager } from "./uplink/session.js";
 export { WorkspaceManager } from "./uplink/workspace.js";
 export { EventBus, createEvent } from "./uplink/events.js";
@@ -60,8 +61,16 @@ export type {
 	ModelInfo,
 	PendingAttention,
 	ProjectStateAggregate,
+	ProjectStartFailureDetails,
+	ProjectStartRequest,
+	ProjectStartState,
+	GitWorktreeBase,
+	ManagedWorktreeExecutionState,
+	ManagedWorktreeStartRequest,
+	WorktreeStartState,
 	RegisteredProject,
 	RuntimeType,
+	SessionExecutionState,
 	SessionStatus,
 	StreamEvent,
 	RunOptions,
@@ -70,6 +79,7 @@ export type {
 	Workspace,
 	DirectoryEntry,
 	Session,
+	SessionStartContext,
 	UplinkCommand,
 	UplinkResponse,
 	UplinkConfig,

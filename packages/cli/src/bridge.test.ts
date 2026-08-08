@@ -360,7 +360,7 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
-	it("forwards model from new_session into uplink start_run payload", async () => {
+	it("forwards model and an explicit legacy resume ID from new_session", async () => {
 		let relayUplinkSocket: WebSocket | null = null;
 		let relayMobileSocket: WebSocket | null = null;
 		let startRunPayload: JsonRecord | null = null;
@@ -465,12 +465,14 @@ describe("RelayUplinkBridge", () => {
 						runtime: "claude",
 						prompt: "test",
 						model: "claude-sonnet-4-20250514",
+						resumeSessionId: "explicit-runtime-session",
 					},
 				}),
 			);
 
 			await waitForCondition(() => startRunPayload !== null, 8000);
 			expect(startRunPayload?.["model"]).toBe("claude-sonnet-4-20250514");
+			expect(startRunPayload?.["resumeSessionId"]).toBe("explicit-runtime-session");
 		} finally {
 			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
 				mobileSocket.close();
@@ -654,6 +656,7 @@ describe("RelayUplinkBridge", () => {
 						socket.send(
 							JSON.stringify({
 								type: "run_started",
+								requestId: command["requestId"],
 								payload: {
 									sessionId: "sess-late-1",
 									runId: "run-late-1",
@@ -668,6 +671,7 @@ describe("RelayUplinkBridge", () => {
 					socket.send(
 						JSON.stringify({
 							type: "run_started",
+							requestId: command["requestId"],
 							payload: {
 								sessionId: "sess-fast-2",
 								runId: "run-fast-2",
@@ -1001,6 +1005,8 @@ describe("RelayUplinkBridge", () => {
 		let sendInputCommandAt = 0;
 		let sendInputAckAt = 0;
 		let stopCommandAt = 0;
+		let stopArrivedBeforeInputAck = false;
+		let acknowledgeInput: (() => void) | null = null;
 
 		uplinkWss.on("connection", (socket) => {
 			socket.on("message", (raw) => {
@@ -1034,7 +1040,7 @@ describe("RelayUplinkBridge", () => {
 
 				if (type === "send_input") {
 					sendInputCommandAt = Date.now();
-					setTimeout(() => {
+					acknowledgeInput = () => {
 						sendInputAckAt = Date.now();
 						socket.send(
 							JSON.stringify({
@@ -1042,18 +1048,21 @@ describe("RelayUplinkBridge", () => {
 								payload: { sessionId: "sess-stop-1" },
 							}),
 						);
-					}, 300);
+					};
 					return;
 				}
 
 				if (type === "stop") {
 					stopCommandAt = Date.now();
+					stopArrivedBeforeInputAck = sendInputAckAt === 0;
 					socket.send(
 						JSON.stringify({
 							type: "stopped",
 							payload: { sessionId: "sess-stop-1" },
 						}),
 					);
+					acknowledgeInput?.();
+					acknowledgeInput = null;
 				}
 			});
 		});
@@ -1159,7 +1168,7 @@ describe("RelayUplinkBridge", () => {
 			await waitForCondition(() => sendInputAckAt > 0, 8000);
 
 			expect(stopCommandAt).toBeGreaterThan(sendInputCommandAt);
-			expect(stopCommandAt).toBeLessThan(sendInputAckAt);
+			expect(stopArrivedBeforeInputAck).toBe(true);
 		} finally {
 			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
 				mobileSocket.close();
@@ -2045,7 +2054,7 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
-	it("auto-resumes opencode sessions when creating a new session", async () => {
+	it("resumes the latest compatible local runtime session", async () => {
 		let startRunPayload: JsonRecord | null = null;
 
 		uplinkWss.on("connection", (socket) => {
@@ -2112,7 +2121,7 @@ describe("RelayUplinkBridge", () => {
 		});
 
 		try {
-			await expect(bridge.startSession("opencode", "auto-resume validation")).resolves.toEqual({
+			await expect(bridge.startSession("opencode", "fresh-start validation")).resolves.toEqual({
 				sessionId: "sess-new-1",
 			});
 			expect(startRunPayload).toBeTruthy();
@@ -2122,7 +2131,7 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
-	it("falls back to a fresh local start when opencode auto-resume fails", async () => {
+	it("retries a failed local resume once as a fresh session", async () => {
 		const startRunPayloads: JsonRecord[] = [];
 
 		uplinkWss.on("connection", (socket) => {
@@ -2159,22 +2168,11 @@ describe("RelayUplinkBridge", () => {
 				if (type === "start_run") {
 					const payload = (command["payload"] as JsonRecord | undefined) ?? {};
 					startRunPayloads.push(payload);
-					if (startRunPayloads.length === 1) {
-						socket.send(
-							JSON.stringify({
-								type: "error",
-								payload: { message: "resume id no longer valid" },
-							}),
-						);
-						return;
-					}
 					socket.send(
 						JSON.stringify({
-							type: "run_started",
-							payload: {
-								sessionId: "sess-new-2",
-								runId: "run-new-2",
-							},
+							type: "error",
+							requestId: command["requestId"],
+							payload: { code: "COMMAND_FAILED", message: "runtime start failed" },
 						}),
 					);
 				}
@@ -2197,10 +2195,10 @@ describe("RelayUplinkBridge", () => {
 		});
 
 		try {
-			await expect(bridge.startSession("opencode", "fallback validation")).resolves.toEqual({
-				sessionId: "sess-new-2",
-			});
-			expect(startRunPayloads.length).toBe(2);
+			await expect(bridge.startSession("opencode", "single-attempt validation")).rejects.toThrow(
+				"runtime start failed",
+			);
+			expect(startRunPayloads).toHaveLength(2);
 			expect(startRunPayloads[0]?.["resumeSessionId"]).toBe("ses_stale_456");
 			expect(startRunPayloads[1]?.["resumeSessionId"]).toBeUndefined();
 		} finally {

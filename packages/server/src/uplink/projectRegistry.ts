@@ -116,6 +116,12 @@ export class ProjectRegistry {
 		return this.projects.map((project) => ({ ...project }));
 	}
 
+	get(path: string): RegisteredProject | undefined {
+		const normalizedPath = normalizePath(path);
+		const project = this.projects.find((candidate) => candidate.path === normalizedPath);
+		return project ? { ...project } : undefined;
+	}
+
 	add(name: string, path: string): RegisteredProject {
 		const project = {
 			name: normalizeName(name),

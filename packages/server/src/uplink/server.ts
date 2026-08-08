@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import {
 	type ModelInfo,
+	type ProjectStartFailureDetails,
 	RUNTIME_MODELS,
 	type RuntimeType,
 	type StreamEvent,
@@ -19,6 +20,8 @@ import {
 import { MockExecutor } from "./mock-executor.js";
 import { discoverOpenCodeModels } from "./opencode-models.js";
 import { ProjectRegistry, ProjectRegistryError } from "./projectRegistry.js";
+import { ProjectStartCoordinator, ProjectStartError } from "./projectStart.js";
+import { ProjectStartJournal, ProjectStartJournalError } from "./projectStartJournal.js";
 import { buildProjectState, projectStateSignature } from "./projectState.js";
 import { probeInstalledRuntimes } from "./runtime-probe.js";
 import { SessionManager } from "./session.js";
@@ -43,6 +46,7 @@ export class UplinkServer {
 	private sessionManager: SessionManager;
 	private eventBus: EventBus;
 	private projectRegistry: ProjectRegistry;
+	private projectStartCoordinator: ProjectStartCoordinator | null = null;
 	private executors = new Map<RuntimeType, BaseExecutor>();
 	private availableRuntimes: RuntimeType[] = [];
 	private dynamicModels = new Map<RuntimeType, ModelInfo[]>();
@@ -58,7 +62,6 @@ export class UplinkServer {
 		this.projectRegistry = new ProjectRegistry(
 			this.config.projectRegistryPath ?? join(homedir(), ".codemote", "projects.json"),
 		);
-
 		// Register mock executor for testing
 		this.registerExecutor(
 			new MockExecutor(this.workspaceManager, this.sessionManager, this.eventBus),
@@ -142,6 +145,7 @@ export class UplinkServer {
 		}
 
 		await this.refreshCaches();
+		await this.recoverProjectStarts();
 
 		return new Promise((resolve, reject) => {
 			const wss = new WebSocketServer({
@@ -204,17 +208,47 @@ export class UplinkServer {
 	private handleConnection(ws: WebSocket): void {
 		this.clients.add(ws);
 		console.log("Client connected");
+		const inspectionControllers = new Set<AbortController>();
+		let disposed = false;
+		const sendIfOpen = (payload: UplinkResponse): void => {
+			if (disposed || ws.readyState !== WebSocket.OPEN) return;
+			try {
+				ws.send(JSON.stringify(payload), (error) => {
+					if (error && ws.readyState === WebSocket.OPEN) {
+						console.error("Uplink WS response failed:", error);
+					}
+				});
+			} catch (error) {
+				if (ws.readyState === WebSocket.OPEN) {
+					console.error("Uplink WS response failed:", error);
+				}
+			}
+		};
+		const dispose = (): void => {
+			if (disposed) return;
+			disposed = true;
+			for (const controller of inspectionControllers) controller.abort();
+			inspectionControllers.clear();
+			this.clients.delete(ws);
+		};
 
 		ws.on("message", async (data) => {
 			let requestId: string | undefined;
+			let controller: AbortController | undefined;
 			try {
 				const command = JSON.parse(data.toString()) as UplinkCommand;
 				requestId = command.requestId;
-				const response = await this.handleCommand(command);
-				ws.send(JSON.stringify(response));
+				if (command.type === "get_project_start_state") {
+					controller = new AbortController();
+					inspectionControllers.add(controller);
+				}
+				const response = await this.handleCommand(command, controller?.signal);
+				sendIfOpen(response);
 			} catch (error) {
 				const safe = this.toSafeError(error);
-				console.error("Uplink WS command failed:", error);
+				if (!(disposed && safe.code === "OPERATION_ABORTED")) {
+					console.error("Uplink WS command failed:", error);
+				}
 				const errorResponse: UplinkResponse = {
 					type: "error",
 					payload: safe,
@@ -222,24 +256,49 @@ export class UplinkServer {
 				if (requestId) {
 					errorResponse.requestId = requestId;
 				}
-				ws.send(JSON.stringify(errorResponse));
+				sendIfOpen(errorResponse);
+			} finally {
+				if (controller) inspectionControllers.delete(controller);
 			}
 		});
 
 		ws.on("close", () => {
-			this.clients.delete(ws);
+			dispose();
 			console.log("Client disconnected");
 		});
 
 		ws.on("error", (error) => {
-			console.error("WebSocket error:", error);
-			this.clients.delete(ws);
+			if (ws.readyState === WebSocket.OPEN) {
+				console.error("WebSocket error:", error);
+			}
+			dispose();
 		});
 	}
 
-	private toSafeError(error: unknown): { message: string; code: string } {
+	private toSafeError(error: unknown): {
+		message: string;
+		code: string;
+		details?: ProjectStartFailureDetails;
+	} {
+		if (error instanceof ProjectStartError) {
+			return {
+				message: error.message,
+				code: error.code,
+				...(error.details ? { details: error.details } : {}),
+			};
+		}
 		if (error instanceof ProjectRegistryError) {
 			return { message: error.message, code: error.code };
+		}
+		if (
+			error instanceof ProjectStartJournalError &&
+			(error.code === "INVALID_PROJECT_START_JOURNAL" || error.code === "PROJECT_START_JOURNAL_IO")
+		) {
+			return {
+				message: error.message,
+				code: error.code,
+				...(error.details ? { details: error.details } : {}),
+			};
 		}
 
 		if (error instanceof SyntaxError) {
@@ -257,16 +316,22 @@ export class UplinkServer {
 		return { message: "Request failed", code: "COMMAND_FAILED" };
 	}
 
-	private async handleCommand(command: UplinkCommand): Promise<UplinkResponse> {
+	private async handleCommand(
+		command: UplinkCommand,
+		signal?: AbortSignal,
+	): Promise<UplinkResponse> {
 		const { requestId } = command;
-		const response = await this.handleCommandInner(command);
+		const response = await this.handleCommandInner(command, signal);
 		if (requestId) {
 			response.requestId = requestId;
 		}
 		return response;
 	}
 
-	private async handleCommandInner(command: UplinkCommand): Promise<UplinkResponse> {
+	private async handleCommandInner(
+		command: UplinkCommand,
+		signal?: AbortSignal,
+	): Promise<UplinkResponse> {
 		switch (command.type) {
 			case "ping":
 				return { type: "pong" };
@@ -276,6 +341,15 @@ export class UplinkServer {
 
 			case "get_project_state":
 				return { type: "project_state", payload: this.currentProjectState() };
+
+			case "get_project_start_state":
+				return {
+					type: "project_start_state",
+					payload: await this.getProjectStartCoordinator().inspect(
+						command.payload.projectPath,
+						signal,
+					),
+				};
 
 			case "list_projects":
 				return { type: "project_state", payload: this.currentProjectState() };
@@ -321,7 +395,11 @@ export class UplinkServer {
 				if (!executor) {
 					throw new Error(`No executor for runtime: ${command.payload.profile}`);
 				}
-				const result = await executor.startRun(command.payload);
+				const result = command.payload.projectStart
+					? await this.getProjectStartCoordinator().start(command.payload, (options, context) =>
+							executor.startRun(options, context),
+						)
+					: await executor.startRun(command.payload);
 				return { type: "run_started", payload: result };
 			}
 
@@ -342,6 +420,7 @@ export class UplinkServer {
 				const session = this.sessionManager.get(command.payload.sessionId);
 				if (!session) throw new Error("Session not found");
 				const executor = this.executors.get(session.runtime);
+				this.sessionManager.setRecoveryState(command.payload.sessionId, "ended");
 				await executor?.stop(command.payload.sessionId);
 				return { type: "stopped", payload: { sessionId: command.payload.sessionId } };
 			}
@@ -543,6 +622,45 @@ export class UplinkServer {
 
 	private getModelsForRuntime(runtime: RuntimeType): ModelInfo[] {
 		return this.dynamicModels.get(runtime) ?? RUNTIME_MODELS[runtime];
+	}
+
+	/**
+	 * Recover durable Git-aware starts before any command is accepted.
+	 *
+	 * A journal this build cannot read is remembered rather than fatal: pairing,
+	 * sessions and every unrelated command keep working, and only Project-start
+	 * requests report the structured journal error.
+	 */
+	private async recoverProjectStarts(): Promise<void> {
+		try {
+			await this.getProjectStartCoordinator().reconcileOnStartup();
+		} catch (error) {
+			if (error instanceof ProjectStartJournalError) {
+				console.error("Project start journal is unusable:", error.message);
+				return;
+			}
+			console.error("Project start recovery failed:", error);
+		}
+	}
+
+	private getProjectStartCoordinator(): ProjectStartCoordinator {
+		if (!this.projectStartCoordinator) {
+			this.projectStartCoordinator = new ProjectStartCoordinator({
+				journal: new ProjectStartJournal(
+					this.config.projectStartJournalPath ??
+						join(homedir(), ".codemote", "project-start-operations.json"),
+				),
+				registry: this.projectRegistry,
+				sessionManager: this.sessionManager,
+				workspaceManager: this.workspaceManager,
+				recoverSession: async (runtime, session, context) =>
+					(await this.executors.get(runtime)?.recoverRun(session, context)) ?? false,
+				...(this.config.managedWorktreeRoot
+					? { managedWorktreeRoot: this.config.managedWorktreeRoot }
+					: {}),
+			});
+		}
+		return this.projectStartCoordinator;
 	}
 
 	private isLoopbackHost(host: string): boolean {

@@ -1,7 +1,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { WebSocket } from "ws";
 
 import { decodeBase64, decrypt, encodeBase64, encrypt, generateKeyPair } from "./encryption.js";
@@ -20,8 +20,12 @@ import { validateEncryptedPayload } from "./validateEncryptedPayload.js";
 
 import type {
 	ModelInfo,
+	ProjectStartFailureDetails,
+	ProjectStartRequest,
+	ProjectStartState,
 	ProjectStateAggregate,
 	RuntimeType,
+	SessionExecutionState,
 	SessionStatus,
 	StreamEvent,
 	UplinkCommand,
@@ -77,6 +81,8 @@ interface SessionInfo {
 	createdAt: number;
 	runtimeSessionId?: string;
 	workspace?: string;
+	originProjectPath?: string;
+	execution?: SessionExecutionState;
 }
 
 interface SessionListMessage {
@@ -193,6 +199,7 @@ interface NewSessionMessage {
 	model?: string;
 	temperature?: number;
 	maxTokens?: number;
+	projectStart?: ProjectStartRequest;
 }
 
 interface ListModelsMessage {
@@ -206,6 +213,11 @@ interface ListRuntimesMessage {
 
 interface GetProjectStateMessage {
 	type: "get_project_state";
+}
+
+interface GetProjectStartStateMessage {
+	type: "get_project_start_state";
+	projectPath: string;
 }
 
 interface AddProjectMessage {
@@ -232,6 +244,39 @@ interface RemoveProjectMessage {
 interface ProjectStateMessage {
 	type: "project_state";
 	state: ProjectStateAggregate;
+}
+
+interface ProjectStartStateMessage {
+	type: "project_start_state";
+	projectPath: string;
+	state?: ProjectStartState;
+	error?: { code: string; message: string };
+}
+
+type SessionStartResultMessage =
+	| {
+			type: "session_start_result";
+			operationId: string;
+			success: true;
+			sessionId: string;
+			originProjectPath: string;
+			execution: SessionExecutionState;
+	  }
+	| {
+			type: "session_start_result";
+			operationId: string;
+			success: false;
+			code: string;
+			message: string;
+			details?: ProjectStartFailureDetails;
+	  };
+
+interface SessionStartUnresolvedMessage {
+	type: "session_start_unresolved";
+	operationId: string;
+	retryable: true;
+	code: "UPLINK_RESPONSE_TIMEOUT" | "UPLINK_RESPONSE_UNRESOLVED";
+	message: string;
 }
 
 interface ProjectRegistryResultMessage {
@@ -336,6 +381,7 @@ type MobileInboundMessage =
 	| ListModelsMessage
 	| ListRuntimesMessage
 	| GetProjectStateMessage
+	| GetProjectStartStateMessage
 	| AddProjectMessage
 	| ListProjectsMessage
 	| RenameProjectMessage
@@ -367,6 +413,9 @@ type MobileOutboundMessage =
 	| GitWorktreeResultMessage
 	| RuntimeListMessage
 	| ProjectStateMessage
+	| ProjectStartStateMessage
+	| SessionStartResultMessage
+	| SessionStartUnresolvedMessage
 	| ProjectRegistryResultMessage
 	| GitPRResultMessage;
 
@@ -429,6 +478,24 @@ export interface RelayUplinkBridgeHandle {
 
 const DEVICE_ID_PATH = join(homedir(), ".codemote", "device-id");
 
+class UplinkRequestError extends Error {
+	constructor(
+		readonly code: string,
+		message: string,
+		readonly details?: ProjectStartFailureDetails,
+	) {
+		super(message);
+		this.name = "UplinkRequestError";
+	}
+}
+
+class UplinkResponseTimeoutError extends Error {
+	constructor(readonly expectedType: UplinkResponse["type"]) {
+		super(`Timed out waiting for uplink response: ${expectedType}`);
+		this.name = "UplinkResponseTimeoutError";
+	}
+}
+
 class UplinkWsClient {
 	private readonly pending: Array<{
 		requestId: string;
@@ -477,6 +544,7 @@ class UplinkWsClient {
 		model?: string,
 		temperature?: number,
 		maxTokens?: number,
+		projectStart?: ProjectStartRequest,
 	) {
 		const normalizedModel = typeof model === "string" ? model.trim() : "";
 		const payload = {
@@ -487,6 +555,7 @@ class UplinkWsClient {
 			...(normalizedModel ? { model: normalizedModel } : {}),
 			...(typeof temperature === "number" && temperature >= 0 ? { temperature } : {}),
 			...(typeof maxTokens === "number" && maxTokens > 0 ? { maxTokens } : {}),
+			...(projectStart ? { projectStart } : {}),
 		};
 		return this.sendAndWait({
 			type: "start_run",
@@ -533,6 +602,13 @@ class UplinkWsClient {
 		// slow or unanswered state read would stall every user action behind it for
 		// the full command timeout.
 		return this.sendAndWait({ type: "get_project_state" }, { bypassQueue: true });
+	}
+
+	async getProjectStartState(projectPath: string) {
+		return this.sendAndWait(
+			{ type: "get_project_start_state", payload: { projectPath } },
+			{ bypassQueue: true },
+		);
 	}
 
 	async addProject(name: string, path: string) {
@@ -694,7 +770,9 @@ class UplinkWsClient {
 			}
 			if (waiter) {
 				clearTimeout(waiter.timeout);
-				waiter.reject(new Error(msg.payload.message));
+				waiter.reject(
+					new UplinkRequestError(msg.payload.code, msg.payload.message, msg.payload.details),
+				);
 			}
 			return;
 		}
@@ -784,7 +862,7 @@ class UplinkWsClient {
 					if (idx >= 0) {
 						this.pending.splice(idx, 1);
 					}
-					reject(new Error(`Timed out waiting for uplink response: ${expectedType}`));
+					reject(new UplinkResponseTimeoutError(expectedType));
 				}, timeoutMs),
 			};
 			this.pending.push(waiter);
@@ -802,6 +880,8 @@ function expectedResponseType(commandType: UplinkCommand["type"]): UplinkRespons
 		case "get_project_state":
 		case "list_projects":
 			return "project_state";
+		case "get_project_start_state":
+			return "project_start_state";
 		case "add_project":
 		case "rename_project":
 		case "remove_project":
@@ -1321,6 +1401,9 @@ export async function startRelayUplinkBridge(
 			case "get_project_state":
 				await handleGetProjectState();
 				return;
+			case "get_project_start_state":
+				await handleGetProjectStartState(message);
+				return;
 			case "add_project":
 				await handleProjectMutation("add", message.path, () =>
 					uplinkClient.addProject(message.name, message.path),
@@ -1424,7 +1507,7 @@ export async function startRelayUplinkBridge(
 	async function handleNewSession(message: NewSessionMessage): Promise<void> {
 		const resumeSessionId = resolveResumeSessionId(message);
 		try {
-			await startAndTrackSession(
+			const result = await startAndTrackSession(
 				message.runtime,
 				message.prompt,
 				resumeSessionId,
@@ -1432,14 +1515,57 @@ export async function startRelayUplinkBridge(
 				message.model,
 				message.temperature,
 				message.maxTokens,
+				message.projectStart,
 			);
+			if (message.projectStart) {
+				if (!result.originProjectPath || !result.execution) {
+					throw new Error("Project-aware start omitted effective state");
+				}
+				sendToMobile({
+					type: "session_start_result",
+					operationId: message.projectStart.operationId,
+					success: true,
+					sessionId: result.sessionId,
+					originProjectPath: result.originProjectPath,
+					execution: result.execution,
+				});
+			}
 		} catch (error) {
+			if (message.projectStart) {
+				if (!(error instanceof UplinkRequestError) || error.code === "PROJECT_START_JOURNAL_IO") {
+					log?.(
+						`[Bridge] Project start ${message.projectStart.operationId} remains unresolved: ${errorMessage(error)}`,
+					);
+					sendToMobile({
+						type: "session_start_unresolved",
+						operationId: message.projectStart.operationId,
+						retryable: true,
+						code:
+							error instanceof UplinkResponseTimeoutError
+								? "UPLINK_RESPONSE_TIMEOUT"
+								: "UPLINK_RESPONSE_UNRESOLVED",
+						message: errorMessage(error),
+					});
+					return;
+				}
+				log?.(
+					`[Bridge] Project start ${message.projectStart.operationId} failed: ${error.message}`,
+				);
+				sendToMobile({
+					type: "session_start_result",
+					operationId: message.projectStart.operationId,
+					success: false,
+					code: error.code,
+					message: error.message,
+					...(error.details ? { details: error.details } : {}),
+				});
+				return;
+			}
+
 			let sessionStartError: unknown = error;
 			if (resumeSessionId) {
 				log?.(
-					`[Bridge] Resume failed for ${message.runtime} session ${resumeSessionId}: ${
-						error instanceof Error ? error.message : String(error)
-					}; retrying with a fresh session`,
+					`[Bridge] Resume failed for ${message.runtime} session ${resumeSessionId}: ${errorMessage(error)}; retrying with a fresh session`,
 				);
 				try {
 					await startAndTrackSession(
@@ -1457,11 +1583,7 @@ export async function startRelayUplinkBridge(
 				}
 			}
 
-			log?.(
-				`[Bridge] Failed to start session: ${
-					sessionStartError instanceof Error ? sessionStartError.message : String(sessionStartError)
-				}`,
-			);
+			log?.(`[Bridge] Failed to start session: ${errorMessage(sessionStartError)}`);
 			const errorId = `error-${Date.now()}`;
 			sessions.set(errorId, {
 				id: errorId,
@@ -1479,53 +1601,31 @@ export async function startRelayUplinkBridge(
 	}
 
 	function resolveResumeSessionId(message: NewSessionMessage): string | undefined {
-		if (!AUTO_RESUME_RUNTIMES.has(message.runtime)) {
-			return undefined;
-		}
-
-		const explicitResumeSessionId = normalizeResumeSessionId(
-			message.runtime,
-			message.resumeSessionId,
+		if (message.projectStart || !AUTO_RESUME_RUNTIMES.has(message.runtime)) return undefined;
+		return (
+			normalizeResumeSessionId(message.runtime, message.resumeSessionId) ??
+			resolveLatestRuntimeSessionId(message.runtime)
 		);
-		if (explicitResumeSessionId) {
-			return explicitResumeSessionId;
-		}
-
-		return resolveLatestRuntimeSessionId(message.runtime);
 	}
 
 	function resolveLatestRuntimeSessionId(runtime: RuntimeType): string | undefined {
-		if (!AUTO_RESUME_RUNTIMES.has(runtime)) {
-			return undefined;
-		}
-
-		const latestRuntimeSession = Array.from(sessions.values())
+		if (!AUTO_RESUME_RUNTIMES.has(runtime)) return undefined;
+		const latest = Array.from(sessions.values())
 			.filter((session) => session.runtime === runtime && !!session.runtimeSessionId)
 			.sort((a, b) => b.createdAt - a.createdAt)[0];
-
-		return normalizeResumeSessionId(runtime, latestRuntimeSession?.runtimeSessionId);
+		return normalizeResumeSessionId(runtime, latest?.runtimeSessionId);
 	}
 
 	function normalizeResumeSessionId(
 		runtime: RuntimeType,
 		runtimeSessionId: string | undefined,
 	): string | undefined {
-		if (!runtimeSessionId) {
-			return undefined;
-		}
-
-		const trimmed = runtimeSessionId.trim();
-		if (trimmed.length === 0) {
-			return undefined;
-		}
-
-		// OpenCode server session ids are prefixed with "ses_". Older persisted
-		// ids can have incompatible shapes and cause immediate runtime errors.
+		const trimmed = runtimeSessionId?.trim();
+		if (!trimmed) return undefined;
 		if (runtime === "opencode" && !trimmed.startsWith("ses_")) {
 			log?.(`[Bridge] Ignoring incompatible OpenCode resume id: ${trimmed.slice(0, 12)}...`);
 			return undefined;
 		}
-
 		return trimmed;
 	}
 
@@ -1537,15 +1637,22 @@ export async function startRelayUplinkBridge(
 		model?: string,
 		temperature?: number,
 		maxTokens?: number,
-	): Promise<{ sessionId: string }> {
+		projectStart?: ProjectStartRequest,
+	): Promise<{
+		sessionId: string;
+		originProjectPath?: string;
+		execution?: SessionExecutionState;
+	}> {
+		const effectiveWorkspace = projectStart?.originProjectPath ?? workspace ?? repoPath;
 		const started = await uplinkClient.startRun(
 			runtime,
-			workspace || repoPath,
+			effectiveWorkspace,
 			prompt,
 			resumeSessionId,
 			model,
 			temperature,
 			maxTokens,
+			projectStart,
 		);
 		if (started.type !== "run_started") {
 			throw new Error("Unexpected start_run response");
@@ -1555,7 +1662,10 @@ export async function startRelayUplinkBridge(
 		const existing = sessions.get(sessionId);
 		const status = existing?.status ?? "starting";
 		const runtimeSessionId = existing?.runtimeSessionId ?? resumeSessionId;
-		const workspacePath = existing?.workspace ?? workspace;
+		const originProjectPath = started.payload.originProjectPath ?? existing?.originProjectPath;
+		const execution = started.payload.execution ?? existing?.execution;
+		const workspacePath =
+			execution?.directory ?? existing?.workspace ?? workspace ?? projectStart?.originProjectPath;
 		sessions.set(sessionId, {
 			id: sessionId,
 			runtime,
@@ -1563,9 +1673,15 @@ export async function startRelayUplinkBridge(
 			createdAt: existing?.createdAt ?? Date.now(),
 			...(runtimeSessionId ? { runtimeSessionId } : {}),
 			...(workspacePath ? { workspace: workspacePath } : {}),
+			...(originProjectPath ? { originProjectPath } : {}),
+			...(execution ? { execution } : {}),
 		});
 		sendSessionList();
-		return { sessionId };
+		return {
+			sessionId,
+			...(originProjectPath ? { originProjectPath } : {}),
+			...(execution ? { execution } : {}),
+		};
 	}
 
 	async function startSession(
@@ -1581,13 +1697,9 @@ export async function startRelayUplinkBridge(
 		try {
 			return await startAndTrackSession(runtime, cleanPrompt, resumeSessionId);
 		} catch (error) {
-			if (!resumeSessionId) {
-				throw error;
-			}
+			if (!resumeSessionId) throw error;
 			log?.(
-				`[Bridge] Resume failed for local ${runtime} start ${resumeSessionId}: ${
-					error instanceof Error ? error.message : String(error)
-				}; retrying with a fresh session`,
+				`[Bridge] Resume failed for local ${runtime} start ${resumeSessionId}: ${errorMessage(error)}; retrying with a fresh session`,
 			);
 			return startAndTrackSession(runtime, cleanPrompt);
 		}
@@ -1836,6 +1948,33 @@ export async function startRelayUplinkBridge(
 			log?.(
 				`[Bridge] Failed to get project state: ${error instanceof Error ? error.message : String(error)}`,
 			);
+		}
+	}
+
+	async function handleGetProjectStartState(message: GetProjectStartStateMessage): Promise<void> {
+		try {
+			const response = await uplinkClient.getProjectStartState(message.projectPath);
+			if (response.type !== "project_start_state") {
+				throw new Error("Unexpected get_project_start_state response");
+			}
+			sendToMobile({
+				type: "project_start_state",
+				projectPath: message.projectPath,
+				state: response.payload,
+			});
+		} catch (error) {
+			const requestError =
+				error instanceof UplinkRequestError
+					? error
+					: new UplinkRequestError("COMMAND_FAILED", errorMessage(error));
+			log?.(
+				`[Bridge] Failed to inspect project start state for ${message.projectPath}: ${requestError.message}`,
+			);
+			sendToMobile({
+				type: "project_start_state",
+				projectPath: message.projectPath,
+				error: { code: requestError.code, message: requestError.message },
+			});
 		}
 	}
 
@@ -2098,6 +2237,8 @@ export async function startRelayUplinkBridge(
 		createdAt?: number;
 		runtimeSessionId?: string;
 		workspace?: { workingDir: string };
+		originProjectPath?: string;
+		execution?: SessionExecutionState;
 	}): SessionInfo {
 		return {
 			id: session.id,
@@ -2106,6 +2247,8 @@ export async function startRelayUplinkBridge(
 			createdAt: session.createdAt ?? session.startedAt ?? Date.now(),
 			...(session.runtimeSessionId ? { runtimeSessionId: session.runtimeSessionId } : {}),
 			...(session.workspace ? { workspace: session.workspace.workingDir } : {}),
+			...(session.originProjectPath ? { originProjectPath: session.originProjectPath } : {}),
+			...(session.execution ? { execution: session.execution } : {}),
 		};
 	}
 
@@ -2373,6 +2516,101 @@ function decodeRelayInbound(raw: unknown): RelayInboundMessage | null {
 	return null;
 }
 
+function decodeProjectStartRequest(value: unknown): ProjectStartRequest | null {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+	const candidate = value as Record<string, unknown>;
+	const operationId = candidate["operationId"];
+	const originProjectPath = candidate["originProjectPath"];
+	const preparationValue = candidate["preparation"];
+	if (
+		typeof operationId !== "string" ||
+		operationId.length === 0 ||
+		typeof originProjectPath !== "string" ||
+		!isAbsolute(originProjectPath) ||
+		(candidate["mode"] !== "project_folder" && candidate["mode"] !== "worktree") ||
+		typeof preparationValue !== "object" ||
+		preparationValue === null ||
+		Array.isArray(preparationValue)
+	) {
+		return null;
+	}
+
+	const preparation = preparationValue as Record<string, unknown>;
+	if (candidate["mode"] === "worktree") {
+		if (
+			preparation["type"] !== "create_worktree" ||
+			typeof preparation["baseRef"] !== "string" ||
+			!(
+				/^refs\/heads\/[^\s]+$/u.test(preparation["baseRef"]) ||
+				/^refs\/remotes\/[^/\s]+\/[^\s]+$/u.test(preparation["baseRef"])
+			) ||
+			preparation["baseRef"].endsWith("/HEAD") ||
+			typeof preparation["expectedCommit"] !== "string" ||
+			!/^[0-9a-fA-F]{40,64}$/u.test(preparation["expectedCommit"]) ||
+			!(
+				preparation["newBranch"] === null ||
+				(typeof preparation["newBranch"] === "string" && preparation["newBranch"].length > 0)
+			) ||
+			Object.keys(preparation).some(
+				(key) => !["type", "baseRef", "expectedCommit", "newBranch"].includes(key),
+			)
+		) {
+			return null;
+		}
+		return {
+			operationId,
+			originProjectPath,
+			mode: "worktree",
+			preparation: {
+				type: "create_worktree",
+				baseRef: preparation["baseRef"],
+				expectedCommit: preparation["expectedCommit"],
+				newBranch: preparation["newBranch"],
+			},
+		};
+	}
+	if (preparation["type"] === "none") {
+		if (
+			"newBranch" in preparation ||
+			"expectedHead" in preparation ||
+			"expectedBranch" in preparation
+		) {
+			return null;
+		}
+		return {
+			operationId,
+			originProjectPath,
+			mode: "project_folder",
+			preparation: { type: "none" },
+		};
+	}
+	if (
+		preparation["type"] !== "create_branch" ||
+		typeof preparation["newBranch"] !== "string" ||
+		preparation["newBranch"].length === 0 ||
+		typeof preparation["expectedHead"] !== "string" ||
+		preparation["expectedHead"].length === 0 ||
+		!(
+			preparation["expectedBranch"] === null ||
+			(typeof preparation["expectedBranch"] === "string" &&
+				preparation["expectedBranch"].length > 0)
+		)
+	) {
+		return null;
+	}
+	return {
+		operationId,
+		originProjectPath,
+		mode: "project_folder",
+		preparation: {
+			type: "create_branch",
+			newBranch: preparation["newBranch"],
+			expectedHead: preparation["expectedHead"],
+			expectedBranch: preparation["expectedBranch"],
+		},
+	};
+}
+
 /** Exported for testing only — not re-exported from index.ts. */
 export function decodeMobileInbound(payload: unknown): MobileInboundMessage | null {
 	if (typeof payload !== "object" || payload === null) {
@@ -2388,6 +2626,7 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 		const model = (payload as { model?: unknown }).model;
 		const temperature = (payload as { temperature?: unknown }).temperature;
 		const maxTokens = (payload as { maxTokens?: unknown }).maxTokens;
+		const projectStartValue = (payload as { projectStart?: unknown }).projectStart;
 		if (
 			(runtime === "opencode" ||
 				runtime === "claude" ||
@@ -2395,8 +2634,15 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 				runtime === "gemini") &&
 			typeof prompt === "string"
 		) {
+			const projectStart =
+				projectStartValue === undefined ? undefined : decodeProjectStartRequest(projectStartValue);
+			if (projectStartValue !== undefined && !projectStart) return null;
 			const msg: NewSessionMessage = { type: "new_session", runtime, prompt };
-			if (typeof resumeSessionId === "string" && resumeSessionId.trim().length > 0) {
+			if (
+				projectStart === undefined &&
+				typeof resumeSessionId === "string" &&
+				resumeSessionId.trim().length > 0
+			) {
 				msg.resumeSessionId = resumeSessionId.trim();
 			}
 			if (typeof workspace === "string" && workspace.trim().length > 0) {
@@ -2416,6 +2662,7 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 			if (typeof maxTokens === "number" && Number.isInteger(maxTokens) && maxTokens > 0) {
 				msg.maxTokens = maxTokens;
 			}
+			if (projectStart) msg.projectStart = projectStart;
 			return msg;
 		}
 		return null;
@@ -2487,6 +2734,14 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 
 	if (type === "get_project_state") {
 		return { type: "get_project_state" };
+	}
+
+	if (type === "get_project_start_state") {
+		const projectPath = (payload as { projectPath?: unknown }).projectPath;
+		if (typeof projectPath === "string" && projectPath.length > 0) {
+			return { type: "get_project_start_state", projectPath };
+		}
+		return null;
 	}
 
 	if (type === "add_project") {

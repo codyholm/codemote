@@ -179,6 +179,41 @@ describe("buildProjectState", () => {
 		expect(agg.projects[0]?.sessionCount).toBe(3);
 	});
 
+	it("groups a project-aware session by origin and projects its effective state", () => {
+		const origin = resolve("/tmp/origin-project");
+		const effective = resolve("/tmp/effective-checkout");
+		const execution = {
+			directory: effective,
+			mode: "worktree" as const,
+			git: {
+				repositoryRoot: effective,
+				head: "abc123",
+				branch: "feature/session",
+				detached: false,
+			},
+			worktree: {
+				path: effective,
+				baseRef: "refs/heads/main",
+				baseCommit: "abc123",
+			},
+		};
+		const agg = buildProjectState(
+			[
+				sessionIn("sess-project-aware", effective, {
+					originProjectPath: origin,
+					execution,
+				}),
+			],
+			[{ name: "Origin", path: origin }],
+			NOW,
+		);
+
+		expect(agg.projects).toHaveLength(1);
+		expect(agg.projects[0]?.id).toBe(origin);
+		expect(agg.projects[0]?.sessions[0]?.originProjectPath).toBe(origin);
+		expect(agg.projects[0]?.sessions[0]?.execution).toEqual(execution);
+	});
+
 	it("includes a named registered project with no sessions", () => {
 		const projectPath = resolve("/tmp/sessionless-project");
 		const agg = buildProjectState([], [{ name: "Named Project", path: `${projectPath}/./` }], NOW);
@@ -247,6 +282,22 @@ describe("buildProjectState", () => {
 		expect(fallback.projects[0]?.name).toBe("removed-project");
 		expect(fallback.projects[0]?.registered).toBe(false);
 		expect(fallback.projects[0]?.sessions[0]?.sessionId).toBe("sess-a");
+	});
+
+	it("keeps a removed origin as the fallback group when execution differs", () => {
+		const origin = resolve("/tmp/removed-origin");
+		const effective = resolve("/tmp/effective-checkout");
+		const session = sessionIn("sess-a", effective, {
+			originProjectPath: origin,
+			execution: { directory: effective, mode: "project_folder", git: null },
+		});
+
+		const fallback = buildProjectState([session], [], NOW);
+
+		expect(fallback.projects).toHaveLength(1);
+		expect(fallback.projects[0]?.id).toBe(origin);
+		expect(fallback.projects[0]?.registered).toBe(false);
+		expect(fallback.projects[0]?.sessions[0]?.execution?.directory).toBe(effective);
 	});
 
 	it("caps sessions, reports the omission, and keeps every blocked session", () => {
@@ -559,6 +610,40 @@ describe("projectStateSignature", () => {
 		expect(before.blockedProjectCount).toBe(after.blockedProjectCount);
 		expect(before.blockedSessionCount).toBe(1);
 		expect(after.blockedSessionCount).toBe(2);
+		expect(projectStateSignature(after)).not.toBe(projectStateSignature(before));
+	});
+
+	it("reacts to project execution metadata changing", () => {
+		const before = buildProjectState(
+			[
+				sessionIn("sess-a", "/tmp/effective", {
+					originProjectPath: "/tmp/origin",
+					execution: { directory: "/tmp/effective", mode: "project_folder", git: null },
+				}),
+			],
+			[],
+			NOW,
+		);
+		const after = buildProjectState(
+			[
+				sessionIn("sess-a", "/tmp/effective", {
+					originProjectPath: "/tmp/origin",
+					execution: {
+						directory: "/tmp/effective",
+						mode: "project_folder",
+						git: {
+							repositoryRoot: "/tmp/effective",
+							head: "abc123",
+							branch: "feature/session",
+							detached: false,
+						},
+					},
+				}),
+			],
+			[],
+			NOW,
+		);
+
 		expect(projectStateSignature(after)).not.toBe(projectStateSignature(before));
 	});
 });

@@ -27,6 +27,7 @@ describe.skipIf(platform() === "win32")("GeminiExecutor", () => {
 		await git.init(["--initial-branch=main"]);
 		await git.addConfig("user.email", "test@test.com");
 		await git.addConfig("user.name", "Test");
+		await git.addConfig("commit.gpgsign", "false");
 		await writeFile(join(testDir, "README.md"), "# Test");
 		await git.add(".");
 		await git.commit("Initial commit");
@@ -221,6 +222,35 @@ printf '{"type":"result","timestamp":"2026-01-01T00:00:02Z","status":"success"}\
 		expect(sessionManager.get(result.sessionId)?.status).toBe("idle");
 
 		activeSessionId = null;
+	});
+
+	it("recovers a durable session lazily and resumes its exact runtime id", async () => {
+		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
+			geminiPath: mockGeminiPath,
+		});
+		const execution = { directory: testDir, mode: "project_folder" as const, git: null };
+		const recovered = await activeExecutor.recoverRun(
+			{
+				sessionId: "gemini-recovered",
+				runId: "gemini-run",
+				workspaceId: "gemini-workspace",
+				createdAt: 1,
+				execution,
+				runtimeSessionId: "gemini-runtime-789",
+				recoveryState: "resumable",
+			},
+			{ originProjectPath: testDir, execution },
+		);
+		activeSessionId = "gemini-recovered";
+
+		expect(recovered).toBe(true);
+		expect(sessionManager.get(activeSessionId)).toMatchObject({ status: "idle" });
+		await expect(readFile(argsLogPath, "utf8")).rejects.toBeDefined();
+
+		await activeExecutor.sendInput(activeSessionId, "recovered-follow-up");
+		expect(await readFile(argsLogPath, "utf8")).toContain(
+			"--resume gemini-runtime-789 --output-format stream-json recovered-follow-up",
+		);
 	});
 
 	it("passes --model when model is provided and preserves it across turns", async () => {

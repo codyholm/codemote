@@ -171,7 +171,7 @@ export class CodexExecutor extends BaseExecutor {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 
-		this.attachProcessHandlers(session.id, codexSession, proc);
+		await this.attachProcessHandlers(session.id, codexSession, proc);
 	}
 
 	/**
@@ -188,6 +188,9 @@ export class CodexExecutor extends BaseExecutor {
 		}
 
 		if (session.status === "ended") {
+			if (session.resumeEligible === false) {
+				throw new SessionNotActiveError(sessionId);
+			}
 			const runtimeSessionId = session.runtimeSessionId?.trim();
 			if (!runtimeSessionId) {
 				throw new SessionNotActiveError(sessionId);
@@ -205,6 +208,16 @@ export class CodexExecutor extends BaseExecutor {
 		await super.sendInput(sessionId, input);
 	}
 
+	protected override async doRecoverRun(
+		session: Session,
+		runtimeSessionId: string,
+	): Promise<boolean> {
+		const codexSession = this.createCodexSession(runtimeSessionId);
+		codexSession.running = false;
+		this.codexSessions.set(session.id, codexSession);
+		return true;
+	}
+
 	/**
 	 * Send input to the Codex session
 	 *
@@ -213,6 +226,15 @@ export class CodexExecutor extends BaseExecutor {
 	 */
 	protected async doSendInput(session: Session, input: string): Promise<void> {
 		const codexSession = this.codexSessions.get(session.id);
+		if (codexSession && (!codexSession.process || !codexSession.running)) {
+			const runtimeSessionId =
+				codexSession.threadId ?? codexSession.codexSessionId ?? session.runtimeSessionId;
+			if (runtimeSessionId) {
+				this.emitStatus(session.id, "starting");
+				await this.resumeSession(session.id, runtimeSessionId, input);
+				return;
+			}
+		}
 		if (!codexSession?.process || !codexSession.running) {
 			throw new Error("Codex session not running");
 		}
@@ -331,7 +353,7 @@ export class CodexExecutor extends BaseExecutor {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 
-		this.attachProcessHandlers(session.id, codexSession, proc);
+		await this.attachProcessHandlers(session.id, codexSession, proc);
 	}
 
 	// ========================================
@@ -450,11 +472,11 @@ export class CodexExecutor extends BaseExecutor {
 	/**
 	 * Attach stdout/stderr parsing and lifecycle handlers to a Codex process.
 	 */
-	private attachProcessHandlers(
+	private async attachProcessHandlers(
 		sessionId: string,
 		codexSession: CodexSession,
 		proc: ChildProcess,
-	): void {
+	): Promise<void> {
 		codexSession.process = proc;
 
 		// A codex process that has closed the read end of its stdin — exited after its
@@ -503,6 +525,23 @@ export class CodexExecutor extends BaseExecutor {
 			codexSession.running = false;
 			this.emitOutput(sessionId, `Error: ${error.message}\n`);
 			this.emitStatus(sessionId, "error");
+		});
+
+		await new Promise<void>((resolve, reject) => {
+			const cleanup = (): void => {
+				proc.removeListener("spawn", onSpawn);
+				proc.removeListener("error", onError);
+			};
+			const onSpawn = (): void => {
+				cleanup();
+				resolve();
+			};
+			const onError = (error: Error): void => {
+				cleanup();
+				reject(error);
+			};
+			proc.once("spawn", onSpawn);
+			proc.once("error", onError);
 		});
 	}
 

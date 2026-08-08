@@ -15,7 +15,13 @@ import {
 } from "@codemote/common";
 import { type EventBus, createEvent } from "./events.js";
 import type { SessionManager } from "./session.js";
-import type { Session, WorkspaceConfig } from "./types.js";
+import type {
+	DurableProjectSession,
+	Session,
+	SessionStartContext,
+	Workspace,
+	WorkspaceConfig,
+} from "./types.js";
 import type { WorkspaceManager } from "./workspace.js";
 
 /**
@@ -76,17 +82,38 @@ export abstract class BaseExecutor {
 	/**
 	 * Start a new run
 	 */
-	async startRun(options: RunOptions): Promise<RunResult> {
+	async startRun(options: RunOptions, context?: SessionStartContext): Promise<RunResult> {
+		const control = context?.launch;
+		const recorded = control?.session;
 		// Create or get workspace
 		const workspaceConfig: WorkspaceConfig = {
 			repoPath: options.workspace,
-			workspaceId: this.generateWorkspaceId(),
+			workspaceId: recorded?.workspaceId ?? this.generateWorkspaceId(),
 		};
 
 		const workspace = await this.workspaceManager.create(workspaceConfig);
-		const session = this.sessionManager.create(this.type, workspace);
+		const session = recorded
+			? this.sessionManager.restore(this.recoveredSession(recorded, workspace, context))
+			: this.sessionManager.create(this.type, workspace, context);
+
+		// Each boundary is durable before the action it admits to. A session this
+		// process cannot record must not exist for the runtime to write into, so
+		// failing to persist discards it instead of leaving a phantom behind.
+		try {
+			control?.recordSession(session);
+		} catch (error) {
+			await this.discardSession(session.id, workspace.id);
+			throw error;
+		}
 
 		this.emitStatus(session.id, "starting");
+
+		try {
+			control?.recordRuntimeLaunchRequested(session);
+		} catch (error) {
+			await this.discardSession(session.id, workspace.id);
+			throw error;
+		}
 
 		try {
 			await this.doStartRun(session, options);
@@ -97,13 +124,59 @@ export abstract class BaseExecutor {
 			}
 		} catch (error) {
 			this.emitStatus(session.id, "error");
-			throw error;
+			throw new ExecutorStartError(
+				error instanceof Error ? error.message : String(error),
+				session.runId,
+				session.id,
+				error,
+			);
 		}
 
 		return {
 			runId: session.runId,
 			sessionId: session.id,
+			...(context
+				? {
+						originProjectPath: context.originProjectPath,
+						execution: context.execution,
+					}
+				: {}),
 		};
+	}
+
+	/**
+	 * Rehydrate a durable runtime conversation without manufacturing a new turn.
+	 *
+	 * Runtime-specific recovery may register enough state to resume lazily when
+	 * the next real user input arrives. Unsupported runtimes return false and the
+	 * caller keeps the existing conservative ended-session restoration.
+	 */
+	async recoverRun(
+		recorded: DurableProjectSession,
+		context: SessionStartContext,
+	): Promise<boolean> {
+		const runtimeSessionId = recorded.runtimeSessionId?.trim();
+		if (!runtimeSessionId) return false;
+
+		const workspace = this.workspaceManager.restore({
+			id: recorded.workspaceId,
+			workingDir: recorded.execution.directory,
+			createdAt: recorded.createdAt,
+		});
+		const session = this.sessionManager.restore(
+			this.recoveredSession(recorded, workspace, context, "idle"),
+		);
+
+		try {
+			const recovered = await this.doRecoverRun(session, runtimeSessionId);
+			if (recovered) return true;
+		} catch (error) {
+			await this.discardSession(session.id, workspace.id);
+			throw error;
+		}
+
+		await this.discardSession(session.id, workspace.id);
+		return false;
 	}
 
 	/**
@@ -143,7 +216,10 @@ export abstract class BaseExecutor {
 		const session = this.sessionManager.get(sessionId);
 		if (!session) return;
 
-		await this.doStop(session);
+		// Runtime exit handlers may report an error while an intentional stop is in
+		// flight. The protocol caller records user intent separately; service shutdown
+		// deliberately records nothing so the durable conversation remains recoverable.
+		await this.sessionManager.withoutRecoveryPersistence(sessionId, () => this.doStop(session));
 		this.sessionManager.end(sessionId);
 		this.emitStatus(sessionId, "ended");
 	}
@@ -259,6 +335,44 @@ export abstract class BaseExecutor {
 		return `ws-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 	}
 
+	/**
+	 * Rebuild the exact session identity a previous process recorded, so a
+	 * retransmission after a restart launches into the same session rather than
+	 * allocating a second one.
+	 */
+	private recoveredSession(
+		recorded: DurableProjectSession,
+		workspace: Workspace,
+		context?: SessionStartContext,
+		status: SessionStatus = "starting",
+	): Session {
+		const now = Date.now();
+		return {
+			id: recorded.sessionId,
+			runId: recorded.runId,
+			runtime: this.type,
+			status,
+			resumeEligible: (recorded.recoveryState ?? "resumable") === "resumable",
+			workspace,
+			startedAt: recorded.createdAt,
+			endedAt: null,
+			lastActivityAt: now,
+			statusChangedAt: now,
+			...(recorded.runtimeSessionId ? { runtimeSessionId: recorded.runtimeSessionId } : {}),
+			...(context
+				? {
+						originProjectPath: context.originProjectPath,
+						execution: context.execution,
+					}
+				: {}),
+		};
+	}
+
+	private async discardSession(sessionId: string, workspaceId: string): Promise<void> {
+		this.sessionManager.remove(sessionId);
+		await this.workspaceManager.remove(workspaceId);
+	}
+
 	// ========================================
 	// Abstract methods for subclasses to implement
 	// ========================================
@@ -269,6 +383,14 @@ export abstract class BaseExecutor {
 	protected abstract doStartRun(session: Session, options: RunOptions): Promise<void>;
 
 	/**
+	 * Register a durable runtime-native identity for lazy follow-up recovery.
+	 * Runtimes that do not explicitly support this keep the prior ended state.
+	 */
+	protected async doRecoverRun(_session: Session, _runtimeSessionId: string): Promise<boolean> {
+		return false;
+	}
+
+	/**
 	 * Implement runtime-specific input handling
 	 */
 	protected abstract doSendInput(session: Session, input: string): Promise<void>;
@@ -277,4 +399,16 @@ export abstract class BaseExecutor {
 	 * Implement runtime-specific stop logic
 	 */
 	protected abstract doStop(session: Session): Promise<void>;
+}
+
+export class ExecutorStartError extends Error {
+	constructor(
+		message: string,
+		readonly runId: string,
+		readonly sessionId: string,
+		options?: unknown,
+	) {
+		super(message, options !== undefined ? { cause: options } : undefined);
+		this.name = "ExecutorStartError";
+	}
 }

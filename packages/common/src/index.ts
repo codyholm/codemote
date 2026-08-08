@@ -149,11 +149,15 @@ export interface RunOptions {
 	model?: string;
 	temperature?: number;
 	maxTokens?: number;
+	projectStart?: import("./projectStart.js").ProjectStartRequest;
 }
 
 export interface RunResult {
 	runId: string;
 	sessionId: string;
+	operationId?: string;
+	originProjectPath?: string;
+	execution?: import("./projectStart.js").SessionExecutionState;
 }
 
 // Config types
@@ -176,3 +180,20 @@ export {
 	PROJECT_STATE_MAX_SESSIONS,
 	attentionForSession,
 } from "./projectState.js";
+
+export type {
+	GitCheckoutState,
+	GitWorktreeBase,
+	ManagedWorktreeExecutionState,
+	ManagedWorktreeStartRequest,
+	ProjectFolderExecutionState,
+	ProjectFolderStartPreparation,
+	ProjectFolderStartRequest,
+	ProjectStartFailureDetails,
+	ProjectStartPhase,
+	ProjectStartPreparation,
+	ProjectStartRequest,
+	ProjectStartState,
+	SessionExecutionState,
+	WorktreeStartState,
+} from "./projectStart.js";

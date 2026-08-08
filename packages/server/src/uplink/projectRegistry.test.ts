@@ -132,6 +132,20 @@ describe("ProjectRegistry", () => {
 		expectRegistryError(() => registry.remove(projectPath), "PROJECT_NOT_FOUND");
 	});
 
+	it("looks up only the exact normalized registered path", () => {
+		const registry = new ProjectRegistry(registryPath);
+		const projectPath = join(fixtureDir, "projects", "registered");
+		registry.add("Registered", projectPath);
+
+		expect(registry.get(`${projectPath}/./`)).toEqual({
+			name: "Registered",
+			path: resolve(projectPath),
+		});
+		expect(registry.get(dirname(projectPath))).toBeUndefined();
+		expect(registry.get(join(projectPath, "nested"))).toBeUndefined();
+		expectRegistryError(() => registry.get("relative/path"), "INVALID_PROJECT");
+	});
+
 	it("rejects a malformed persisted document in full", async () => {
 		await mkdir(dirname(registryPath), { recursive: true });
 		const projectPath = join(fixtureDir, "projects", "duplicate");

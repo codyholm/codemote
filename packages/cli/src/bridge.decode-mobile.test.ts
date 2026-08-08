@@ -95,4 +95,148 @@ describe("decodeMobileInbound", () => {
 			expect(asRecord(result)["maxTokens"]).toBeUndefined();
 		});
 	});
+
+	describe("project-folder starts", () => {
+		const base = {
+			type: "new_session",
+			runtime: "codex",
+			prompt: "test",
+			projectStart: {
+				operationId: "operation-1",
+				originProjectPath: "/tmp/project",
+				mode: "project_folder",
+				preparation: { type: "none" },
+			},
+		};
+
+		it("accepts strict no-branch and branch requests", () => {
+			expect(decodeMobileInbound(base)).toMatchObject({ projectStart: base.projectStart });
+			expect(
+				decodeMobileInbound({
+					...base,
+					projectStart: {
+						...base.projectStart,
+						preparation: {
+							type: "create_branch",
+							newBranch: "feature/session",
+							expectedHead: "abc123",
+							expectedBranch: null,
+						},
+					},
+				}),
+			).toMatchObject({
+				projectStart: {
+					preparation: {
+						type: "create_branch",
+						newBranch: "feature/session",
+						expectedHead: "abc123",
+						expectedBranch: null,
+					},
+				},
+			});
+		});
+
+		it("keeps project-aware starts fresh even when a legacy resume ID is supplied", () => {
+			const decoded = decodeMobileInbound({ ...base, resumeSessionId: "legacy-session" });
+			expect(decoded).not.toBeNull();
+			expect(asRecord(decoded)["resumeSessionId"]).toBeUndefined();
+		});
+
+		it("rejects malformed nested intent instead of downgrading it", () => {
+			const malformed: unknown[] = [
+				null,
+				{},
+				{ ...base.projectStart, operationId: "" },
+				{ ...base.projectStart, mode: "worktree" },
+				{ ...base.projectStart, preparation: { type: "none", newBranch: "feature/oops" } },
+				{
+					...base.projectStart,
+					preparation: {
+						type: "create_branch",
+						newBranch: "",
+						expectedHead: "abc123",
+						expectedBranch: "main",
+					},
+				},
+				{
+					...base.projectStart,
+					preparation: {
+						type: "create_branch",
+						newBranch: "feature/session",
+						expectedBranch: "main",
+					},
+				},
+			];
+
+			for (const projectStart of malformed) {
+				expect(decodeMobileInbound({ ...base, projectStart })).toBeNull();
+			}
+		});
+
+		it("decodes project start capability requests", () => {
+			expect(
+				decodeMobileInbound({
+					type: "get_project_start_state",
+					projectPath: "/tmp/project",
+				}),
+			).toEqual({
+				type: "get_project_start_state",
+				projectPath: "/tmp/project",
+			});
+			expect(decodeMobileInbound({ type: "get_project_start_state", projectPath: "" })).toBeNull();
+		});
+
+		it("accepts strict detached and attached Worktree requests", () => {
+			const worktree = {
+				operationId: "worktree-1",
+				originProjectPath: "/tmp/project",
+				mode: "worktree",
+				preparation: {
+					type: "create_worktree",
+					baseRef: "refs/remotes/origin/main",
+					expectedCommit: "a".repeat(40),
+					newBranch: null,
+				},
+			};
+			expect(decodeMobileInbound({ ...base, projectStart: worktree })).toMatchObject({
+				projectStart: worktree,
+			});
+			expect(
+				decodeMobileInbound({
+					...base,
+					projectStart: {
+						...worktree,
+						preparation: { ...worktree.preparation, newBranch: "feature/mobile" },
+					},
+				}),
+			).toMatchObject({
+				projectStart: { preparation: { newBranch: "feature/mobile" } },
+			});
+		});
+
+		it("rejects malformed Worktree fields", () => {
+			const preparation = {
+				type: "create_worktree",
+				baseRef: "refs/heads/main",
+				expectedCommit: "b".repeat(40),
+				newBranch: null,
+			};
+			const worktree = {
+				operationId: "worktree-1",
+				originProjectPath: "/tmp/project",
+				mode: "worktree",
+				preparation,
+			};
+			for (const projectStart of [
+				{ ...worktree, originProjectPath: "relative" },
+				{ ...worktree, preparation: { ...preparation, baseRef: "main" } },
+				{ ...worktree, preparation: { ...preparation, baseRef: "refs/remotes/origin/HEAD" } },
+				{ ...worktree, preparation: { ...preparation, expectedCommit: "short" } },
+				{ ...worktree, preparation: { ...preparation, newBranch: "" } },
+				{ ...worktree, preparation: { ...preparation, unexpected: true } },
+			]) {
+				expect(decodeMobileInbound({ ...base, projectStart })).toBeNull();
+			}
+		});
+	});
 });

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { simpleGit } from "simple-git";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { WorkspaceManager } from "./workspace";
+import { WorkspaceManager, WorkspaceRestoreConflictError } from "./workspace";
 
 describe("WorkspaceManager", () => {
 	let testDir: string;
@@ -65,5 +65,20 @@ describe("WorkspaceManager", () => {
 		expect(manager.get("to-remove")).toBeDefined();
 		await manager.remove("to-remove");
 		expect(manager.get("to-remove")).toBeUndefined();
+	});
+
+	it("restores a recorded workspace idempotently and refuses a conflicting directory", async () => {
+		const recorded = { id: "ws-recorded", workingDir: testDir, createdAt: 1000 };
+
+		const restored = manager.restore(recorded);
+		expect(restored).toEqual(recorded);
+		expect(manager.get("ws-recorded")?.workingDir).toBe(testDir);
+		expect(manager.restore({ ...recorded })).toBe(restored);
+		expect(manager.list()).toHaveLength(1);
+
+		expect(() =>
+			manager.restore({ ...recorded, workingDir: join(testDir, "elsewhere") }),
+		).toThrowError(WorkspaceRestoreConflictError);
+		expect(manager.get("ws-recorded")?.workingDir).toBe(testDir);
 	});
 });

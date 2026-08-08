@@ -99,6 +99,23 @@ export class OpenCodeExecutor extends BaseExecutor {
 		await this.runTurn(session, options.initialPrompt);
 	}
 
+	protected override async doRecoverRun(
+		session: Session,
+		runtimeSessionId: string,
+	): Promise<boolean> {
+		this.openCodeSessions.set(session.id, {
+			process: null,
+			running: false,
+			runtimeSessionId,
+			model: null,
+			temperature: null,
+			maxTokens: null,
+			seenToolCallIds: new Set(),
+			stderrBuffer: "",
+		});
+		return true;
+	}
+
 	protected async doSendInput(session: Session, input: string): Promise<void> {
 		const openCodeSession = this.openCodeSessions.get(session.id);
 		if (!openCodeSession) {

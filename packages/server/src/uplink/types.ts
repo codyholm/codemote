@@ -1,26 +1,42 @@
 import type {
+	GitWorktreeBase,
+	ManagedWorktreeExecutionState,
+	ManagedWorktreeStartRequest,
 	ModelInfo,
 	PendingAttention,
+	ProjectStartFailureDetails,
+	ProjectStartRequest,
+	ProjectStartState,
 	ProjectStateAggregate,
 	RegisteredProject,
 	RunOptions,
 	RunResult,
 	RuntimeType,
+	SessionExecutionState,
 	SessionStatus,
 	StreamEvent,
+	WorktreeStartState,
 } from "@codemote/common";
 
 // Re-export common types
 export type {
 	ModelInfo,
+	GitWorktreeBase,
+	ManagedWorktreeExecutionState,
+	ManagedWorktreeStartRequest,
 	PendingAttention,
+	ProjectStartFailureDetails,
+	ProjectStartRequest,
+	ProjectStartState,
 	ProjectStateAggregate,
 	RegisteredProject,
 	RunOptions,
 	RunResult,
 	RuntimeType,
+	SessionExecutionState,
 	SessionStatus,
 	StreamEvent,
+	WorktreeStartState,
 };
 
 /**
@@ -65,6 +81,8 @@ export interface Session {
 	runId: string;
 	/** Runtime-native session ID used for resume (e.g. Claude session_id) */
 	runtimeSessionId?: string;
+	/** Whether this session may use its runtime-native ID for another turn. */
+	resumeEligible?: boolean;
 	/** Which runtime this session uses */
 	runtime: RuntimeType;
 	/** Current status */
@@ -83,6 +101,45 @@ export interface Session {
 	 * terminal/idle transition. Explicitly `| undefined` so the clear can assign
 	 * rather than `delete`, which Biome's noDelete rule rejects. */
 	attention?: PendingAttention | undefined;
+	/** Registered project that originated this session. */
+	originProjectPath?: string;
+	/** Effective directory and Git state selected before runtime launch. */
+	execution?: SessionExecutionState;
+}
+
+/**
+ * The one Codemote session identity a Git-aware start operation owns, durable
+ * enough to restore discovery and replay a terminal result after a restart.
+ * Runtime output, prompts, approvals and process handles are deliberately absent.
+ */
+export interface DurableProjectSession {
+	sessionId: string;
+	runId: string;
+	workspaceId: string;
+	createdAt: number;
+	execution: SessionExecutionState;
+	runtimeSessionId?: string;
+	recoveryState?: DurableSessionRecoveryState;
+}
+
+export type DurableSessionRecoveryState = "resumable" | "ended" | "error";
+
+/**
+ * Durable boundaries the base executor crosses on behalf of a Git-aware start.
+ * `session` carries an already-recorded identity to reuse after a restart; both
+ * callbacks must persist before the executor may continue, so runtime-specific
+ * code can never run ahead of the phase that admits it might have run.
+ */
+export interface ProjectSessionLaunchControl {
+	session?: DurableProjectSession;
+	recordSession(session: Session): void;
+	recordRuntimeLaunchRequested(session: Session): void;
+}
+
+export interface SessionStartContext {
+	originProjectPath: string;
+	execution: SessionExecutionState;
+	launch?: ProjectSessionLaunchControl;
 }
 
 /**
@@ -126,6 +183,7 @@ export type UplinkCommand =
 	  } & RequestEnvelope)
 	| ({ type: "list_sessions" } & RequestEnvelope)
 	| ({ type: "get_project_state" } & RequestEnvelope)
+	| ({ type: "get_project_start_state"; payload: { projectPath: string } } & RequestEnvelope)
 	| ({ type: "add_project"; payload: { name: string; path: string } } & RequestEnvelope)
 	| ({ type: "list_projects" } & RequestEnvelope)
 	| ({ type: "rename_project"; payload: { path: string; name: string } } & RequestEnvelope)
@@ -157,6 +215,7 @@ export type UplinkResponse =
 	| ({ type: "git_pr_result"; payload: { sessionId: string; url: string } } & RequestEnvelope)
 	| ({ type: "sessions"; payload: Session[] } & RequestEnvelope)
 	| ({ type: "project_state"; payload: ProjectStateAggregate } & RequestEnvelope)
+	| ({ type: "project_start_state"; payload: ProjectStartState } & RequestEnvelope)
 	| ({
 			type: "project_registry_result";
 			payload: {
@@ -184,7 +243,10 @@ export type UplinkResponse =
 			type: "cache_refreshed";
 			payload: { availableRuntimes: RuntimeType[]; modelCounts: Record<string, number> };
 	  } & RequestEnvelope)
-	| ({ type: "error"; payload: { message: string; code: string } } & RequestEnvelope)
+	| ({
+			type: "error";
+			payload: { message: string; code: string; details?: ProjectStartFailureDetails };
+	  } & RequestEnvelope)
 	| ({ type: "event"; payload: StreamEvent } & RequestEnvelope);
 
 /**
@@ -231,6 +293,10 @@ export interface UplinkConfig {
 	repoPath: string;
 	/** Project registry file path override */
 	projectRegistryPath?: string;
+	/** Project-folder start operation journal path override */
+	projectStartJournalPath?: string;
+	/** Parent directory for machine-managed Git worktrees */
+	managedWorktreeRoot?: string;
 	/** Available runtime profiles */
 	runtimes: RuntimeType[];
 	/** Runtime-specific configurations */

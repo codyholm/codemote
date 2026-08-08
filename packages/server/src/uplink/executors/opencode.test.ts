@@ -27,6 +27,7 @@ describe.skipIf(platform() === "win32")("OpenCodeExecutor", () => {
 		await git.init(["--initial-branch=main"]);
 		await git.addConfig("user.email", "test@test.com");
 		await git.addConfig("user.name", "Test");
+		await git.addConfig("commit.gpgsign", "false");
 		await writeFile(join(testDir, "README.md"), "# Test");
 		await git.add(".");
 		await git.commit("Initial commit");
@@ -161,6 +162,35 @@ exit 0
 		const argsLog = await readFile(argsLogPath, "utf8");
 		expect(argsLog).toContain("run --format json initial-prompt");
 		expect(argsLog).toContain("run --format json --session ses_mock_123 follow-up-prompt");
+	});
+
+	it("recovers a durable session lazily and reuses its exact runtime id", async () => {
+		activeExecutor = new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
+			opencodePath: mockOpenCodePath,
+		});
+		const execution = { directory: testDir, mode: "project_folder" as const, git: null };
+		const recovered = await activeExecutor.recoverRun(
+			{
+				sessionId: "opencode-recovered",
+				runId: "opencode-run",
+				workspaceId: "opencode-workspace",
+				createdAt: 1,
+				execution,
+				runtimeSessionId: "ses_recovered_456",
+				recoveryState: "resumable",
+			},
+			{ originProjectPath: testDir, execution },
+		);
+		activeSessionId = "opencode-recovered";
+
+		expect(recovered).toBe(true);
+		expect(sessionManager.get(activeSessionId)).toMatchObject({ status: "idle" });
+		await expect(readFile(argsLogPath, "utf8")).rejects.toBeDefined();
+
+		await activeExecutor.sendInput(activeSessionId, "recovered-follow-up");
+		expect(await readFile(argsLogPath, "utf8")).toContain(
+			"run --format json --session ses_recovered_456 recovered-follow-up",
+		);
 	});
 
 	it("passes --model when model is provided and preserves it across turns", async () => {
