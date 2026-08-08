@@ -1,6 +1,6 @@
 import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import {
 	type ModelInfo,
 	type ProjectStartFailureDetails,
@@ -9,6 +9,11 @@ import {
 	type StreamEvent,
 } from "@codemote/common";
 import { WebSocket, WebSocketServer } from "ws";
+import {
+	buildDirectoryNavigationMetadata,
+	directoryEntryPath,
+	resolveDirectoryPaths,
+} from "./directory-navigation.js";
 import { EventBus } from "./events.js";
 import type { BaseExecutor } from "./executor.js";
 import {
@@ -493,9 +498,23 @@ export class UplinkServer {
 
 			case "list_directory": {
 				const requestedPath = command.payload.path?.trim() || process.cwd();
-				const resolvedPath = resolve(requestedPath);
-				const entries = await this.listDirectory(resolvedPath);
-				return { type: "directory_listing", payload: { path: resolvedPath, entries } };
+				const resolved = resolveDirectoryPaths({
+					requestedPath,
+					cwd: process.cwd(),
+					homePath: homedir(),
+				});
+				const entries = await this.listDirectory(resolved.path);
+				const navigation = await buildDirectoryNavigationMetadata(resolved.path, resolved.homePath);
+				return {
+					type: "directory_listing",
+					payload: {
+						path: resolved.path,
+						parentPath: navigation.parentPath,
+						homePath: resolved.homePath,
+						roots: navigation.roots,
+						entries,
+					},
+				};
 			}
 
 			case "refresh_cache": {
@@ -525,7 +544,7 @@ export class UplinkServer {
 			candidates,
 			UplinkServer.LIST_DIRECTORY_STAT_CONCURRENCY,
 			async (d): Promise<DirectoryEntry | null> => {
-				const fullPath = join(dirPath, d.name);
+				const fullPath = directoryEntryPath(dirPath, d.name);
 
 				// For symlinks, verify the target is actually a directory
 				if (d.isSymbolicLink()) {
@@ -544,7 +563,7 @@ export class UplinkServer {
 				} catch {
 					// not a git repo
 				}
-				return { name: d.name, isDirectory: true, isGitRepo };
+				return { name: d.name, path: fullPath, isDirectory: true, isGitRepo };
 			},
 		);
 

@@ -1177,6 +1177,130 @@ describe("RelayUplinkBridge", () => {
 		}
 	}, 20_000);
 
+	it("forwards Windows directory navigation metadata without interpreting paths", async () => {
+		let relayUplinkSocket: WebSocket | null = null;
+		let relayMobileSocket: WebSocket | null = null;
+		const listing = {
+			path: "C:\\Users\\Tester",
+			parentPath: "C:\\Users",
+			homePath: "C:\\Users\\Tester",
+			roots: [
+				{ name: "C:", path: "C:\\" },
+				{ name: "D:", path: "D:\\" },
+				{ name: "\\\\server\\share", path: "\\\\server\\share\\" },
+			],
+			entries: [
+				{
+					name: "source",
+					path: "C:\\Users\\Tester\\source",
+					isDirectory: true,
+					isGitRepo: true,
+				},
+			],
+		};
+
+		uplinkWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const command = JSON.parse(raw.toString()) as JsonRecord;
+				const type = command["type"];
+
+				if (type === "list_sessions") {
+					socket.send(JSON.stringify({ type: "sessions", payload: [] }));
+					return;
+				}
+
+				if (type === "list_directory") {
+					socket.send(JSON.stringify({ type: "directory_listing", payload: listing }));
+				}
+			});
+		});
+
+		relayWss.on("connection", (socket) => {
+			socket.on("message", (raw) => {
+				const message = JSON.parse(raw.toString()) as JsonRecord;
+				const type = message["type"];
+
+				if (type === "register") {
+					relayUplinkSocket = socket;
+					socket.send(JSON.stringify({ type: "registered", pairingCode: "223344" }));
+					return;
+				}
+
+				if (type === "pair") {
+					relayMobileSocket = socket;
+					socket.send(JSON.stringify({ type: "paired", uplinkDeviceId: "uplink-test-windows" }));
+					relayUplinkSocket?.send(
+						JSON.stringify({
+							type: "paired",
+							mobileDeviceId: "mobile-test-windows",
+						}),
+					);
+					return;
+				}
+
+				if (type !== "message") return;
+				if (socket === relayMobileSocket) {
+					relayUplinkSocket?.send(raw.toString());
+				} else if (socket === relayUplinkSocket) {
+					relayMobileSocket?.send(raw.toString());
+				}
+			});
+		});
+
+		const bridge = await startRelayUplinkBridge({
+			relayUrl: `ws://127.0.0.1:${relayPort}`,
+			uplinkUrl: `ws://127.0.0.1:${uplinkPort}`,
+			repoPath: tempRepoDir,
+		});
+
+		let mobileSocket: WebSocket | null = null;
+		try {
+			mobileSocket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+			await waitForOpen(mobileSocket);
+
+			const payloads: JsonRecord[] = [];
+			mobileSocket.on("message", (raw) => {
+				const envelope = JSON.parse(raw.toString()) as JsonRecord;
+				if (envelope["type"] !== "message") return;
+				const payload = envelope["payload"] as JsonRecord | undefined;
+				if (payload) payloads.push(payload);
+			});
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "pair",
+					deviceId: "mobile-test-windows",
+					pin: bridge.pairingCode,
+					deviceType: "mobile",
+				}),
+			);
+
+			await waitForCondition(
+				() => payloads.some((payload) => payload["type"] === "session_list"),
+				8000,
+			);
+
+			mobileSocket.send(
+				JSON.stringify({
+					type: "message",
+					payload: { type: "list_directory", path: "C:\\Users\\Tester" },
+				}),
+			);
+
+			await waitForCondition(
+				() => payloads.some((payload) => payload["type"] === "directory_listing"),
+				8000,
+			);
+			const forwarded = payloads.find((payload) => payload["type"] === "directory_listing");
+			expect(forwarded).toEqual({ type: "directory_listing", ...listing });
+		} finally {
+			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+				mobileSocket.close();
+			}
+			await bridge.stop();
+		}
+	}, 20_000);
+
 	it("returns explicit directory_listing error payload when list_directory fails", async () => {
 		let relayUplinkSocket: WebSocket | null = null;
 		let relayMobileSocket: WebSocket | null = null;

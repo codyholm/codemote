@@ -303,7 +303,10 @@ interface ListDirectoryMessage {
 interface DirectoryListingMessage {
 	type: "directory_listing";
 	path: string;
-	entries: Array<{ name: string; isDirectory: boolean; isGitRepo: boolean }>;
+	parentPath?: string | null;
+	homePath?: string;
+	roots?: Array<{ name: string; path: string }>;
+	entries: Array<{ name: string; path: string; isDirectory: boolean; isGitRepo: boolean }>;
 	error?: string;
 }
 
@@ -2033,6 +2036,9 @@ export async function startRelayUplinkBridge(
 			sendToMobile({
 				type: "directory_listing",
 				path: response.payload.path,
+				parentPath: response.payload.parentPath,
+				homePath: response.payload.homePath,
+				roots: response.payload.roots,
 				entries: response.payload.entries,
 			});
 		} catch (error) {

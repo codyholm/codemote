@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
@@ -101,9 +101,20 @@ describe("UplinkServer list_directory", () => {
 			expect(msg["type"]).toBe("directory_listing");
 			const payload = msg["payload"] as {
 				path: string;
-				entries: Array<{ name: string; isDirectory: boolean; isGitRepo: boolean }>;
+				parentPath: string | null;
+				homePath: string;
+				roots: Array<{ name: string; path: string }>;
+				entries: Array<{
+					name: string;
+					path: string;
+					isDirectory: boolean;
+					isGitRepo: boolean;
+				}>;
 			};
 			expect(payload.path).toBe(tempDir);
+			expect(payload.parentPath).toBe(join(tempDir, ".."));
+			expect(payload.homePath).toBe(homedir());
+			expect(payload.roots).toEqual([{ name: "/", path: "/" }]);
 
 			// Hidden dir should be excluded
 			const names = payload.entries.map((e) => e.name);
@@ -121,6 +132,7 @@ describe("UplinkServer list_directory", () => {
 				throw new Error("directory listing returned no entries");
 			}
 			expect(firstEntry.name).toBe("my-git-project");
+			expect(firstEntry.path).toBe(join(tempDir, "my-git-project"));
 			expect(firstEntry.isGitRepo).toBe(true);
 			expect(firstEntry.isDirectory).toBe(true);
 
@@ -141,10 +153,15 @@ describe("UplinkServer list_directory", () => {
 			const msg = await msgPromise;
 
 			expect(msg["type"]).toBe("directory_listing");
-			const payload = msg["payload"] as { path: string; entries: unknown[] };
+			const payload = msg["payload"] as {
+				path: string;
+				homePath: string;
+				entries: unknown[];
+			};
 
 			// Should resolve to process.cwd() (server WorkingDirectory)
 			expect(payload.path).toBe(process.cwd());
+			expect(payload.homePath).toBe(homedir());
 			expect(Array.isArray(payload.entries)).toBe(true);
 		} finally {
 			ws.close();
