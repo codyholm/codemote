@@ -6,6 +6,35 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 describe("decodeMobileInbound", () => {
+	describe("list_directory correlation", () => {
+		it("preserves an opaque mobile request ID", () => {
+			expect(
+				decodeMobileInbound({
+					type: "list_directory",
+					path: " C:\\Users\\Tester ",
+					requestId: " mobile-directory-1 ",
+				}),
+			).toEqual({
+				type: "list_directory",
+				path: "C:\\Users\\Tester",
+				requestId: " mobile-directory-1 ",
+			});
+		});
+
+		it("rejects malformed mobile request IDs while accepting legacy requests", () => {
+			expect(decodeMobileInbound({ type: "list_directory", path: "/tmp" })).toEqual({
+				type: "list_directory",
+				path: "/tmp",
+			});
+			expect(
+				decodeMobileInbound({ type: "list_directory", path: "/tmp", requestId: "" }),
+			).toBeNull();
+			expect(
+				decodeMobileInbound({ type: "list_directory", path: "/tmp", requestId: 42 }),
+			).toBeNull();
+		});
+	});
+
 	describe("new_session temperature validation", () => {
 		const base = { type: "new_session", runtime: "claude", prompt: "test" };
 

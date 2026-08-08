@@ -298,10 +298,12 @@ interface GetDiffMessage {
 interface ListDirectoryMessage {
 	type: "list_directory";
 	path?: string;
+	requestId?: string;
 }
 
 interface DirectoryListingMessage {
 	type: "directory_listing";
+	requestId?: string;
 	path: string;
 	parentPath?: string | null;
 	homePath?: string;
@@ -2035,6 +2037,7 @@ export async function startRelayUplinkBridge(
 
 			sendToMobile({
 				type: "directory_listing",
+				...(message.requestId === undefined ? {} : { requestId: message.requestId }),
 				path: response.payload.path,
 				parentPath: response.payload.parentPath,
 				homePath: response.payload.homePath,
@@ -2046,6 +2049,7 @@ export async function startRelayUplinkBridge(
 			log?.(`[Bridge] Failed to list directory: ${reason}`);
 			sendToMobile({
 				type: "directory_listing",
+				...(message.requestId === undefined ? {} : { requestId: message.requestId }),
 				path: message.path ?? "",
 				entries: [],
 				error: reason,
@@ -2782,9 +2786,19 @@ export function decodeMobileInbound(payload: unknown): MobileInboundMessage | nu
 
 	if (type === "list_directory") {
 		const path = (payload as { path?: unknown }).path;
+		const requestId = (payload as { requestId?: unknown }).requestId;
+		if (
+			requestId !== undefined &&
+			(typeof requestId !== "string" || requestId.trim().length === 0)
+		) {
+			return null;
+		}
 		const msg: ListDirectoryMessage = { type: "list_directory" };
 		if (typeof path === "string" && path.trim().length > 0) {
 			msg.path = path.trim();
+		}
+		if (typeof requestId === "string") {
+			msg.requestId = requestId;
 		}
 		return msg;
 	}

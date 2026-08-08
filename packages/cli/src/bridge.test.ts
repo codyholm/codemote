@@ -1180,6 +1180,8 @@ describe("RelayUplinkBridge", () => {
 	it("forwards Windows directory navigation metadata without interpreting paths", async () => {
 		let relayUplinkSocket: WebSocket | null = null;
 		let relayMobileSocket: WebSocket | null = null;
+		let uplinkRequestId: string | undefined;
+		const mobileRequestId = "mobile-directory-windows";
 		const listing = {
 			path: "C:\\Users\\Tester",
 			parentPath: "C:\\Users",
@@ -1210,7 +1212,14 @@ describe("RelayUplinkBridge", () => {
 				}
 
 				if (type === "list_directory") {
-					socket.send(JSON.stringify({ type: "directory_listing", payload: listing }));
+					uplinkRequestId = command["requestId"] as string | undefined;
+					socket.send(
+						JSON.stringify({
+							type: "directory_listing",
+							requestId: uplinkRequestId,
+							payload: listing,
+						}),
+					);
 				}
 			});
 		});
@@ -1283,7 +1292,11 @@ describe("RelayUplinkBridge", () => {
 			mobileSocket.send(
 				JSON.stringify({
 					type: "message",
-					payload: { type: "list_directory", path: "C:\\Users\\Tester" },
+					payload: {
+						type: "list_directory",
+						path: "C:\\Users\\Tester",
+						requestId: mobileRequestId,
+					},
 				}),
 			);
 
@@ -1292,7 +1305,13 @@ describe("RelayUplinkBridge", () => {
 				8000,
 			);
 			const forwarded = payloads.find((payload) => payload["type"] === "directory_listing");
-			expect(forwarded).toEqual({ type: "directory_listing", ...listing });
+			expect(uplinkRequestId).toBeTypeOf("string");
+			expect(uplinkRequestId).not.toBe(mobileRequestId);
+			expect(forwarded).toEqual({
+				type: "directory_listing",
+				requestId: mobileRequestId,
+				...listing,
+			});
 		} finally {
 			if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
 				mobileSocket.close();
@@ -1304,6 +1323,7 @@ describe("RelayUplinkBridge", () => {
 	it("returns explicit directory_listing error payload when list_directory fails", async () => {
 		let relayUplinkSocket: WebSocket | null = null;
 		let relayMobileSocket: WebSocket | null = null;
+		const mobileRequestId = "mobile-directory-error";
 
 		uplinkWss.on("connection", (socket) => {
 			socket.on("message", (raw) => {
@@ -1319,6 +1339,7 @@ describe("RelayUplinkBridge", () => {
 					socket.send(
 						JSON.stringify({
 							type: "error",
+							requestId: command["requestId"],
 							payload: { message: "EACCES: permission denied, scandir '/root'" },
 						}),
 					);
@@ -1395,7 +1416,11 @@ describe("RelayUplinkBridge", () => {
 			mobileSocket.send(
 				JSON.stringify({
 					type: "message",
-					payload: { type: "list_directory", path: "/root" },
+					payload: {
+						type: "list_directory",
+						path: "/root",
+						requestId: mobileRequestId,
+					},
 				}),
 			);
 
@@ -1405,6 +1430,7 @@ describe("RelayUplinkBridge", () => {
 						(payload) =>
 							payload["type"] === "directory_listing" &&
 							payload["path"] === "/root" &&
+							payload["requestId"] === mobileRequestId &&
 							payload["error"] === "EACCES: permission denied, scandir '/root'",
 					),
 				8000,
