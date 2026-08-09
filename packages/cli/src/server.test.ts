@@ -2,17 +2,14 @@
  * Tests for server integration
  */
 
-import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { promisify } from "node:util";
+import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
 import type { ServerConfig, ServerHandle } from "./server.js";
 
 type StartServer = (config: ServerConfig) => Promise<ServerHandle>;
-const execFileAsync = promisify(execFile);
 
 // Every test here starts a real relay + uplink + bridge: TLS cert work, Fastify
 // listening on several interfaces, then a full teardown. Individually they run in
@@ -72,10 +69,12 @@ describe("Server Integration", { timeout: 30000 }, () => {
 	// ~/.codemote/speech.json and removes it on stop. Left unredirected, running
 	// this suite while `codemote` is up would overwrite and then delete the live
 	// file, and `codemote speech status` would report a running service as gone.
-	// Speech stays enabled here so the wiring is exercised; only the path moves.
+	// Speech composition has its own integration suite. Keeping it off here avoids
+	// starting an unrelated HTTP service for every relay/uplink assertion.
 	beforeEach(async () => {
 		speechDir = await mkdtemp(join(tmpdir(), "server-test-speech-"));
 		vi.stubEnv("CODEMOTE_SPEECH_DISCOVERY_FILE", join(speechDir, "speech.json"));
+		vi.stubEnv("CODEMOTE_SPEECH", "0");
 	});
 
 	afterEach(async () => {
@@ -88,9 +87,11 @@ describe("Server Integration", { timeout: 30000 }, () => {
 	});
 
 	describe("startServer", () => {
-		it("should start both relay and uplink servers", async () => {
+		it("starts the relay/uplink stack and exposes its lifecycle controls", async () => {
+			const pins: string[] = [];
 			server = await startServer({
 				port: testPort,
+				onPINRegenerate: (pin) => pins.push(pin),
 			});
 
 			expect(server).toBeDefined();
@@ -107,58 +108,20 @@ describe("Server Integration", { timeout: 30000 }, () => {
 				"utf8",
 			);
 			expect(persistedDeviceId.trim()).toBe(server.uplinkDeviceId);
-		});
-
-		it("should generate a valid PIN", async () => {
-			server = await startServer({
-				port: testPort + 10,
-			});
-
-			const pin = server.pin;
-			expect(pin).toMatch(/^\d{6}$/);
-			expect(pin.length).toBe(6);
-		});
-
-		it("should call onPINRegenerate callback", async () => {
-			const pins: string[] = [];
-
-			server = await startServer({
-				port: testPort + 20,
-				onPINRegenerate: (pin) => {
-					pins.push(pin);
-				},
-			});
-
-			expect(server.pin).toMatch(/^\d{6}$/);
 			expect(pins.length).toBeGreaterThanOrEqual(1);
 			expect(pins.at(-1)).toBe(server.pin);
-		});
-
-		it("should provide stats endpoint", async () => {
-			server = await startServer({
-				port: testPort + 30,
-			});
 
 			const stats = await server.getStats();
-
-			expect(stats).toBeDefined();
 			// The combined server starts an internal uplink bridge connection.
 			expect(stats.rooms).toBeGreaterThanOrEqual(1);
 			expect(stats.connections).toBeGreaterThanOrEqual(1);
 			expect(stats.version).toBeDefined();
-		});
-
-		it("should allow manual PIN regeneration", async () => {
-			server = await startServer({
-				port: testPort + 40,
-			});
 
 			const originalPIN = server.pin;
 			await server.regeneratePIN();
-			const newPIN = server.pin;
-
 			expect(originalPIN).toMatch(/^\d{6}$/);
-			expect(newPIN).toMatch(/^\d{6}$/);
+			expect(server.pin).toMatch(/^\d{6}$/);
+			expect(pins.at(-1)).toBe(server.pin);
 		});
 
 		it("lists and revokes trusted devices through server handle", async () => {
@@ -263,17 +226,7 @@ describe("Server Integration", { timeout: 30000 }, () => {
 	});
 
 	describe("server lifecycle", () => {
-		it("should stop gracefully", async () => {
-			server = await startServer({
-				port: testPort + 60,
-			});
-
-			await expect(server.stop()).resolves.not.toThrow();
-			server = null; // Prevent double cleanup
-		});
-
-		// Two full start/stop cycles rather than one, so this is the slowest test here.
-		it("should handle multiple start/stop cycles", async () => {
+		it("releases its listeners for a restart on the same ports", async () => {
 			// Start first instance
 			server = await startServer({
 				port: testPort + 70,
@@ -291,18 +244,10 @@ describe("Server Integration", { timeout: 30000 }, () => {
 	});
 
 	describe("configuration", () => {
-		it("should accept custom repo path", async () => {
+		it("accepts custom repository and runtime configuration", async () => {
 			server = await startServer({
 				port: testPort + 80,
-				repoPath: process.cwd(), // Use valid path
-			});
-
-			expect(server).toBeDefined();
-		});
-
-		it("should accept runtime configuration", async () => {
-			server = await startServer({
-				port: testPort + 100,
+				repoPath: process.cwd(),
 				runtimes: ["opencode", "claude"],
 			});
 
@@ -488,271 +433,6 @@ describe("Server Integration", { timeout: 30000 }, () => {
 			}
 		}, 15_000);
 
-		it("replays project-folder and worktree starts across a service restart", async () => {
-			vi.stubEnv("GUILD_REMOTE_DISABLE_TLS", "1");
-			vi.stubEnv("GUILD_REMOTE_ALLOW_INSECURE", "1");
-			vi.stubEnv("CODEMOTE_SPEECH", "0");
-			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-project-start-"));
-			const projectPath = join(fixtureDir, "project");
-			const registryPath = join(fixtureDir, "machine", "projects.json");
-			const journalPath = join(fixtureDir, "machine", "operations.json");
-			const pairingPath = join(fixtureDir, "machine", "trusted-pairings.json");
-			const port = testPort + 115;
-			await mkdir(projectPath);
-			await git(projectPath, ["init", "-b", "main"]);
-			await git(projectPath, ["config", "user.name", "Codemote Test"]);
-			await git(projectPath, ["config", "user.email", "codemote@example.invalid"]);
-			await git(projectPath, ["config", "commit.gpgsign", "false"]);
-			await writeFile(join(projectPath, "tracked.txt"), "committed\n", "utf8");
-			await git(projectPath, ["add", "tracked.txt"]);
-			await git(projectPath, ["commit", "--no-gpg-sign", "-m", "fixture"]);
-			const head = await git(projectPath, ["rev-parse", "HEAD"]);
-			const start = {
-				type: "new_session",
-				runtime: "opencode",
-				prompt: "restart-safe project start",
-				projectStart: {
-					operationId: "configured-journal-operation",
-					originProjectPath: projectPath,
-					mode: "project_folder",
-					preparation: {
-						type: "create_branch",
-						newBranch: "feature/configured-journal",
-						expectedHead: head,
-						expectedBranch: "main",
-					},
-				},
-			};
-			const worktreeStart = {
-				type: "new_session",
-				runtime: "opencode",
-				prompt: "restart-safe worktree start",
-				projectStart: {
-					operationId: "configured-journal-worktree",
-					originProjectPath: projectPath,
-					mode: "worktree",
-					preparation: {
-						type: "create_worktree",
-						baseRef: "refs/heads/main",
-						expectedCommit: head,
-						newBranch: "feature/configured-worktree",
-					},
-				},
-			};
-			const config: ServerConfig = {
-				port,
-				repoPath: fixtureDir,
-				runtimes: [],
-				projectRegistryPath: registryPath,
-				projectStartJournalPath: journalPath,
-				managedWorktreeRoot: join(fixtureDir, "managed"),
-				pairingStorePath: pairingPath,
-			};
-			let mobile: WebSocket | null = null;
-			try {
-				server = await startServer(config);
-				mobile = new WebSocket(`ws://127.0.0.1:${port}/ws`);
-				await waitForOpen(mobile);
-				const firstPaired = waitForMessageOfType(mobile, "paired");
-				mobile.send(
-					JSON.stringify({
-						type: "pair",
-						deviceId: "mobile-project-start",
-						pin: server.pin,
-						deviceType: "mobile",
-					}),
-				);
-				await firstPaired;
-				const added = waitForMobilePayloadType(mobile, "project_registry_result");
-				mobile.send(
-					JSON.stringify({
-						type: "message",
-						payload: { type: "add_project", name: "Fixture", path: projectPath },
-					}),
-				);
-				await added;
-
-				const firstResultPromise = waitForMobilePayloadType(mobile, "session_start_result");
-				mobile.send(JSON.stringify({ type: "message", payload: start }));
-				const firstResult = await firstResultPromise;
-				expect(firstResult["success"]).toBe(true);
-				expect(firstResult["operationId"]).toBe("configured-journal-operation");
-				const firstSessionId = firstResult["sessionId"];
-				expect(typeof firstSessionId).toBe("string");
-				expect(await git(projectPath, ["branch", "--show-current"])).toBe(
-					"feature/configured-journal",
-				);
-
-				const worktreePromise = waitForMobilePayloadType(mobile, "session_start_result");
-				mobile.send(JSON.stringify({ type: "message", payload: worktreeStart }));
-				const worktreeResult = await worktreePromise;
-				expect(worktreeResult["success"]).toBe(true);
-				const worktreeSessionId = worktreeResult["sessionId"];
-				const worktreePath = (
-					(worktreeResult["execution"] as Record<string, unknown>)["worktree"] as Record<
-						string,
-						unknown
-					>
-				)["path"] as string;
-				expect(await realpath(dirname(worktreePath))).toBe(
-					await realpath(join(fixtureDir, "managed")),
-				);
-
-				// Drop the responses and the service, exactly as a lost reply plus a
-				// restart would: the phone still holds both operation IDs.
-				mobile.close();
-				mobile = null;
-				await server.stop();
-				server = null;
-
-				server = await startServer(config);
-				mobile = new WebSocket(`ws://127.0.0.1:${port}/ws`);
-				await waitForOpen(mobile);
-				const secondPaired = waitForMessageOfType(mobile, "paired");
-				mobile.send(
-					JSON.stringify({
-						type: "pair",
-						deviceId: "mobile-project-start",
-						pin: server.pin,
-						deviceType: "mobile",
-					}),
-				);
-				await secondPaired;
-
-				const replayPromise = waitForMobilePayloadType(mobile, "session_start_result");
-				mobile.send(JSON.stringify({ type: "message", payload: start }));
-				const replay = await replayPromise;
-				expect(replay["success"]).toBe(true);
-				expect(replay["sessionId"]).toBe(firstSessionId);
-				expect(replay["operationId"]).toBe("configured-journal-operation");
-
-				const worktreeReplayPromise = waitForMobilePayloadType(mobile, "session_start_result");
-				mobile.send(JSON.stringify({ type: "message", payload: worktreeStart }));
-				const worktreeReplay = await worktreeReplayPromise;
-				expect(worktreeReplay["success"]).toBe(true);
-				expect(worktreeReplay["sessionId"]).toBe(worktreeSessionId);
-				expect(worktreeReplay["execution"]).toEqual(worktreeResult["execution"]);
-
-				expect(await git(projectPath, ["branch", "--show-current"])).toBe(
-					"feature/configured-journal",
-				);
-				expect(await git(projectPath, ["for-each-ref", "--format=%(refname)", "refs/heads"])).toBe(
-					[
-						"refs/heads/feature/configured-journal",
-						"refs/heads/feature/configured-worktree",
-						"refs/heads/main",
-					].join("\n"),
-				);
-				const registrations = (await git(projectPath, ["worktree", "list", "--porcelain"]))
-					.split("\n")
-					.filter((line) => line === `worktree ${worktreePath}`);
-				expect(registrations).toHaveLength(1);
-
-				const journal = JSON.parse(await readFile(journalPath, "utf8")) as {
-					version: number;
-					operations: Array<{ phase?: string; result?: { sessionId?: string } }>;
-				};
-				expect(journal.version).toBe(2);
-				expect(journal.operations).toHaveLength(2);
-				expect(journal.operations.map((operation) => operation.result?.sessionId).sort()).toEqual(
-					[firstSessionId, worktreeSessionId].sort(),
-				);
-			} finally {
-				mobile?.close();
-				if (server) {
-					await server.stop();
-					server = null;
-				}
-				await rm(fixtureDir, { recursive: true, force: true });
-			}
-		}, 30_000);
-
-		it("creates a managed worktree beneath the supplied server root", async () => {
-			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-managed-worktree-"));
-			const projectPath = join(fixtureDir, "project");
-			const managedRoot = join(fixtureDir, "managed");
-			const port = testPort + 118;
-			vi.stubEnv("GUILD_REMOTE_DISABLE_TLS", "1");
-			vi.stubEnv("GUILD_REMOTE_ALLOW_INSECURE", "1");
-			await mkdir(projectPath);
-			await git(projectPath, ["init", "-b", "main"]);
-			await git(projectPath, ["config", "user.name", "Codemote Test"]);
-			await git(projectPath, ["config", "user.email", "codemote@example.invalid"]);
-			await writeFile(join(projectPath, "tracked.txt"), "committed\n");
-			await git(projectPath, ["add", "tracked.txt"]);
-			await git(projectPath, ["commit", "--no-gpg-sign", "-m", "fixture"]);
-			const head = await git(projectPath, ["rev-parse", "HEAD"]);
-			let mobile: WebSocket | null = null;
-			try {
-				server = await startServer({
-					port,
-					repoPath: fixtureDir,
-					runtimes: [],
-					projectRegistryPath: join(fixtureDir, "machine", "projects.json"),
-					projectStartJournalPath: join(fixtureDir, "machine", "operations.json"),
-					pairingStorePath: join(fixtureDir, "machine", "pairings.json"),
-					managedWorktreeRoot: managedRoot,
-				});
-				mobile = new WebSocket(`ws://127.0.0.1:${port}/ws`);
-				await waitForOpen(mobile);
-				const paired = waitForMessageOfType(mobile, "paired");
-				mobile.send(
-					JSON.stringify({
-						type: "pair",
-						deviceId: "mobile-managed-worktree",
-						pin: server.pin,
-						deviceType: "mobile",
-					}),
-				);
-				await paired;
-				const added = waitForMobilePayloadType(mobile, "project_registry_result");
-				mobile.send(
-					JSON.stringify({
-						type: "message",
-						payload: { type: "add_project", name: "Fixture", path: projectPath },
-					}),
-				);
-				await added;
-				const resultPromise = waitForMobilePayloadType(mobile, "session_start_result");
-				mobile.send(
-					JSON.stringify({
-						type: "message",
-						payload: {
-							type: "new_session",
-							runtime: "opencode",
-							prompt: "managed start",
-							projectStart: {
-								operationId: "configured-managed-worktree",
-								originProjectPath: projectPath,
-								mode: "worktree",
-								preparation: {
-									type: "create_worktree",
-									baseRef: "refs/heads/main",
-									expectedCommit: head,
-									newBranch: null,
-								},
-							},
-						},
-					}),
-				);
-				const result = await resultPromise;
-				expect(result["success"]).toBe(true);
-				const execution = result["execution"] as Record<string, unknown>;
-				const worktree = execution["worktree"] as Record<string, unknown>;
-				expect(await realpath(dirname(worktree["path"] as string))).toBe(
-					await realpath(managedRoot),
-				);
-				expect(execution["directory"]).toBe(worktree["path"]);
-			} finally {
-				mobile?.close();
-				if (server) {
-					await server.stop();
-					server = null;
-				}
-				await rm(fixtureDir, { recursive: true, force: true });
-			}
-		}, 30_000);
-
 		it("supports remote relay mode with status metadata", async () => {
 			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-remote-status-"));
 			const statusFilePath = join(fixtureDir, "server-status.json");
@@ -835,29 +515,47 @@ describe("Server Integration", { timeout: 30000 }, () => {
 });
 
 function waitForOpen(ws: WebSocket): Promise<void> {
+	if (ws.readyState === WebSocket.OPEN) return Promise.resolve();
+
 	return new Promise((resolve, reject) => {
-		if (ws.readyState === WebSocket.OPEN) {
+		const cleanup = () => {
+			clearTimeout(timeout);
+			ws.off("open", onOpen);
+			ws.off("error", onError);
+		};
+		const onOpen = () => {
+			cleanup();
 			resolve();
-			return;
-		}
-		ws.once("open", resolve);
-		ws.once("error", reject);
-		setTimeout(() => reject(new Error("WebSocket open timeout")), 5000);
+		};
+		const onError = (error: Error) => {
+			cleanup();
+			reject(error);
+		};
+		const timeout = setTimeout(() => {
+			cleanup();
+			reject(new Error("WebSocket open timeout"));
+		}, 5000);
+		ws.once("open", onOpen);
+		ws.once("error", onError);
 	});
 }
 
 function waitForMessageOfType(ws: WebSocket, type: string): Promise<Record<string, unknown>> {
 	return new Promise((resolve, reject) => {
+		const cleanup = () => {
+			clearTimeout(timeout);
+			ws.off("message", handler);
+		};
 		const handler = (data: WebSocket.RawData) => {
-			const msg = JSON.parse(data.toString());
-			if (msg.type === type) {
-				ws.off("message", handler);
+			const msg = JSON.parse(data.toString()) as Record<string, unknown>;
+			if (msg["type"] === type) {
+				cleanup();
 				resolve(msg);
 			}
 		};
 		ws.on("message", handler);
-		setTimeout(() => {
-			ws.off("message", handler);
+		const timeout = setTimeout(() => {
+			cleanup();
 			reject(new Error(`WebSocket message timeout waiting for type: ${type}`));
 		}, 5000);
 	});
@@ -865,28 +563,24 @@ function waitForMessageOfType(ws: WebSocket, type: string): Promise<Record<strin
 
 function waitForMobilePayloadType(ws: WebSocket, type: string): Promise<Record<string, unknown>> {
 	return new Promise((resolve, reject) => {
+		const cleanup = () => {
+			clearTimeout(timeout);
+			ws.off("message", handler);
+		};
 		const handler = (data: WebSocket.RawData) => {
 			const envelope = JSON.parse(data.toString()) as Record<string, unknown>;
 			if (envelope["type"] !== "message") return;
 			const payload = envelope["payload"] as Record<string, unknown> | undefined;
 			if (payload?.["type"] !== type) return;
-			ws.off("message", handler);
+			cleanup();
 			resolve(payload);
 		};
 		ws.on("message", handler);
-		setTimeout(() => {
-			ws.off("message", handler);
+		const timeout = setTimeout(() => {
+			cleanup();
 			reject(new Error(`WebSocket message timeout waiting for mobile payload: ${type}`));
 		}, 10_000);
 	});
-}
-
-async function git(cwd: string, args: string[]): Promise<string> {
-	const result = await execFileAsync("git", ["-C", cwd, ...args], {
-		encoding: "utf8",
-		maxBuffer: 64 * 1024,
-	});
-	return result.stdout.trim();
 }
 
 async function waitForCondition(

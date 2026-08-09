@@ -23,7 +23,6 @@ import {
 	GeminiExecutor,
 	OpenCodeExecutor,
 } from "./executors/index.js";
-import { MockExecutor } from "./mock-executor.js";
 import { discoverOpenCodeModels } from "./opencode-models.js";
 import { ProjectRegistry, ProjectRegistryError } from "./projectRegistry.js";
 import { ProjectStartCoordinator, ProjectStartError } from "./projectStart.js";
@@ -68,11 +67,6 @@ export class UplinkServer {
 		this.projectRegistry = new ProjectRegistry(
 			this.config.projectRegistryPath ?? join(homedir(), ".codemote", "projects.json"),
 		);
-		// Register mock executor for testing
-		this.registerExecutor(
-			new MockExecutor(this.workspaceManager, this.sessionManager, this.eventBus),
-		);
-
 		// Subscribe to all events and broadcast to clients
 		this.eventBus.subscribe((event) => this.broadcast({ type: "event", payload: event }));
 

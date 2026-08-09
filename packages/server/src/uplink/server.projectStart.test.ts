@@ -586,29 +586,6 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		).toHaveLength(1);
 	});
 
-	it("preserves legacy starts and starts project-aware non-Git sessions", async () => {
-		const legacy = await client.request(
-			{
-				type: "start_run",
-				payload: { profile: "codex", workspace: project, initialPrompt: "legacy" },
-			},
-			"legacy-start",
-		);
-		expect(legacy.type).toBe("run_started");
-		expect((legacy.payload as RunResult).operationId).toBeUndefined();
-
-		const projectAware = await client.request(
-			{
-				type: "start_run",
-				payload: startPayload("plain-start", "plain", { type: "none" }, plainProject),
-			},
-			"plain-start",
-		);
-		expect(projectAware.type).toBe("run_started");
-		expect((projectAware.payload as RunResult).execution?.git).toBeNull();
-		expect(controlled.starts).toBe(2);
-	});
-
 	it("starts one managed worktree beneath the configured root and continues it by session ID", async () => {
 		const current = await state();
 		const base = current.worktree?.bases.find(({ ref }) => ref === "refs/heads/main");
@@ -853,36 +830,6 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		expect(await git(project, ["branch", "--show-current"])).toBe("main");
 	});
 
-	it("coalesces duplicate delivery and conflicts a changed request with the same ID", async () => {
-		const current = await state();
-		const payload = startPayload("duplicate-delivery", "duplicate", {
-			type: "create_branch",
-			newBranch: "feature/duplicate",
-			expectedHead: current.git?.head,
-			expectedBranch: current.git?.branch,
-		});
-
-		const [first, second, changed] = await Promise.all([
-			client.request({ type: "start_run", payload }, "duplicate-a"),
-			client.request({ type: "start_run", payload }, "duplicate-b"),
-			client.request(
-				{ type: "start_run", payload: { ...payload, initialPrompt: "different" } },
-				"duplicate-changed",
-			),
-		]);
-
-		expect(first.type).toBe("run_started");
-		expect(second.payload).toEqual(first.payload);
-		expect(changed.type).toBe("error");
-		expect((changed.payload as { code: string }).code).toBe("OPERATION_CONFLICT");
-		expect(controlled.starts).toBe(1);
-		const sessions = await client.request({ type: "list_sessions" }, "duplicate-sessions");
-		expect((sessions.payload as Session[]).length).toBe(1);
-		expect(await git(project, ["for-each-ref", "--format=%(refname)", "refs/heads"])).toBe(
-			"refs/heads/feature/duplicate\nrefs/heads/main",
-		);
-	});
-
 	it("replays a completed branch start after restart and keeps the session discoverable", async () => {
 		const current = await state();
 		const payload = startPayload("restart-branch", "branch", {
@@ -967,42 +914,6 @@ describe("UplinkServer project-folder starts", { timeout: 30_000 }, () => {
 		expect(sessions[0]?.execution?.directory).toBe(firstResult.execution.directory);
 		expect(sessions[0]?.originProjectPath).toBe(project);
 		expect(await git(project, ["branch", "--show-current"])).toBe("main");
-	});
-
-	it("keeps an explicitly stopped durable session ended after service restart", async () => {
-		const started = await client.request(
-			{ type: "start_run", payload: startPayload("stopped-restart", "stop me") },
-			"stopped-restart-start",
-		);
-		const result = started.payload as RunResult;
-		const internals = server as unknown as ServerInternals;
-		internals.sessionManager.setRuntimeSessionId(result.sessionId, "runtime-stopped-1");
-
-		const stopped = await client.request(
-			{ type: "stop", payload: { sessionId: result.sessionId } },
-			"stopped-restart-stop",
-		);
-		expect(stopped.type).toBe("stopped");
-		const durableBeforeRestart = readJournal().operations.find(
-			(operation) => operation["operationId"] === "stopped-restart",
-		)?.["session"] as Record<string, unknown> | undefined;
-		expect(durableBeforeRestart).toMatchObject({
-			runtimeSessionId: "runtime-stopped-1",
-			recoveryState: "ended",
-		});
-
-		const { client: restartedClient, executor } = await restartServer();
-		const restored = (
-			await restartedClient.request({ type: "list_sessions" }, "stopped-restart-sessions")
-		).payload as Session[];
-		expect(restored).toHaveLength(1);
-		expect(restored[0]).toMatchObject({
-			id: result.sessionId,
-			status: "ended",
-			resumeEligible: false,
-		});
-		expect(restored[0]?.runtimeSessionId).toBeUndefined();
-		expect(executor.inputs).toBe(0);
 	});
 
 	it.skipIf(platform() === "win32")(

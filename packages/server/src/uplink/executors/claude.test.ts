@@ -84,14 +84,6 @@ exit 0
 		await rm(testDir, { recursive: true, force: true });
 	});
 
-	it("creates executor with correct type", () => {
-		const executor = new ClaudeExecutor(workspaceManager, sessionManager, eventBus, {
-			claudePath: mockClaudePath,
-		});
-
-		expect(executor.type).toBe("claude");
-	});
-
 	it("rejects start when the Claude binary cannot be spawned", async () => {
 		activeExecutor = new ClaudeExecutor(workspaceManager, sessionManager, eventBus, {
 			claudePath: join(testDir, "missing-claude"),

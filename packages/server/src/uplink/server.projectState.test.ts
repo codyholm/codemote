@@ -1,27 +1,37 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { ATTENTION_DESCRIPTION_MAX, type ProjectStateAggregate } from "@codemote/common";
+import {
+	ATTENTION_DESCRIPTION_MAX,
+	type ProjectStateAggregate,
+	type RunOptions,
+} from "@codemote/common";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
+import { reserveFreePort, waitForOpen } from "../test-support/network.js";
+import type { EventBus } from "./events.js";
+import { BaseExecutor } from "./executor.js";
 import { UplinkServer } from "./server.js";
+import type { SessionManager } from "./session.js";
+import type { Session } from "./types.js";
+import type { WorkspaceManager } from "./workspace.js";
 
-function reserveFreePort(): Promise<number> {
-	return new Promise((resolve, reject) => {
-		const server = createServer();
-		server.on("error", (err) => {
-			server.close(() => reject(err));
-		});
-		server.listen(0, "127.0.0.1", () => {
-			const address = server.address();
-			if (!address || typeof address === "string") {
-				server.close(() => reject(new Error("Failed to reserve port")));
-				return;
-			}
-			server.close(() => resolve(address.port));
-		});
-	});
+interface ServerInternals {
+	workspaceManager: WorkspaceManager;
+	sessionManager: SessionManager;
+	eventBus: EventBus;
+}
+
+class ProjectStateTestExecutor extends BaseExecutor {
+	readonly type = "opencode" as const;
+
+	protected async doStartRun(session: Session, _options: RunOptions): Promise<void> {
+		this.emitStatus(session.id, "idle");
+	}
+
+	protected async doSendInput(_session: Session, _input: string): Promise<void> {}
+
+	protected async doStop(_session: Session): Promise<void> {}
 }
 
 interface UplinkMessage {
@@ -43,11 +53,7 @@ class TestClient {
 
 	static async connect(port: number): Promise<TestClient> {
 		const ws = new WebSocket(`ws://127.0.0.1:${port}`);
-		await new Promise<void>((resolve, reject) => {
-			ws.once("open", () => resolve());
-			ws.once("error", reject);
-			setTimeout(() => reject(new Error("WebSocket open timeout")), 5000);
-		});
+		await waitForOpen(ws);
 
 		const client = new TestClient(ws);
 		ws.on("message", (data) => client.ingest(JSON.parse(data.toString()) as UplinkMessage));
@@ -132,7 +138,7 @@ interface ExecutorProbe {
 
 function probe(server: UplinkServer): ExecutorProbe {
 	const executor = server.getExecutor("opencode");
-	if (!executor) throw new Error("mock executor is not registered");
+	if (!executor) throw new Error("project-state test executor is not registered");
 	return executor as unknown as ExecutorProbe;
 }
 
@@ -161,6 +167,14 @@ describe("UplinkServer project state", () => {
 			runtimes: [],
 			projectRegistryPath: join(fixtureDir, "projects.json"),
 		});
+		const internals = server as unknown as ServerInternals;
+		server.registerExecutor(
+			new ProjectStateTestExecutor(
+				internals.workspaceManager,
+				internals.sessionManager,
+				internals.eventBus,
+			),
+		);
 		await server.start();
 		client = await TestClient.connect(port);
 	});

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RateLimiter, generatePIN } from "./pairing.js";
 
 describe("generatePIN", () => {
@@ -42,12 +42,18 @@ describe("RateLimiter", () => {
 	let limiter: RateLimiter;
 
 	beforeEach(() => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
 		limiter = new RateLimiter({
 			maxAttempts: 3,
 			windowMs: 10_000,
 			backoffMs: [100, 200, 400],
 			lockoutMs: 5000,
 		});
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
 	});
 
 	describe("basic rate limiting", () => {
@@ -104,7 +110,7 @@ describe("RateLimiter", () => {
 			expect(result1.allowed).toBe(true);
 
 			// Wait well past backoff period
-			await new Promise((resolve) => setTimeout(resolve, 200));
+			vi.advanceTimersByTime(200);
 
 			// Second attempt should be allowed now
 			const result2 = await limiter.checkAndRecord(client, false);
@@ -116,7 +122,7 @@ describe("RateLimiter", () => {
 
 			// First attempt (count=1)
 			await limiter.checkAndRecord(client, false);
-			await new Promise((resolve) => setTimeout(resolve, 200));
+			vi.advanceTimersByTime(200);
 
 			// Second attempt (count=2)
 			await limiter.checkAndRecord(client, false);
@@ -134,10 +140,10 @@ describe("RateLimiter", () => {
 
 			// Make 3 attempts (max is 3) waiting between each to pass backoff
 			await limiter.checkAndRecord(client, false); // count=1
-			await new Promise((resolve) => setTimeout(resolve, 200));
+			vi.advanceTimersByTime(200);
 
 			await limiter.checkAndRecord(client, false); // count=2
-			await new Promise((resolve) => setTimeout(resolve, 300));
+			vi.advanceTimersByTime(300);
 
 			// Third attempt triggers lockout (count=3)
 			const result = await limiter.checkAndRecord(client, false);
@@ -146,16 +152,16 @@ describe("RateLimiter", () => {
 			expect(result.allowed).toBe(false);
 			expect(result.waitMs).toBe(5000); // lockoutMs
 			expect(result.message).toContain("Locked out");
-		}, 10000);
+		});
 
 		it("should keep client locked during lockout period", async () => {
 			const client = "192.168.1.1";
 
 			// Trigger lockout
 			await limiter.checkAndRecord(client, false);
-			await new Promise((resolve) => setTimeout(resolve, 150));
+			vi.advanceTimersByTime(150);
 			await limiter.checkAndRecord(client, false);
-			await new Promise((resolve) => setTimeout(resolve, 250));
+			vi.advanceTimersByTime(250);
 			await limiter.checkAndRecord(client, false);
 
 			// Try again immediately
@@ -170,22 +176,22 @@ describe("RateLimiter", () => {
 			// Trigger lockout
 			await limiter.checkAndRecord(client, false);
 			// Wait comfortably past backoff (100ms) for attempt #2.
-			await new Promise((resolve) => setTimeout(resolve, 300));
+			vi.advanceTimersByTime(300);
 			const secondAttempt = await limiter.checkAndRecord(client, false);
 			if (!secondAttempt.allowed) {
-				await new Promise((resolve) => setTimeout(resolve, (secondAttempt.waitMs ?? 0) + 50));
+				vi.advanceTimersByTime((secondAttempt.waitMs ?? 0) + 50);
 				await limiter.checkAndRecord(client, false);
 			}
-			await new Promise((resolve) => setTimeout(resolve, 300));
+			vi.advanceTimersByTime(300);
 			const lockoutResult = await limiter.checkAndRecord(client, false);
 			expect(lockoutResult.allowed).toBe(false);
 
 			// Wait past lockout period (5000ms from the lockout timestamp)
-			await new Promise((resolve) => setTimeout(resolve, 5100));
+			vi.advanceTimersByTime(5100);
 
 			const result = await limiter.checkAndRecord(client, false);
 			expect(result.allowed).toBe(true);
-		}, 15000);
+		});
 	});
 
 	describe("time window", () => {
@@ -194,16 +200,16 @@ describe("RateLimiter", () => {
 
 			// Make some failed attempts
 			await limiter.checkAndRecord(client, false);
-			await new Promise((resolve) => setTimeout(resolve, 200));
+			vi.advanceTimersByTime(200);
 			await limiter.checkAndRecord(client, false);
 
 			// Wait past time window (10000ms + buffer)
-			await new Promise((resolve) => setTimeout(resolve, 10300));
+			vi.advanceTimersByTime(10300);
 
 			// Should be treated as first attempt again
 			const result = await limiter.checkAndRecord(client, false);
 			expect(result.allowed).toBe(true);
-		}, 15000);
+		});
 	});
 
 	describe("reset method", () => {

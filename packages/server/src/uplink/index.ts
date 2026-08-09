@@ -37,7 +37,6 @@ export { EventBus, createEvent } from "./events.js";
 
 // Executor framework
 export { BaseExecutor } from "./executor.js";
-export { MockExecutor } from "./mock-executor.js";
 
 // Executors
 export {
@@ -54,7 +53,3 @@ export { ManagedWorktreeService } from "./managedWorktree.js";
 
 // Config
 export { loadConfig, validateConfig } from "./config.js";
-
-// Smoke testing
-export { SmokeTestHarness, runAllSmokeTests } from "./smoke/index.js";
-export type { SmokeTestConfig, SmokeTestResult } from "./smoke/index.js";

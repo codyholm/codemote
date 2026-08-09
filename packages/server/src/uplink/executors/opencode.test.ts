@@ -99,14 +99,6 @@ exit 0
 		await rm(testDir, { recursive: true, force: true });
 	});
 
-	it("creates executor with correct type", () => {
-		const executor = new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
-			opencodePath: mockOpenCodePath,
-		});
-
-		expect(executor.type).toBe("opencode");
-	});
-
 	it("starts a run, emits structured message output, and stores runtime session id", async () => {
 		activeExecutor = new OpenCodeExecutor(workspaceManager, sessionManager, eventBus, {
 			opencodePath: mockOpenCodePath,

@@ -90,14 +90,6 @@ exit 0
 		await rm(testDir, { recursive: true, force: true });
 	});
 
-	it("creates executor with correct type", () => {
-		const executor = new CodexExecutor(workspaceManager, sessionManager, eventBus, {
-			codexPath: mockCodexPath,
-		});
-
-		expect(executor.type).toBe("codex");
-	});
-
 	it("recovers a durable session lazily and resumes its exact thread", async () => {
 		const argsLogPath = join(testDir, "codex-recovery-args.log");
 		const recoveryPath = join(testDir, "mock-codex-recovery");

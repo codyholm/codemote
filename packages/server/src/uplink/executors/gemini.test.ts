@@ -89,14 +89,6 @@ exit 0
 		await rm(testDir, { recursive: true, force: true });
 	});
 
-	it("creates executor with correct type", () => {
-		const executor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
-			geminiPath: mockGeminiPath,
-		});
-
-		expect(executor.type).toBe("gemini");
-	});
-
 	it("starts a run and emits structured assistant messages", async () => {
 		activeExecutor = new GeminiExecutor(workspaceManager, sessionManager, eventBus, {
 			geminiPath: mockGeminiPath,

@@ -18,7 +18,6 @@ export { SessionManager } from "./uplink/session.js";
 export { WorkspaceManager } from "./uplink/workspace.js";
 export { EventBus, createEvent } from "./uplink/events.js";
 export { BaseExecutor } from "./uplink/executor.js";
-export { MockExecutor } from "./uplink/mock-executor.js";
 export {
 	OpenCodeExecutor,
 	ClaudeExecutor,
@@ -33,8 +32,6 @@ export type {
 } from "./uplink/executors/index.js";
 export { DEFAULT_CONFIG } from "./uplink/types.js";
 export { loadConfig, validateConfig } from "./uplink/config.js";
-export { SmokeTestHarness, runAllSmokeTests } from "./uplink/smoke/index.js";
-export type { SmokeTestConfig, SmokeTestResult } from "./uplink/smoke/index.js";
 
 // ── Speech exports ─────────────────────────────────────────────
 export {

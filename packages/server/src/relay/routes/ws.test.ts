@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
+import { reserveFreePort, waitForMessageOfType, waitForOpen } from "../../test-support/network.js";
 import { createRelayServer } from "../server.js";
 
 type RelayServerHandle = Awaited<ReturnType<typeof createRelayServer>>;
@@ -35,7 +36,7 @@ describe("relay ws routes", () => {
 	it("resumes pairing after relay restart using persisted trusted devices", async () => {
 		fixtureDir = await mkdtemp(join(tmpdir(), "relay-ws-test-"));
 		const storePath = join(fixtureDir, "trusted-pairings.json");
-		const relayPort = 20100 + Math.floor(Math.random() * 500);
+		const relayPort = await reserveFreePort();
 
 		relayServer = await createRelayServer({
 			port: relayPort,
@@ -120,7 +121,7 @@ describe("relay ws routes", () => {
 	it("keeps resumed mobile connected after stale socket closes", async () => {
 		fixtureDir = await mkdtemp(join(tmpdir(), "relay-ws-test-"));
 		const storePath = join(fixtureDir, "trusted-pairings.json");
-		const relayPort = 21500 + Math.floor(Math.random() * 500);
+		const relayPort = await reserveFreePort();
 
 		relayServer = await createRelayServer({
 			port: relayPort,
@@ -211,7 +212,7 @@ describe("relay ws routes", () => {
 	it("notifies uplink when a mobile socket disconnects", async () => {
 		fixtureDir = await mkdtemp(join(tmpdir(), "relay-ws-test-"));
 		const storePath = join(fixtureDir, "trusted-pairings.json");
-		const relayPort = 20900 + Math.floor(Math.random() * 500);
+		const relayPort = await reserveFreePort();
 
 		relayServer = await createRelayServer({
 			port: relayPort,
@@ -262,7 +263,7 @@ describe("relay ws routes", () => {
 	it("unpair removes trust and future resume fails", async () => {
 		fixtureDir = await mkdtemp(join(tmpdir(), "relay-ws-test-"));
 		const storePath = join(fixtureDir, "trusted-pairings.json");
-		const relayPort = 20700 + Math.floor(Math.random() * 500);
+		const relayPort = await reserveFreePort();
 
 		relayServer = await createRelayServer({
 			port: relayPort,
@@ -334,7 +335,7 @@ describe("relay ws routes", () => {
 	it("relay revocation removes trusted resume without restart", async () => {
 		fixtureDir = await mkdtemp(join(tmpdir(), "relay-ws-test-"));
 		const storePath = join(fixtureDir, "trusted-pairings.json");
-		const relayPort = 21300 + Math.floor(Math.random() * 500);
+		const relayPort = await reserveFreePort();
 
 		relayServer = await createRelayServer({
 			port: relayPort,
@@ -393,39 +394,3 @@ describe("relay ws routes", () => {
 		expect(errorMsg["message"]).toBe("Not paired");
 	});
 });
-
-function waitForOpen(ws: WebSocket): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (ws.readyState === WebSocket.OPEN) {
-			resolve();
-			return;
-		}
-		ws.once("open", resolve);
-		ws.once("error", reject);
-		setTimeout(() => reject(new Error("WebSocket open timeout")), 5_000);
-	});
-}
-
-function waitForMessageOfType(
-	ws: WebSocket,
-	type: string,
-	timeoutMs = 5_000,
-): Promise<Record<string, unknown>> {
-	return new Promise((resolve, reject) => {
-		const timeout = setTimeout(() => {
-			ws.off("message", handler);
-			reject(new Error(`WebSocket message timeout waiting for type ${type}`));
-		}, timeoutMs);
-
-		const handler = (data: WebSocket.RawData) => {
-			const msg = JSON.parse(data.toString()) as Record<string, unknown>;
-			if (msg["type"] === type) {
-				clearTimeout(timeout);
-				ws.off("message", handler);
-				resolve(msg);
-			}
-		};
-
-		ws.on("message", handler);
-	});
-}

@@ -1537,15 +1537,25 @@ async function waitForOpen(ws: WebSocket): Promise<void> {
 	if (ws.readyState === WebSocket.OPEN) return;
 
 	await new Promise<void>((resolve, reject) => {
-		const timeout = setTimeout(() => reject(new Error("WebSocket open timeout")), 4000);
-		ws.once("open", () => {
+		const cleanup = () => {
 			clearTimeout(timeout);
+			ws.off("open", onOpen);
+			ws.off("error", onError);
+		};
+		const onOpen = () => {
+			cleanup();
 			resolve();
-		});
-		ws.once("error", (error) => {
-			clearTimeout(timeout);
+		};
+		const onError = (error: Error) => {
+			cleanup();
 			reject(error);
-		});
+		};
+		const timeout = setTimeout(() => {
+			cleanup();
+			reject(new Error("WebSocket open timeout"));
+		}, 4000);
+		ws.once("open", onOpen);
+		ws.once("error", onError);
 	});
 }
 

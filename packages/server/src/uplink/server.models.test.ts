@@ -1,44 +1,8 @@
-import { createServer } from "node:net";
 import type { ModelInfo } from "@codemote/common";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
+import { reserveFreePort, waitForMessage, waitForOpen } from "../test-support/network.js";
 import { UplinkServer } from "./server.js";
-
-function reserveFreePort(): Promise<number> {
-	return new Promise((resolve, reject) => {
-		const server = createServer();
-		server.on("error", (err) => {
-			server.close(() => reject(err));
-		});
-		server.listen(0, "127.0.0.1", () => {
-			const address = server.address();
-			if (!address || typeof address === "string") {
-				server.close(() => reject(new Error("Failed to reserve port")));
-				return;
-			}
-			server.close(() => resolve(address.port));
-		});
-	});
-}
-
-function waitForOpen(ws: WebSocket): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (ws.readyState === WebSocket.OPEN) {
-			resolve();
-			return;
-		}
-		ws.once("open", resolve);
-		ws.once("error", reject);
-		setTimeout(() => reject(new Error("WebSocket open timeout")), 5000);
-	});
-}
-
-function waitForMessage(ws: WebSocket): Promise<Record<string, unknown>> {
-	return new Promise((resolve, reject) => {
-		ws.once("message", (data) => resolve(JSON.parse(data.toString())));
-		setTimeout(() => reject(new Error("WebSocket message timeout")), 5000);
-	});
-}
 
 describe("UplinkServer list_models", () => {
 	let port: number;
