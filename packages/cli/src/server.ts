@@ -225,16 +225,15 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 	const localRelayEnabled = !remoteRelayTarget;
 
 	const tlsDisableRequested =
-		process.env["GUILD_REMOTE_DISABLE_TLS"] === "1" ||
-		process.env["GUILD_REMOTE_DISABLE_TLS"] === "true";
+		process.env["CODEMOTE_DISABLE_TLS"] === "1" || process.env["CODEMOTE_DISABLE_TLS"] === "true";
 	const allowInsecure =
-		process.env["GUILD_REMOTE_ALLOW_INSECURE"] === "1" ||
-		process.env["GUILD_REMOTE_ALLOW_INSECURE"] === "true";
+		process.env["CODEMOTE_ALLOW_INSECURE"] === "1" ||
+		process.env["CODEMOTE_ALLOW_INSECURE"] === "true";
 	const tlsDisabled =
 		tlsDisableRequested && allowInsecure && process.env["NODE_ENV"] !== "production";
 	if (tlsDisableRequested && !tlsDisabled) {
 		console.warn(
-			"[Server] Refusing to disable TLS without GUILD_REMOTE_ALLOW_INSECURE=1 and NODE_ENV!=production",
+			"[Server] Refusing to disable TLS without CODEMOTE_ALLOW_INSECURE=1 and NODE_ENV!=production",
 		);
 	}
 	const wsScheme = tlsDisabled ? "ws" : "wss";
@@ -446,7 +445,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 		repoPath: uplinkConfig.repoPath ?? process.cwd(),
 		...(advertisedRelayUrl ? { localEndpointUrl: advertisedRelayUrl } : {}),
 		...(bridgeHostedEndpointUrl ? { hostedEndpointUrl: bridgeHostedEndpointUrl } : {}),
-		...(process.env["GUILD_REMOTE_DEBUG"] ? { log: (message) => console.log(message) } : {}),
+		...(process.env["CODEMOTE_DEBUG"] ? { log: (message) => console.log(message) } : {}),
 		encryptionMode,
 		...(keyRotationIntervalMs !== undefined ? { keyRotationIntervalMs } : {}),
 		onPairingCode: (pin) => {

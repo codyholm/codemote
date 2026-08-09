@@ -12,13 +12,13 @@
 	},
 	"dependencies": {
 		"@codemote/common": "workspace:*",
-		"@fastify/cors": "^11.2.0",
-		"@fastify/websocket": "^11.2.0",
+		"@fastify/cors": "^11.3.0",
+		"@fastify/websocket": "^11.3.0",
 		"cross-spawn": "7.0.6",
-		"fastify": "^5.6.2",
-		"nanoid": "^5.1.6",
-		"simple-git": "^3.30.0",
-		"ws": "^8.19.0"
+		"fastify": "^5.11.3",
+		"nanoid": "^5.1.16",
+		"simple-git": "^3.36.0",
+		"ws": "^8.21.3"
 	},
 	"devDependencies": {
 		"@types/cross-spawn": "6.0.6",

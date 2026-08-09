@@ -125,11 +125,11 @@ describe("Server Integration", { timeout: 30000 }, () => {
 		});
 
 		it("lists and revokes trusted devices through server handle", async () => {
-			const prevDisable = process.env["GUILD_REMOTE_DISABLE_TLS"];
-			const prevAllow = process.env["GUILD_REMOTE_ALLOW_INSECURE"];
+			const prevDisable = process.env["CODEMOTE_DISABLE_TLS"];
+			const prevAllow = process.env["CODEMOTE_ALLOW_INSECURE"];
 			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-test-"));
-			process.env["GUILD_REMOTE_DISABLE_TLS"] = "1";
-			process.env["GUILD_REMOTE_ALLOW_INSECURE"] = "1";
+			process.env["CODEMOTE_DISABLE_TLS"] = "1";
+			process.env["CODEMOTE_ALLOW_INSECURE"] = "1";
 			try {
 				server = await startServer({
 					port: testPort + 45,
@@ -167,23 +167,23 @@ describe("Server Integration", { timeout: 30000 }, () => {
 			} finally {
 				await rm(fixtureDir, { recursive: true, force: true });
 				if (prevDisable === undefined) {
-					Reflect.deleteProperty(process.env, "GUILD_REMOTE_DISABLE_TLS");
+					Reflect.deleteProperty(process.env, "CODEMOTE_DISABLE_TLS");
 				} else {
-					process.env["GUILD_REMOTE_DISABLE_TLS"] = prevDisable;
+					process.env["CODEMOTE_DISABLE_TLS"] = prevDisable;
 				}
 				if (prevAllow === undefined) {
-					Reflect.deleteProperty(process.env, "GUILD_REMOTE_ALLOW_INSECURE");
+					Reflect.deleteProperty(process.env, "CODEMOTE_ALLOW_INSECURE");
 				} else {
-					process.env["GUILD_REMOTE_ALLOW_INSECURE"] = prevAllow;
+					process.env["CODEMOTE_ALLOW_INSECURE"] = prevAllow;
 				}
 			}
 		});
 
 		it("does not crash when receiving malformed encrypted payloads", async () => {
-			const prevDisable = process.env["GUILD_REMOTE_DISABLE_TLS"];
-			const prevAllow = process.env["GUILD_REMOTE_ALLOW_INSECURE"];
-			process.env["GUILD_REMOTE_DISABLE_TLS"] = "1";
-			process.env["GUILD_REMOTE_ALLOW_INSECURE"] = "1";
+			const prevDisable = process.env["CODEMOTE_DISABLE_TLS"];
+			const prevAllow = process.env["CODEMOTE_ALLOW_INSECURE"];
+			process.env["CODEMOTE_DISABLE_TLS"] = "1";
+			process.env["CODEMOTE_ALLOW_INSECURE"] = "1";
 			try {
 				server = await startServer({ port: testPort + 35 });
 
@@ -212,14 +212,14 @@ describe("Server Integration", { timeout: 30000 }, () => {
 				mobileWs.close();
 			} finally {
 				if (prevDisable === undefined) {
-					Reflect.deleteProperty(process.env, "GUILD_REMOTE_DISABLE_TLS");
+					Reflect.deleteProperty(process.env, "CODEMOTE_DISABLE_TLS");
 				} else {
-					process.env["GUILD_REMOTE_DISABLE_TLS"] = prevDisable;
+					process.env["CODEMOTE_DISABLE_TLS"] = prevDisable;
 				}
 				if (prevAllow === undefined) {
-					Reflect.deleteProperty(process.env, "GUILD_REMOTE_ALLOW_INSECURE");
+					Reflect.deleteProperty(process.env, "CODEMOTE_ALLOW_INSECURE");
 				} else {
-					process.env["GUILD_REMOTE_ALLOW_INSECURE"] = prevAllow;
+					process.env["CODEMOTE_ALLOW_INSECURE"] = prevAllow;
 				}
 			}
 		});
@@ -369,10 +369,10 @@ describe("Server Integration", { timeout: 30000 }, () => {
 		});
 
 		it("resets mobileConnected in status snapshots after mobile disconnect", async () => {
-			const prevDisable = process.env["GUILD_REMOTE_DISABLE_TLS"];
-			const prevAllow = process.env["GUILD_REMOTE_ALLOW_INSECURE"];
-			process.env["GUILD_REMOTE_DISABLE_TLS"] = "1";
-			process.env["GUILD_REMOTE_ALLOW_INSECURE"] = "1";
+			const prevDisable = process.env["CODEMOTE_DISABLE_TLS"];
+			const prevAllow = process.env["CODEMOTE_ALLOW_INSECURE"];
+			process.env["CODEMOTE_DISABLE_TLS"] = "1";
+			process.env["CODEMOTE_ALLOW_INSECURE"] = "1";
 
 			const fixtureDir = await mkdtemp(join(tmpdir(), "cli-server-status-disconnect-"));
 			const statusFilePath = join(fixtureDir, "server-status.json");
@@ -421,14 +421,14 @@ describe("Server Integration", { timeout: 30000 }, () => {
 			} finally {
 				await rm(fixtureDir, { recursive: true, force: true });
 				if (prevDisable === undefined) {
-					Reflect.deleteProperty(process.env, "GUILD_REMOTE_DISABLE_TLS");
+					Reflect.deleteProperty(process.env, "CODEMOTE_DISABLE_TLS");
 				} else {
-					process.env["GUILD_REMOTE_DISABLE_TLS"] = prevDisable;
+					process.env["CODEMOTE_DISABLE_TLS"] = prevDisable;
 				}
 				if (prevAllow === undefined) {
-					Reflect.deleteProperty(process.env, "GUILD_REMOTE_ALLOW_INSECURE");
+					Reflect.deleteProperty(process.env, "CODEMOTE_ALLOW_INSECURE");
 				} else {
-					process.env["GUILD_REMOTE_ALLOW_INSECURE"] = prevAllow;
+					process.env["CODEMOTE_ALLOW_INSECURE"] = prevAllow;
 				}
 			}
 		}, 15_000);

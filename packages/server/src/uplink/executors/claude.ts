@@ -34,7 +34,7 @@ const DEFAULT_CLAUDE_CONFIG: ClaudeConfig = {
 };
 
 const CLAUDE_DEBUG =
-	process.env["GUILD_REMOTE_DEBUG"] === "1" || process.env["GUILD_REMOTE_DEBUG"] === "true";
+	process.env["CODEMOTE_DEBUG"] === "1" || process.env["CODEMOTE_DEBUG"] === "true";
 
 function logClaudeDebug(message: string): void {
 	if (CLAUDE_DEBUG) {

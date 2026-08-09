@@ -7,7 +7,7 @@ const SOURCE_EXTENSIONS = new Set([".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"]
 const BIOME_EXTENSIONS = new Set([...SOURCE_EXTENSIONS, ".json", ".jsonc"]);
 const DOC_EXTENSIONS = new Set([".md", ".mdx", ".yaml", ".yml"]);
 const DOC_EXCLUDED_PATHS = new Set(["pnpm-lock.yaml"]);
-const SWIFT_ROOTS = ["packages/mobile-ios/", "packages/desktop-macos/"];
+const SWIFT_ROOTS = ["packages/desktop-macos/"];
 const EXCLUDED_DIRECTORY_NAMES = new Set([
 	".build",
 	".next",
@@ -22,17 +22,6 @@ const EXCLUDED_DIRECTORY_NAMES = new Set([
 	"playwright-report",
 	"test-results",
 ]);
-const DOC_EXCLUDED_PREFIXES = [
-	".claude/",
-	".codex/",
-	".guild/.archive/",
-	".guild/exports/",
-	".guild/ops/evidence/",
-	".guild/ops/plans/.archive/",
-	".guild/runtime/",
-	"packages/mobile-android/",
-];
-
 function splitNul(buffer) {
 	return buffer
 		.toString("utf8")
@@ -87,10 +76,6 @@ function hasExcludedDirectory(path) {
 	return path.split("/").some((part) => EXCLUDED_DIRECTORY_NAMES.has(part));
 }
 
-function isGuildExportManifest(path) {
-	return path.startsWith(".guild/exports/") && path.endsWith("/manifest.json");
-}
-
 export function classifyPath(path) {
 	const extension = extname(path).toLowerCase();
 	const excludedDirectory = hasExcludedDirectory(path);
@@ -100,13 +85,8 @@ export function classifyPath(path) {
 		!excludedDirectory &&
 		extension === ".swift" &&
 		SWIFT_ROOTS.some((root) => path.startsWith(root));
-	const shell =
-		!excludedDirectory && extension === ".sh" && !path.startsWith("packages/mobile-android/");
-	const docs =
-		!excludedDirectory &&
-		DOC_EXTENSIONS.has(extension) &&
-		!DOC_EXCLUDED_PATHS.has(path) &&
-		!DOC_EXCLUDED_PREFIXES.some((prefix) => path.startsWith(prefix));
+	const shell = !excludedDirectory && extension === ".sh";
+	const docs = !excludedDirectory && DOC_EXTENSIONS.has(extension) && !DOC_EXCLUDED_PATHS.has(path);
 
 	return { biome, docs, shell, source, swift };
 }
@@ -115,7 +95,6 @@ function classifyStagedPaths(paths) {
 	const groups = {
 		biome: [],
 		docs: [],
-		exports: [],
 		included: [],
 		shell: [],
 		source: [],
@@ -133,9 +112,6 @@ function classifyStagedPaths(paths) {
 		}
 		if (included) {
 			groups.included.push(path);
-		}
-		if (isGuildExportManifest(path)) {
-			groups.exports.push(path);
 		}
 	}
 
@@ -196,19 +172,6 @@ function firstFailure(...statuses) {
 function runBiome(root, groups) {
 	if (groups.biome.length === 0) {
 		return 0;
-	}
-
-	if (groups.exports.length > 0) {
-		const exportsStatus = runFormatter(
-			root,
-			"pnpm",
-			["format:exports", "--", ...groups.exports],
-			groups.exports,
-			{ SKIP_GUILD_EXPORT_GIT_ADD: "1" },
-		);
-		if (exportsStatus !== 0) {
-			return exportsStatus;
-		}
 	}
 
 	const formatStatus = runFormatter(

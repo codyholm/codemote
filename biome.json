@@ -17,35 +17,12 @@
 		"indentStyle": "tab",
 		"lineWidth": 100
 	},
-	"overrides": [
-		{
-			"include": ["packages/web/src/app/layout.tsx"],
-			"linter": {
-				"rules": {
-					"security": {
-						"noDangerouslySetInnerHtml": "off"
-					}
-				}
-			}
-		}
-	],
 	"files": {
 		"ignore": [
 			"node_modules",
 			"dist",
 			".build",
 			"build",
-			".guild/exports",
-			".guild/.archive",
-			".guild/ops/evidence",
-			".guild/runtime",
-			".claude",
-			".codex",
-			"packages/mobile-ios/**/*.xcassets",
-			"packages/mobile-ios/build",
-			"packages/mobile-ios/build-sim",
-			"packages/mobile-ios/.build",
-			"**/fastlane/api_key.json",
 			".next",
 			"out",
 			"test-results",
