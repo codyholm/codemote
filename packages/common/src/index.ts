@@ -4,7 +4,7 @@ export const VERSION = "0.1.0";
 
 // Error types
 export {
-	GuildRemoteError,
+	CodemoteError,
 	SessionNotFoundError,
 	SessionNotActiveError,
 	WorkspaceNotFoundError,

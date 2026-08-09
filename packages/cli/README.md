@@ -12,6 +12,20 @@ Leave it running — it starts a local server your phone connects to.
 
 Scan the QR code with your iPhone camera or open the Codemote app and enter the PIN. That's it.
 
+## Background Service
+
+Pair the phone during an interactive `npx codemote` run first. To keep Codemote running without an open terminal, install the CLI persistently and register the platform service:
+
+```bash
+npm install -g codemote
+codemote service install
+codemote service start
+codemote service status
+codemote service logs
+```
+
+An ephemeral `npx` installation cannot be registered as a background service. Codemote uses a user LaunchAgent on macOS, a user systemd unit on Linux, and Task Scheduler on Windows. Commands are also available for `stop` and `uninstall`.
+
 ## How It Works
 
 1. **Run `npx codemote`** in your terminal — a QR code and PIN appear
@@ -36,9 +50,9 @@ Everything runs on your machine. In the default LAN mode, your phone connects di
 
 Works out of the box. These environment variables are available if needed:
 
-| Variable | Default | Description |
-|---|---|---|
-| `PORT` | `8080` | Server port |
+| Variable             | Default           | Description                             |
+| -------------------- | ----------------- | --------------------------------------- |
+| `PORT`               | `8080`            | Server port                             |
 | `CODEMOTE_START_DIR` | Current directory | Starting directory for project browsing |
 
 ## Security
@@ -47,6 +61,7 @@ Works out of the box. These environment variables are available if needed:
 - Pairing requires a 6-digit PIN shown only in your terminal
 - In LAN mode your phone connects directly to your machine and traffic stays on your local network, with no external server involved
 
-## License
+## Source availability
 
-MIT
+Copyright © 2026 Codemote. All rights reserved.
+No license is granted to copy, modify, distribute, sublicense, publish, or create derivative works from this code or other repository contents.

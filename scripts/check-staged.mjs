@@ -7,11 +7,9 @@ const SOURCE_EXTENSIONS = new Set([".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"]
 const BIOME_EXTENSIONS = new Set([...SOURCE_EXTENSIONS, ".json", ".jsonc"]);
 const DOC_EXTENSIONS = new Set([".md", ".mdx", ".yaml", ".yml"]);
 const DOC_EXCLUDED_PATHS = new Set(["pnpm-lock.yaml"]);
-const SWIFT_ROOTS = ["packages/mobile-ios/", "packages/desktop-macos/"];
 const EXCLUDED_DIRECTORY_NAMES = new Set([
 	".build",
 	".next",
-	".swiftpm",
 	"DerivedData",
 	"SourcePackages",
 	"build",
@@ -22,17 +20,6 @@ const EXCLUDED_DIRECTORY_NAMES = new Set([
 	"playwright-report",
 	"test-results",
 ]);
-const DOC_EXCLUDED_PREFIXES = [
-	".claude/",
-	".codex/",
-	".guild/.archive/",
-	".guild/exports/",
-	".guild/ops/evidence/",
-	".guild/ops/plans/.archive/",
-	".guild/runtime/",
-	"packages/mobile-android/",
-];
-
 function splitNul(buffer) {
 	return buffer
 		.toString("utf8")
@@ -87,45 +74,30 @@ function hasExcludedDirectory(path) {
 	return path.split("/").some((part) => EXCLUDED_DIRECTORY_NAMES.has(part));
 }
 
-function isGuildExportManifest(path) {
-	return path.startsWith(".guild/exports/") && path.endsWith("/manifest.json");
-}
-
 export function classifyPath(path) {
 	const extension = extname(path).toLowerCase();
 	const excludedDirectory = hasExcludedDirectory(path);
 	const biome = !excludedDirectory && BIOME_EXTENSIONS.has(extension);
 	const source = biome && SOURCE_EXTENSIONS.has(extension);
-	const swift =
-		!excludedDirectory &&
-		extension === ".swift" &&
-		SWIFT_ROOTS.some((root) => path.startsWith(root));
-	const shell =
-		!excludedDirectory && extension === ".sh" && !path.startsWith("packages/mobile-android/");
-	const docs =
-		!excludedDirectory &&
-		DOC_EXTENSIONS.has(extension) &&
-		!DOC_EXCLUDED_PATHS.has(path) &&
-		!DOC_EXCLUDED_PREFIXES.some((prefix) => path.startsWith(prefix));
+	const shell = !excludedDirectory && extension === ".sh";
+	const docs = !excludedDirectory && DOC_EXTENSIONS.has(extension) && !DOC_EXCLUDED_PATHS.has(path);
 
-	return { biome, docs, shell, source, swift };
+	return { biome, docs, shell, source };
 }
 
 function classifyStagedPaths(paths) {
 	const groups = {
 		biome: [],
 		docs: [],
-		exports: [],
 		included: [],
 		shell: [],
 		source: [],
-		swift: [],
 	};
 
 	for (const path of paths) {
 		const classification = classifyPath(path);
 		let included = false;
-		for (const group of ["biome", "docs", "shell", "source", "swift"]) {
+		for (const group of ["biome", "docs", "shell", "source"]) {
 			if (classification[group]) {
 				groups[group].push(path);
 				included = true;
@@ -133,9 +105,6 @@ function classifyStagedPaths(paths) {
 		}
 		if (included) {
 			groups.included.push(path);
-		}
-		if (isGuildExportManifest(path)) {
-			groups.exports.push(path);
 		}
 	}
 
@@ -198,19 +167,6 @@ function runBiome(root, groups) {
 		return 0;
 	}
 
-	if (groups.exports.length > 0) {
-		const exportsStatus = runFormatter(
-			root,
-			"pnpm",
-			["format:exports", "--", ...groups.exports],
-			groups.exports,
-			{ SKIP_GUILD_EXPORT_GIT_ADD: "1" },
-		);
-		if (exportsStatus !== 0) {
-			return exportsStatus;
-		}
-	}
-
 	const formatStatus = runFormatter(
 		root,
 		"pnpm",
@@ -234,50 +190,6 @@ function runBiome(root, groups) {
 		return runCommand(root, "pnpm", ["typecheck"]).status;
 	}
 	return 0;
-}
-
-function runSwift(root, paths) {
-	if (paths.length === 0) {
-		return 0;
-	}
-	if (!requireTool(root, "xcrun", ["--find", "swift-format"], "Apple swift-format")) {
-		return 127;
-	}
-	if (!requireTool(root, "mint", ["which", "swiftlint"], "SwiftLint 0.63.2")) {
-		return 127;
-	}
-
-	const formatStatus = runFormatter(
-		root,
-		"xcrun",
-		["swift-format", "format", "--configuration", ".swift-format", "--in-place", "--", ...paths],
-		paths,
-	);
-	const formatLintStatus = runCommand(root, "xcrun", [
-		"swift-format",
-		"lint",
-		"--configuration",
-		".swift-format",
-		"--strict",
-		"--",
-		...paths,
-	]).status;
-	const swiftFormatStatus = firstFailure(formatStatus, formatLintStatus);
-	if (swiftFormatStatus !== 0) {
-		return swiftFormatStatus;
-	}
-
-	return runCommand(root, "mint", [
-		"run",
-		"swiftlint",
-		"lint",
-		"--strict",
-		"--config",
-		".swiftlint.yml",
-		"--no-cache",
-		"--",
-		...paths,
-	]).status;
 }
 
 function runShell(root, paths) {
@@ -348,7 +260,6 @@ export function main() {
 
 		for (const [run, paths] of [
 			[() => runBiome(root, groups), groups.biome],
-			[() => runSwift(root, groups.swift), groups.swift],
 			[() => runShell(root, groups.shell), groups.shell],
 			[() => runDocs(root, groups.docs), groups.docs],
 		]) {

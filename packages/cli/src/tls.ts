@@ -50,8 +50,8 @@ export async function fetchRelayTlsPin(relayUrl: string, timeoutMs = 5_000): Pro
 		throw new Error("Relay URL must use wss:// to derive a TLS pin");
 	}
 	const allowInsecureRelayPinFetch =
-		process.env["GUILD_REMOTE_ALLOW_INSECURE_RELAY_PIN_FETCH"] === "1" ||
-		process.env["GUILD_REMOTE_ALLOW_INSECURE_RELAY_PIN_FETCH"] === "true";
+		process.env["CODEMOTE_ALLOW_INSECURE_RELAY_PIN_FETCH"] === "1" ||
+		process.env["CODEMOTE_ALLOW_INSECURE_RELAY_PIN_FETCH"] === "true";
 	const port = parsed.port ? Number.parseInt(parsed.port, 10) : 443;
 	if (!Number.isFinite(port) || port < 1 || port > 65_535) {
 		throw new Error(`Invalid relay port in URL: ${relayUrl}`);

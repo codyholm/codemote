@@ -19,11 +19,8 @@
 		"lint": "biome check .",
 		"lint:fix": "biome check --write .",
 		"format": "biome format --write .",
-		"format:exports": "node scripts/format-exports.mjs",
 		"check:staged": "node scripts/check-staged.mjs",
 		"setup:quality": "./scripts/setup-quality-tools.sh",
-		"ops:reconcile": "node scripts/ops/reconcile-master-plan.mjs",
-		"ops:reconcile:closed": "node scripts/ops/reconcile-master-plan.mjs --require-closed",
 		"typecheck": "pnpm -r typecheck",
 		"prepare": "simple-git-hooks"
 	},
@@ -33,6 +30,11 @@
 		"simple-git-hooks": "^2.11.0",
 		"typescript": "^5.6.0",
 		"vitest": "^2.1.0"
+	},
+	"pnpm": {
+		"overrides": {
+			"node-forge": "1.4.0"
+		}
 	},
 	"simple-git-hooks": {
 		"pre-commit": "pnpm check:staged"

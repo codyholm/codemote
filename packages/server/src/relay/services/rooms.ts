@@ -1,7 +1,6 @@
 import type { WebSocket } from "ws";
 
-const DEBUG =
-	process.env["GUILD_REMOTE_DEBUG"] === "1" || process.env["GUILD_REMOTE_DEBUG"] === "true";
+const DEBUG = process.env["CODEMOTE_DEBUG"] === "1" || process.env["CODEMOTE_DEBUG"] === "true";
 
 function logDebug(message: string): void {
 	if (DEBUG) {

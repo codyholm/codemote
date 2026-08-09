@@ -166,6 +166,7 @@ describe("UplinkServer project state", () => {
 			host: "127.0.0.1",
 			runtimes: [],
 			projectRegistryPath: join(fixtureDir, "projects.json"),
+			projectStartJournalPath: join(fixtureDir, "project-start-operations.json"),
 		});
 		const internals = server as unknown as ServerInternals;
 		server.registerExecutor(

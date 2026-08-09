@@ -190,11 +190,10 @@ async function startApp(mode: StartupMode, remoteRelayUrl?: string) {
 
 	// Keep advertised endpoint transport aligned with server-side TLS mode.
 	const tlsDisableRequested =
-		process.env["GUILD_REMOTE_DISABLE_TLS"] === "1" ||
-		process.env["GUILD_REMOTE_DISABLE_TLS"] === "true";
+		process.env["CODEMOTE_DISABLE_TLS"] === "1" || process.env["CODEMOTE_DISABLE_TLS"] === "true";
 	const allowInsecure =
-		process.env["GUILD_REMOTE_ALLOW_INSECURE"] === "1" ||
-		process.env["GUILD_REMOTE_ALLOW_INSECURE"] === "true";
+		process.env["CODEMOTE_ALLOW_INSECURE"] === "1" ||
+		process.env["CODEMOTE_ALLOW_INSECURE"] === "true";
 	const tlsDisabled =
 		tlsDisableRequested && allowInsecure && process.env["NODE_ENV"] !== "production";
 
